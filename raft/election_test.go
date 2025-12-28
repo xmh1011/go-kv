@@ -464,6 +464,7 @@ func TestRequestVote(t *testing.T) {
 
 			r := &Raft{
 				id:               2,
+				peerIDs:          []int{1, 2, 3}, // 确保候选人 1 在配置中
 				currentTerm:      tt.initialState.term,
 				votedFor:         tt.initialState.votedFor,
 				state:            tt.initialState.state,

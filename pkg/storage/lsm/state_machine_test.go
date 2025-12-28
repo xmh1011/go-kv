@@ -18,8 +18,8 @@ func TestStateMachineAdapter_Snapshot(t *testing.T) {
 	adapter := NewStateMachineAdapter(db)
 
 	// 写入一些数据
-	adapter.Apply(param.LogEntry{Command: mustMarshal(param.KVCommand{Op: "set", Key: "k1", Value: "v1"})})
-	adapter.Apply(param.LogEntry{Command: mustMarshal(param.KVCommand{Op: "set", Key: "k2", Value: "v2"})})
+	adapter.Apply(param.LogEntry{Command: mustMarshal(param.KVCommand{Op: param.OpSet, Key: "k1", Value: "v1"})})
+	adapter.Apply(param.LogEntry{Command: mustMarshal(param.KVCommand{Op: param.OpSet, Key: "k2", Value: "v2"})})
 
 	// 获取快照
 	snapData, err := adapter.GetSnapshot()

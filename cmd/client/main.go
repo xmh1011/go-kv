@@ -98,7 +98,7 @@ func runCommand(op, key, value string) {
 
 	// 4. Construct command
 	kvCmd := param.KVCommand{
-		Op:    op,
+		Op:    param.StringToOpType(op),
 		Key:   key,
 		Value: value,
 	}

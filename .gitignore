@@ -41,6 +41,7 @@ bench_test.txt
 bench_custom.txt
 coverage.txt
 **/data/
+/raft-*
 
 kv-client
 kv-server

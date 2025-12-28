@@ -39,25 +39,25 @@ func (lsm *StateMachineAdapter) Apply(entry param.LogEntry) any {
 		return err
 	}
 
-	log.Debugf("[LSMAdapter] Applying command: Op=%s, Key=%s", cmd.Op, cmd.Key)
+	log.Debugf("[LSMAdapter] Applying command: Op=%d, Key=%s", cmd.Op, cmd.Key)
 
 	// 2. 根据操作类型执行
 	switch cmd.Op {
-	case "set":
+	case param.OpSet:
 		err := lsm.db.Put(cmd.Key, []byte(cmd.Value))
 		if err != nil {
 			log.Errorf("[LSMAdapter] Apply 'set' failed for key '%s': %v", cmd.Key, err)
 		}
 		return err
-	case "delete":
+	case param.OpDelete:
 		err := lsm.db.Delete(cmd.Key)
 		if err != nil {
 			log.Errorf("[LSMAdapter] Apply 'delete' failed for key '%s': %v", cmd.Key, err)
 		}
 		return err
 	default:
-		log.Warnf("[LSMAdapter] Apply received unknown operation: %s", cmd.Op)
-		return fmt.Errorf("unknown operation: %s", cmd.Op)
+		log.Warnf("[LSMAdapter] Apply received unknown operation: %d", cmd.Op)
+		return fmt.Errorf("unknown operation: %d", cmd.Op)
 	}
 }
 

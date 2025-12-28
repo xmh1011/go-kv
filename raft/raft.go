@@ -237,7 +237,7 @@ func (r *Raft) ClientRequest(args *param.ClientArgs, reply *param.ClientReply) e
 
 	if cmdBytes, ok := args.Command.([]byte); ok {
 		if err := json.Unmarshal(cmdBytes, &cmd); err == nil {
-			if cmd.Op == "get" {
+			if cmd.Op == param.OpGet {
 				isRead = true
 			}
 		}

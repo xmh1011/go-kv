@@ -1,7 +1,9 @@
 package lsm
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/binary"
+	"encoding/gob"
 	"fmt"
 	"sync"
 
@@ -47,9 +49,10 @@ func (s *StorageAdapter) init() error {
 		return fmt.Errorf("get first index failed: %w", err)
 	}
 	if val != nil {
-		if err := json.Unmarshal(val, &s.firstIndex); err != nil {
-			return fmt.Errorf("unmarshal first index failed: %w", err)
+		if len(val) != 8 {
+			return fmt.Errorf("invalid first index data length: %d", len(val))
 		}
+		s.firstIndex = binary.BigEndian.Uint64(val)
 	} else {
 		s.firstIndex = 1 // 默认为 1
 	}
@@ -60,9 +63,10 @@ func (s *StorageAdapter) init() error {
 		return fmt.Errorf("get last index failed: %w", err)
 	}
 	if val != nil {
-		if err := json.Unmarshal(val, &s.lastIndex); err != nil {
-			return fmt.Errorf("unmarshal last index failed: %w", err)
+		if len(val) != 8 {
+			return fmt.Errorf("invalid last index data length: %d", len(val))
 		}
+		s.lastIndex = binary.BigEndian.Uint64(val)
 	} else {
 		s.lastIndex = 0
 	}
@@ -73,9 +77,10 @@ func (s *StorageAdapter) init() error {
 		return fmt.Errorf("get log size failed: %w", err)
 	}
 	if val != nil {
-		if err := json.Unmarshal(val, &s.logSize); err != nil {
-			return fmt.Errorf("unmarshal log size failed: %w", err)
+		if len(val) != 8 {
+			return fmt.Errorf("invalid log size data length: %d", len(val))
 		}
+		s.logSize = int(binary.BigEndian.Uint64(val))
 	} else {
 		s.logSize = 0
 	}
@@ -90,10 +95,11 @@ func (s *StorageAdapter) getLogKey(index uint64) string {
 
 // SetState 原子地设置 HardState (currentTerm, votedFor)。
 func (s *StorageAdapter) SetState(state param.HardState) error {
-	data, err := json.Marshal(state)
-	if err != nil {
-		return err
-	}
+	data := make([]byte, 24)
+	binary.BigEndian.PutUint64(data[0:8], state.CurrentTerm)
+	binary.BigEndian.PutUint64(data[8:16], state.VotedFor)
+	binary.BigEndian.PutUint64(data[16:24], state.CommitIndex)
+
 	if err := s.db.Put(keyHardState, data); err != nil {
 		log.Errorf("[LSMStorage] SetState failed: %v", err)
 		return err
@@ -111,9 +117,14 @@ func (s *StorageAdapter) GetState() (param.HardState, error) {
 	if val == nil {
 		return state, nil // 返回空状态
 	}
-	if err := json.Unmarshal(val, &state); err != nil {
-		return state, err
+
+	if len(val) != 24 {
+		return state, fmt.Errorf("invalid hard state data length: %d", len(val))
 	}
+
+	state.CurrentTerm = binary.BigEndian.Uint64(val[0:8])
+	state.VotedFor = binary.BigEndian.Uint64(val[8:16])
+	state.CommitIndex = binary.BigEndian.Uint64(val[16:24])
 	return state, nil
 }
 
@@ -123,10 +134,12 @@ func (s *StorageAdapter) AppendEntries(entries []param.LogEntry) error {
 	defer s.mu.Unlock()
 
 	for _, entry := range entries {
-		data, err := json.Marshal(entry)
-		if err != nil {
+		var buf bytes.Buffer
+		if err := gob.NewEncoder(&buf).Encode(entry); err != nil {
 			return err
 		}
+		data := buf.Bytes()
+
 		key := s.getLogKey(entry.Index)
 		if err := s.db.Put(key, data); err != nil {
 			log.Errorf("[LSMStorage] Append entry %d failed: %v", entry.Index, err)
@@ -158,7 +171,7 @@ func (s *StorageAdapter) GetEntry(index uint64) (*param.LogEntry, error) {
 		return nil, nil
 	}
 	var entry param.LogEntry
-	if err := json.Unmarshal(val, &entry); err != nil {
+	if err := gob.NewDecoder(bytes.NewReader(val)).Decode(&entry); err != nil {
 		return nil, err
 	}
 	return &entry, nil
@@ -217,11 +230,11 @@ func (s *StorageAdapter) LogSize() (int, error) {
 
 // SaveSnapshot 原子地保存快照数据和元数据。
 func (s *StorageAdapter) SaveSnapshot(snapshot *param.Snapshot) error {
-	data, err := json.Marshal(snapshot)
-	if err != nil {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(snapshot); err != nil {
 		return err
 	}
-	if err := s.db.Put(keySnapshot, data); err != nil {
+	if err := s.db.Put(keySnapshot, buf.Bytes()); err != nil {
 		log.Errorf("[LSMStorage] SaveSnapshot failed: %v", err)
 		return err
 	}
@@ -238,7 +251,7 @@ func (s *StorageAdapter) ReadSnapshot() (*param.Snapshot, error) {
 		return nil, nil
 	}
 	var snapshot param.Snapshot
-	if err := json.Unmarshal(val, &snapshot); err != nil {
+	if err := gob.NewDecoder(bytes.NewReader(val)).Decode(&snapshot); err != nil {
 		return nil, err
 	}
 	return &snapshot, nil
@@ -295,25 +308,19 @@ func (s *StorageAdapter) saveMetadata() error {
 }
 
 func (s *StorageAdapter) saveFirstIndex() error {
-	data, err := json.Marshal(s.firstIndex)
-	if err != nil {
-		return err
-	}
+	data := make([]byte, 8)
+	binary.BigEndian.PutUint64(data, s.firstIndex)
 	return s.db.Put(keyFirstIndex, data)
 }
 
 func (s *StorageAdapter) saveLastIndex() error {
-	data, err := json.Marshal(s.lastIndex)
-	if err != nil {
-		return err
-	}
+	data := make([]byte, 8)
+	binary.BigEndian.PutUint64(data, s.lastIndex)
 	return s.db.Put(keyLastIndex, data)
 }
 
 func (s *StorageAdapter) saveLogSize() error {
-	data, err := json.Marshal(s.logSize)
-	if err != nil {
-		return err
-	}
+	data := make([]byte, 8)
+	binary.BigEndian.PutUint64(data, uint64(s.logSize))
 	return s.db.Put(keyLogSize, data)
 }

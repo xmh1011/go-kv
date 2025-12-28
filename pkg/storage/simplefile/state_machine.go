@@ -76,24 +76,20 @@ func (sm *StateMachine) Apply(entry param.LogEntry) any {
 	}
 
 	switch cmd.Op {
-	case "set":
+	case param.OpSet:
 		sm.kvStore[cmd.Key] = cmd.Value
 		if err := sm.persist(); err != nil {
-			// In a real system, we might want to handle persistence failure more gracefully,
-			// but for this simple implementation, logging or panicking might be the only option
-			// if we can't guarantee durability.
-			// For now, we'll just return the error as the result.
 			return err
 		}
 		return nil
-	case "delete":
+	case param.OpDelete:
 		delete(sm.kvStore, cmd.Key)
 		if err := sm.persist(); err != nil {
 			return err
 		}
 		return nil
 	default:
-		return fmt.Errorf("unknown operation: %s", cmd.Op)
+		return fmt.Errorf("unknown operation: %d", cmd.Op)
 	}
 }
 

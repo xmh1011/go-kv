@@ -426,6 +426,13 @@ func (r *Raft) decideVote(args *param.RequestVoteArgs, reply *param.RequestVoteR
 	// 检查自己是否有资格投票（在本任期内还未投票，或已投给当前候选人）。
 	canVote := r.votedFor == -1 || r.votedFor == args.CandidateID
 
+	// 检查候选人是否在自己的配置中
+	_, inConfig := findPeer(args.CandidateID, r.peerIDs)
+	if r.inJointConsensus {
+		_, inNewConfig := findPeer(args.CandidateID, r.newPeerIDs)
+		inConfig = inConfig || inNewConfig
+	}
+
 	// 检查候选人的日志是否至少和自己一样新。
 	logIsUpToDate, err := r.isLogUpToDate(args.LastLogIndex, args.LastLogTerm)
 	if err != nil {
@@ -433,8 +440,8 @@ func (r *Raft) decideVote(args *param.RequestVoteArgs, reply *param.RequestVoteR
 		return err
 	}
 
-	// 只有同时满足两个条件时，才授予投票。
-	if canVote && logIsUpToDate {
+	// 只有同时满足三个条件时，才授予投票。
+	if canVote && inConfig && logIsUpToDate {
 		if err := r.grantVote(args.CandidateID); err != nil {
 			reply.VoteGranted = false
 			return err
@@ -442,7 +449,7 @@ func (r *Raft) decideVote(args *param.RequestVoteArgs, reply *param.RequestVoteR
 		reply.VoteGranted = true
 	} else {
 		// 否则，拒绝投票，并记录详细原因。
-		log.Infof("[RequestVote] Node %d denying vote for term %d to candidate %d. (canVote=%t, logIsUpToDate=%t)", r.id, r.currentTerm, args.CandidateID, canVote, logIsUpToDate)
+		log.Infof("[RequestVote] Node %d denying vote for term %d to candidate %d. (canVote=%t, inConfig=%t, logIsUpToDate=%t)", r.id, r.currentTerm, args.CandidateID, canVote, inConfig, logIsUpToDate)
 		reply.VoteGranted = false
 	}
 	return nil

@@ -38,15 +38,15 @@ func (sm *StateMachine) Apply(entry param.LogEntry) any {
 	}
 
 	switch cmd.Op {
-	case "set":
+	case param.OpSet:
 		sm.kvStore[cmd.Key] = cmd.Value
 		return nil // 写操作通常不返回结果
-	case "delete":
+	case param.OpDelete:
 		delete(sm.kvStore, cmd.Key)
 		return nil
 	default:
 		// 对于 Get 操作，通常不通过 Apply，但这里可以返回错误
-		return fmt.Errorf("unknown operation: %s", cmd.Op)
+		return fmt.Errorf("unknown operation: %d", cmd.Op)
 	}
 }
 
