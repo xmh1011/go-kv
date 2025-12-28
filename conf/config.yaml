@@ -1,0 +1,37 @@
+server:
+  address: "0.0.0.0"
+  port: 8080
+  mode: "debug"
+
+log:
+  filename: "app.log"
+  maxsize: 10
+  maxbackups: 5
+  maxage: 30
+  compress: true
+  level: "debug"
+  console: true
+
+# Raft 配置
+raft:
+  transport: "grpc" # "tcp" or "grpc"
+  engine: "lsm"    # "lsm" or "simplefile" or "inmemory"
+  data_dir: "./data"
+  heartbeat_timeout: 50ms
+  election_timeout: 200ms
+  snapshot_threshold: 8192
+  peers:
+    - id: 1
+      address: "127.0.0.1:8001"
+    - id: 2
+      address: "127.0.0.1:8002"
+    - id: 3
+      address: "127.0.0.1:8003"
+
+# LSM 引擎配置
+lsm:
+  root_path: "./data"
+  wal_path: "./data/wal"
+  sstable_path: "./data/sst"
+  max_mem_table_size: 2097152 # 2MB
+  max_sstable_size: 2097152   # 2MB

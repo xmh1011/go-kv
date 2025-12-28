@@ -1,0 +1,17 @@
+raft:
+  id: 1
+  transport: grpc
+  engine: lsm
+  data_dir: ./data
+  peers:
+    - id: 1
+      address: 127.0.0.1:8001
+    - id: 2
+      address: 127.0.0.1:8002
+    - id: 3
+      address: 127.0.0.1:8003
+
+lsm:
+  root_path: ./data/node-1/lsm_statemachine
+  wal_path: ./data/node-1/lsm_statemachine/wal
+  sstable_path: ./data/node-1/lsm_statemachine/sst

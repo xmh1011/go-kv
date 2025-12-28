@@ -28,5 +28,16 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+
+**/*.wal
+**/*.sst
+**/*-level
+**/*.log
+**/*.wf
+/data/
+bench_test.txt
+bench_custom.txt
+coverage.txt
+**/data/
