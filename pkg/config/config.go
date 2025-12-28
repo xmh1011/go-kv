@@ -6,6 +6,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/viper"
+
 	"github.com/xmh1011/go-kv/pkg/log"
 )
 
@@ -34,11 +35,12 @@ const (
 	KeyRaftPeers             = "raft.peers"
 
 	// LSM
-	KeyLSMWALPath         = "lsm.wal_path"
-	KeyLSMSSTablePath     = "lsm.sstable_path"
-	KeyLSMRootPath        = "lsm.root_path"
-	KeyLSMMaxMemTableSize = "lsm.max_mem_table_size"
-	KeyLSMMaxSSTableSize  = "lsm.max_sstable_size"
+	KeyLSMMaxMemTableSize   = "lsm.max_mem_table_size"
+	KeyLSMMaxSSTableSize    = "lsm.max_sstable_size"
+	KeyLSMMaxIMemTableCount = "lsm.max_imem_table_count"
+	KeyLSMMinSSTableLevel   = "lsm.min_sstable_level"
+	KeyLSMMaxSSTableLevel   = "lsm.max_sstable_level"
+	KeyLSMLevelSizeBase     = "lsm.level_size_base"
 )
 
 // --- 默认值常量 ---
@@ -57,6 +59,10 @@ const (
 	DefaultSnapshotThreshold = 8192
 	DefaultMaxMemTableSize   = 2 * 1024 * 1024 // 2MB
 	DefaultMaxSSTableSize    = 2 * 1024 * 1024 // 2MB
+	DefaultMaxIMemTableCount = 10
+	DefaultMinSSTableLevel   = 0
+	DefaultMaxSSTableLevel   = 6
+	DefaultLevelSizeBase     = 2
 )
 
 // AppConfig 是总配置结构体
@@ -86,16 +92,25 @@ type PeerInfo struct {
 
 // LSMConfig 包含了 LSM 引擎的配置
 type LSMConfig struct {
-	WALPath         string `mapstructure:"wal_path"`
-	SSTablePath     string `mapstructure:"sstable_path"`
-	RootPath        string `mapstructure:"root_path"`
-	MaxMemTableSize int    `mapstructure:"max_mem_table_size"`
-	MaxSSTableSize  int    `mapstructure:"max_sstable_size"`
+	MaxMemTableSize   int `mapstructure:"max_mem_table_size"`
+	MaxSSTableSize    int `mapstructure:"max_sstable_size"`
+	MaxIMemTableCount int `mapstructure:"max_imem_table_count"`
+	MinSSTableLevel   int `mapstructure:"min_sstable_level"`
+	MaxSSTableLevel   int `mapstructure:"max_sstable_level"`
+	LevelSizeBase     int `mapstructure:"level_size_base"`
+}
+
+func init() {
+	setDefaults()
+	// 初始化时加载默认配置到 Conf，确保在不调用 Init 的情况下也有默认值
+	if err := viper.Unmarshal(&Conf); err != nil {
+		fmt.Printf("Failed to unmarshal default config: %v\n", err)
+	}
 }
 
 // Init 初始化配置
 func Init(configPath string) error {
-	// 1. 设置默认值
+	// 1. 设置默认值 (虽然 init 已经调用过，但为了确保逻辑完整性，这里保留或移除均可，保留无害)
 	setDefaults()
 
 	// 2. 读取配置文件
@@ -154,26 +169,15 @@ func setDefaults() {
 	viper.SetDefault(KeyRaftPeers, []PeerInfo{})
 
 	// LSM
-	viper.SetDefault(KeyLSMRootPath, DefaultDataDir)
-	viper.SetDefault(KeyLSMWALPath, fmt.Sprintf("%s/wal", DefaultDataDir))
-	viper.SetDefault(KeyLSMSSTablePath, fmt.Sprintf("%s/sst", DefaultDataDir))
 	viper.SetDefault(KeyLSMMaxMemTableSize, DefaultMaxMemTableSize)
 	viper.SetDefault(KeyLSMMaxSSTableSize, DefaultMaxSSTableSize)
+	viper.SetDefault(KeyLSMMaxIMemTableCount, DefaultMaxIMemTableCount)
+	viper.SetDefault(KeyLSMMinSSTableLevel, DefaultMinSSTableLevel)
+	viper.SetDefault(KeyLSMMaxSSTableLevel, DefaultMaxSSTableLevel)
+	viper.SetDefault(KeyLSMLevelSizeBase, DefaultLevelSizeBase)
 }
 
 // GetConfig 获取配置副本
 func GetConfig() AppConfig {
 	return Conf
-}
-
-func GetWALPath() string {
-	return Conf.LSM.WALPath
-}
-
-func GetSSTablePath() string {
-	return Conf.LSM.SSTablePath
-}
-
-func GetRootPath() string {
-	return Conf.LSM.RootPath
 }

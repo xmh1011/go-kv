@@ -41,3 +41,6 @@ bench_test.txt
 bench_custom.txt
 coverage.txt
 **/data/
+
+kv-client
+kv-server

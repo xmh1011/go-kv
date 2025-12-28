@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/xmh1011/go-kv/engine/lsm/kv"
+	"github.com/xmh1011/go-kv/pkg/config"
 )
 
 func TestNewSSTableBuilder(t *testing.T) {
@@ -55,17 +56,17 @@ func TestBuilder_ShouldFlush(t *testing.T) {
 	}{
 		{
 			name:     "not flush",
-			size:     maxSSTableSize - 1,
+			size:     uint64(config.Conf.LSM.MaxSSTableSize) - 1,
 			expected: false,
 		},
 		{
 			name:     "exact flush",
-			size:     maxSSTableSize,
+			size:     uint64(config.Conf.LSM.MaxSSTableSize),
 			expected: true,
 		},
 		{
 			name:     "exceed flush",
-			size:     maxSSTableSize + 1,
+			size:     uint64(config.Conf.LSM.MaxSSTableSize) + 1,
 			expected: true,
 		},
 	}

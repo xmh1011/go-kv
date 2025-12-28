@@ -2,11 +2,13 @@ package raft
 
 import (
 	"encoding/json"
+	"fmt"
 	"math/rand"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/xmh1011/go-kv/pkg/config"
 	"github.com/xmh1011/go-kv/pkg/log"
 	"github.com/xmh1011/go-kv/pkg/param"
 	"github.com/xmh1011/go-kv/pkg/storage"
@@ -62,6 +64,8 @@ type Raft struct {
 
 	// --- 选举相关 ---
 	electionResetEvent     time.Time
+	electionTimeout        time.Duration // 基础选举超时时间
+	heartbeatTimeout       time.Duration // 心跳间隔
 	currentElectionTimeout time.Duration // 当前节点的随机选举超时
 
 	// --- Leader 的易失性状态 ---
@@ -97,12 +101,15 @@ func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.
 		shutdownChan:      make(chan struct{}),
 		lastAck:           make(map[int]time.Time),
 		snapshotThreshold: -1, // 默认禁用自动快照
+		electionTimeout:   config.Conf.Raft.ElectionTimeout,
+		heartbeatTimeout:  config.Conf.Raft.HeartbeatTimeout,
 	}
 	// 从稳定存储中恢复状态。
 	if store != nil {
 		hardState, err := store.GetState()
 		if err != nil {
 			log.Fatalf("[Raft] Failed to get hard state from storage: %s", err.Error())
+			panic(fmt.Errorf("failed to get hard state: %w", err))
 		}
 		r.currentTerm = hardState.CurrentTerm
 		r.votedFor = int(hardState.VotedFor)
@@ -160,7 +167,7 @@ func (r *Raft) SetSnapshotThreshold(threshold int) {
 // 它会Ticking，检查选举超时，并在 Follower/Candidate 状态下发起选举。
 func (r *Raft) Run() {
 	log.Infof("[Core] Node %d starting main loop (Initial timeout: %s)", r.id, r.currentElectionTimeout)
-	ticker := time.NewTicker(heartbeatInterval) // 使用心跳间隔作为 tick 频率
+	ticker := time.NewTicker(r.heartbeatTimeout) // 使用心跳间隔作为 tick 频率
 	defer ticker.Stop()
 
 	for {
@@ -216,9 +223,9 @@ func (r *Raft) Stop() {
 // randomizedElectionTimeout 返回一个在 [electionTimeout, 2 * electionTimeout) 范围内的随机超时时间。
 // 这有助于防止选举时出现平票（split votes）。
 func (r *Raft) randomizedElectionTimeout() time.Duration {
-	randomRange := int64(electionTimeout)
+	randomRange := int64(r.electionTimeout)
 	randomAddition := time.Duration(rand.Int63n(randomRange))
-	return electionTimeout + randomAddition
+	return r.electionTimeout + randomAddition
 }
 
 // ClientRequest 是处理来自客户端请求的 RPC 函数。
@@ -375,7 +382,7 @@ func (r *Raft) confirmLeadership() bool {
 	majority := len(peerIDs)/2 + 1
 
 	// 设置一个较短的超时时间，避免读请求无限阻塞
-	timeout := time.After(electionTimeout)
+	timeout := time.After(r.electionTimeout)
 
 	for i := 0; i < len(requests); i++ {
 		select {
@@ -709,7 +716,7 @@ func (r *Raft) initLeaderState() {
 func (r *Raft) startHeartbeat() {
 	// This method is called with the lock held.
 	go func() {
-		ticker := time.NewTicker(heartbeatInterval)
+		ticker := time.NewTicker(r.heartbeatTimeout)
 		defer ticker.Stop()
 
 		// Send an initial heartbeat immediately without waiting for the first tick.

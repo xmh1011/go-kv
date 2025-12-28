@@ -11,6 +11,7 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/xmh1011/go-kv/pkg/config"
 	"github.com/xmh1011/go-kv/pkg/param"
 	"github.com/xmh1011/go-kv/pkg/storage"
 	"github.com/xmh1011/go-kv/pkg/transport"
@@ -452,6 +453,8 @@ func TestApplyConfigChange(t *testing.T) {
 				nextIndex:        make(map[int]uint64),
 				matchIndex:       make(map[int]uint64),
 				mu:               sync.Mutex{},
+				electionTimeout:  config.Conf.Raft.ElectionTimeout,
+				heartbeatTimeout: config.Conf.Raft.HeartbeatTimeout,
 			}
 
 			r.applyConfigChange(tt.cmd, 10)
@@ -698,13 +701,15 @@ func TestAppendEntries(t *testing.T) {
 			commitChan := make(chan param.CommitEntry, 1)
 
 			r := &Raft{
-				id:           2,
-				currentTerm:  tt.initialState.term,
-				store:        mockStore,
-				stateMachine: mockSM,
-				commitChan:   commitChan,
-				lastApplied:  tt.initialState.lastApplied,
-				mu:           sync.Mutex{},
+				id:               2,
+				currentTerm:      tt.initialState.term,
+				store:            mockStore,
+				stateMachine:     mockSM,
+				commitChan:       commitChan,
+				lastApplied:      tt.initialState.lastApplied,
+				mu:               sync.Mutex{},
+				electionTimeout:  config.Conf.Raft.ElectionTimeout,
+				heartbeatTimeout: config.Conf.Raft.HeartbeatTimeout,
 			}
 			r.lastAppliedCond = sync.NewCond(&r.mu)
 

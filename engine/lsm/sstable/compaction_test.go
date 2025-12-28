@@ -29,7 +29,7 @@ func TestSSTableManagerCompaction(t *testing.T) {
 
 		imem := memtable.NewIMemTable(mem)
 		sst := BuildSSTableFromIMemTable(imem, tmp)
-		sst.level = minSSTableLevel
+		sst.level = mgr.minSSTableLevel
 		// 手动设置路径，因为 BuildSSTableFromIMemTable 不再设置路径
 		sst.filePath = sstableFilePath(sst.id, sst.level, tmp)
 
@@ -73,7 +73,7 @@ func TestAsyncCompaction(t *testing.T) {
 	// 1. 创建 Level1 文件（超过阈值）
 	var level1Files []string
 	var tables []*SSTable
-	for i := 0; i < maxFileNumsInLevel(1)+1; i++ {
+	for i := 0; i < mgr.maxFileNumsInLevel(1)+1; i++ {
 		sst := NewSSTableWithLevel(1, tmpDir)
 		// 添加一些测试数据
 		for j := 0; j < 10; j++ {
@@ -114,7 +114,7 @@ func TestAsyncCompaction(t *testing.T) {
 	}
 
 	// 4. 验证旧文件被删除
-	for _, f := range level1Files[:maxFileNumsInLevel(1)] {
+	for _, f := range level1Files[:mgr.maxFileNumsInLevel(1)] {
 		assert.NoFileExists(t, f, "old Level1 file still exists: %s", f)
 	}
 
@@ -139,7 +139,7 @@ func TestCompactLevelWithNoFiles(t *testing.T) {
 	tmpDir := t.TempDir()
 	mgr := NewSSTableManager(tmpDir)
 
-	err := mgr.compactLevel(minSSTableLevel) // Level0
+	err := mgr.compactLevel(mgr.minSSTableLevel) // Level0
 	assert.NoError(t, err, "compacting empty level should not error")
 }
 
@@ -148,7 +148,7 @@ func TestCompactionWithInvalidSSTable(t *testing.T) {
 	mgr := NewSSTableManager(tmpDir)
 
 	// 模拟一个无效的文件路径
-	mgr.totalMap[minSSTableLevel] = []string{"1.sst", "2.sst", "3.sst"}
+	mgr.totalMap[mgr.minSSTableLevel] = []string{"1.sst", "2.sst", "3.sst"}
 
 	err := mgr.Compaction()
 	assert.Error(t, err, "compaction should fail on invalid SSTable file")
@@ -167,14 +167,14 @@ func TestRecursiveCompactionAcrossLevels(t *testing.T) {
 		})
 		imem := memtable.NewIMemTable(mem)
 		sst := BuildSSTableFromIMemTable(imem, tmpDir)
-		sst.level = minSSTableLevel
+		sst.level = mgr.minSSTableLevel
 		// 手动设置路径
 		sst.filePath = sstableFilePath(sst.id, sst.level, tmpDir)
 		_ = mgr.addNewSSTables([]*SSTable{sst})
 	}
 
 	// 伪造更多 Level1 文件以触发下一层压缩
-	for i := 0; i < maxFileNumsInLevel(1); i++ {
+	for i := 0; i < mgr.maxFileNumsInLevel(1); i++ {
 		sst := NewSSTableWithLevel(1, tmpDir)
 		sst.Header = block.NewHeader("keyA", "keyZ")
 		sst.Add(&kv.KeyValuePair{Key: "keyA", Value: []byte("valueA")})

@@ -4,6 +4,7 @@ import (
 	"container/heap"
 
 	"github.com/xmh1011/go-kv/engine/lsm/kv"
+	"github.com/xmh1011/go-kv/pkg/config"
 )
 
 // KVEntry 包装 KV 对，用于堆排序
@@ -71,7 +72,7 @@ func (m *Manager) CompactAndMergeKVs(kvs []kv.KeyValuePair, level int) []*SSTabl
 
 		// 如果不是删除标记，则写入
 		// TODO: 最后一层合并时，将删除标记的 Key 写入 tombstone 文件
-		if !currentPair.IsDeleted() || level < maxSSTableLevel {
+		if !currentPair.IsDeleted() || level < config.Conf.LSM.MaxSSTableLevel {
 			builder.Add(&currentPair)
 			lastWrittenKey = currentKey // 更新最后写入的 Key
 		}

@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/xmh1011/go-kv/engine/lsm/kv"
+	"github.com/xmh1011/go-kv/pkg/config"
 )
 
 func TestMemTableBuilderInsertAndEviction(t *testing.T) {
@@ -18,10 +19,10 @@ func TestMemTableBuilderInsertAndEviction(t *testing.T) {
 	// 手动构造 key-value 对，每次都填满 MemTable 触发 Promote
 	var evicted *IMemTable
 	var err error
-	for i := 0; i <= maxIMemTableCount; i++ {
+	for i := 0; i <= config.Conf.LSM.MaxIMemTableCount; i++ {
 		// 构造一个大的 kv，使得每次都触发 Promote
 		key := kv.Key(fmt.Sprintf("key-%03d", i))
-		value := kv.Value(make([]byte, maxMemoryTableSize)) // 触发 Flush
+		value := kv.Value(make([]byte, config.Conf.LSM.MaxMemTableSize)) // 触发 Flush
 		evicted, err = manager.Insert(kv.KeyValuePair{Key: key, Value: value})
 		assert.NoError(t, err, "should not return error on insert")
 	}
@@ -38,7 +39,7 @@ func TestMemTableBuilderInsertAndEviction(t *testing.T) {
 
 	// 验证 IMemTable 数量不超过 maxIMemTableCount
 	all := manager.GetAll()
-	assert.LessOrEqual(t, len(all), maxIMemTableCount, "should not exceed max count")
+	assert.LessOrEqual(t, len(all), config.Conf.LSM.MaxIMemTableCount, "should not exceed max count")
 
 	// 验证当前 MemTable 仍可写入
 	ok := manager.CanInsert(kv.KeyValuePair{Key: "z", Value: []byte("zzz")})
@@ -51,10 +52,10 @@ func TestInsertTriggersPromotion(t *testing.T) {
 
 	var evicted *IMemTable
 	var err error
-	for i := 0; i <= maxIMemTableCount; i++ {
+	for i := 0; i <= config.Conf.LSM.MaxIMemTableCount; i++ {
 		// 构造一个大的 kv，使得每次都触发 Promote
 		key := kv.Key(fmt.Sprintf("key-%03d", i))
-		value := kv.Value(make([]byte, maxMemoryTableSize)) // 触发 Flush
+		value := kv.Value(make([]byte, config.Conf.LSM.MaxMemTableSize)) // 触发 Flush
 		evicted, err = manager.Insert(kv.KeyValuePair{Key: key, Value: value})
 		assert.NoError(t, err, "should not return error on insert")
 	}
@@ -126,7 +127,7 @@ func TestRecoverSuccess(t *testing.T) {
 	assert.GreaterOrEqual(t, len(manager.IMems), 0)
 
 	// 确认 IMemTable 数量不超过 maxIMemTableCount
-	assert.LessOrEqual(t, len(manager.IMems), maxIMemTableCount)
+	assert.LessOrEqual(t, len(manager.IMems), config.Conf.LSM.MaxIMemTableCount)
 
 	// 检查 manager.Mem 的 id 是最后一个文件的 id
 	lastFile := mockCreateWalFile(t, tempDir, 100)
