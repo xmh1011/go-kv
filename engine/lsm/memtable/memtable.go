@@ -17,12 +17,9 @@ import (
 	"github.com/xmh1011/go-kv/engine/lsm/kv"
 	"github.com/xmh1011/go-kv/engine/lsm/memtable/skiplist"
 	"github.com/xmh1011/go-kv/engine/lsm/wal"
+	"github.com/xmh1011/go-kv/pkg/config"
 	"github.com/xmh1011/go-kv/pkg/log"
 	"github.com/xmh1011/go-kv/pkg/utils"
-)
-
-const (
-	maxMemoryTableSize = 2 * 1024 * 1024 // 2MB
 )
 
 // MemTable is an in-memory data structure used to store kv.KeyValuePairs.
@@ -35,6 +32,7 @@ type MemTable struct {
 	entries     *skiplist.SkipList
 	wal         *wal.WAL
 	sizeInBytes uint64
+	maxSize     uint64
 }
 
 // NewMemTable creates a new instance of MemTable with WAL.
@@ -49,6 +47,7 @@ func NewMemTable(id uint64, walPath string) *MemTable {
 		id:      id,
 		entries: skiplist.NewSkipList(),
 		wal:     w,
+		maxSize: uint64(config.Conf.LSM.MaxMemTableSize),
 	}
 }
 
@@ -56,6 +55,7 @@ func NewMemTableWithoutWAL() *MemTable {
 	return &MemTable{
 		entries: skiplist.NewSkipList(),
 		wal:     nil,
+		maxSize: uint64(config.Conf.LSM.MaxMemTableSize),
 	}
 }
 
@@ -117,7 +117,7 @@ func (t *MemTable) AddPair(pair kv.KeyValuePair) {
 }
 
 func (t *MemTable) CanInsert(pair kv.KeyValuePair) bool {
-	return t.ApproximateSize()+pair.EstimateSize() <= maxMemoryTableSize
+	return t.ApproximateSize()+pair.EstimateSize() <= t.maxSize
 }
 
 // RecoverFromWAL constructs up to 10 IMemTable and 1 MemTable from WAL files.

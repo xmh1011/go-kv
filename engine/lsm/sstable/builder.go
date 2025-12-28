@@ -4,23 +4,26 @@ import (
 	"github.com/xmh1011/go-kv/engine/lsm/kv"
 	"github.com/xmh1011/go-kv/engine/lsm/memtable"
 	"github.com/xmh1011/go-kv/engine/lsm/sstable/block"
+	"github.com/xmh1011/go-kv/pkg/config"
 )
 
 type Builder struct {
-	table *SSTable
-	size  uint64
+	table   *SSTable
+	size    uint64
+	maxSize uint64
 }
 
 func NewSSTableBuilder(level int, rootPath string) *Builder {
 	return &Builder{
-		table: NewSSTableWithLevel(level, rootPath),
-		size:  0,
+		table:   NewSSTableWithLevel(level, rootPath),
+		size:    0,
+		maxSize: uint64(config.Conf.LSM.MaxSSTableSize),
 	}
 }
 
 // BuildSSTableFromIMemTable 构建一个完整的 SSTable（包含 DataBlock、IndexBlock、FilterBlock）
 func BuildSSTableFromIMemTable(imem *memtable.IMemTable, rootPath string) *SSTable {
-	builder := NewSSTableBuilder(minSSTableLevel, rootPath)
+	builder := NewSSTableBuilder(config.Conf.LSM.MinSSTableLevel, rootPath)
 
 	// 遍历所有 key-value 对
 	imem.RangeScan(func(pair *kv.KeyValuePair) {
@@ -38,7 +41,7 @@ func (b *Builder) Add(pair *kv.KeyValuePair) {
 
 // ShouldFlush 判断是否应该写入磁盘
 func (b *Builder) ShouldFlush() bool {
-	return b.size >= maxSSTableSize
+	return b.size >= b.maxSize
 }
 
 // Finalize 填充 IndexBlock 和 Header

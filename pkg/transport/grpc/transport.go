@@ -11,10 +11,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xmh1011/go-kv/pkg/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/xmh1011/go-kv/pkg/log"
 	"github.com/xmh1011/go-kv/pkg/param"
 	"github.com/xmh1011/go-kv/pkg/transport/grpc/pb"
 	"github.com/xmh1011/go-kv/raft/api"

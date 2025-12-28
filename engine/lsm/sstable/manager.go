@@ -12,14 +12,9 @@ import (
 	"github.com/xmh1011/go-kv/engine/lsm/kv"
 	"github.com/xmh1011/go-kv/engine/lsm/memtable"
 	"github.com/xmh1011/go-kv/engine/lsm/sstable/block"
+	"github.com/xmh1011/go-kv/pkg/config"
 	"github.com/xmh1011/go-kv/pkg/log"
 	"github.com/xmh1011/go-kv/pkg/utils"
-)
-
-const (
-	minSSTableLevel = 0
-	maxSSTableLevel = 6
-	levelSizeBase   = 2
 )
 
 // Manager 管理内存中的 SSTable 元信息（Footer/Filter/Index）+ 磁盘中的文件记录。
@@ -43,16 +38,23 @@ type Manager struct {
 	// 异步合并控制
 	compactionCond   *sync.Cond
 	compactingLevels map[int]bool // 记录各层级的压缩状态
+
+	minSSTableLevel int
+	maxSSTableLevel int
+	levelSizeBase   int
 }
 
 func NewSSTableManager(sstPath string) *Manager {
+	minLevel := config.Conf.LSM.MinSSTableLevel
+	maxLevel := config.Conf.LSM.MaxSSTableLevel
+
 	// 创建 SSTable 目录
 	err := os.MkdirAll(sstPath, os.ModePerm)
 	if err != nil {
 		log.Errorf("[SSTableManager] Failed to create sstable directory: %s", err.Error())
 	}
 	// 为各层创建对应目录
-	for i := minSSTableLevel; i <= maxSSTableLevel; i++ {
+	for i := minLevel; i <= maxLevel; i++ {
 		if err = os.MkdirAll(sstableLevelPath(i, sstPath), os.ModePerm); err != nil {
 			log.Errorf("[SSTableManager] Failed to create sstable level %d directory: %s", i, err.Error())
 		}
@@ -60,11 +62,14 @@ func NewSSTableManager(sstPath string) *Manager {
 
 	mgr := &Manager{
 		sstPath:          sstPath,
-		levels:           make([][]*SSTable, maxSSTableLevel+1),
+		levels:           make([][]*SSTable, maxLevel+1),
 		fileIndex:        make(map[string]*SSTable),
 		totalMap:         make(map[int][]string),
 		compactingLevels: make(map[int]bool),
-		sparseIndexes:    make([][]*SSTable, maxSSTableLevel),
+		sparseIndexes:    make([][]*SSTable, maxLevel),
+		minSSTableLevel:  minLevel,
+		maxSSTableLevel:  maxLevel,
+		levelSizeBase:    config.Conf.LSM.LevelSizeBase,
 	}
 	mgr.compactionCond = sync.NewCond(&mgr.mu)
 	return mgr
@@ -99,7 +104,7 @@ func (m *Manager) CreateNewSSTable(imem *memtable.IMemTable) error {
 // 返回找到的值或错误，如果未找到返回 (nil, nil)
 func (m *Manager) Search(key kv.Key) ([]byte, error) {
 	// 1. 从高层级向低层级查找
-	for level := minSSTableLevel; level <= maxSSTableLevel; level++ {
+	for level := m.minSSTableLevel; level <= m.maxSSTableLevel; level++ {
 		// 2. 等待该层级的潜在合并完成（仅对需要等待的层级）
 		if err := m.waitForCompactionIfNeeded(level); err != nil {
 			log.Errorf("[SSTableManager] Wait for compaction at level %d failed: %s", level, err.Error())
@@ -107,7 +112,7 @@ func (m *Manager) Search(key kv.Key) ([]byte, error) {
 		}
 
 		// 3. 先从level 0开始查找
-		if level == minSSTableLevel {
+		if level == m.minSSTableLevel {
 			val, err := m.searchFromLevel0(key)
 			if err != nil {
 				log.Errorf("[SSTableManager] Search from level 0 failed: %s", err.Error())
@@ -159,7 +164,7 @@ func (m *Manager) isCompacting(level int) bool {
 }
 
 func (m *Manager) searchFromLevel0(key kv.Key) (kv.Value, error) {
-	tables := m.getLevelTables(minSSTableLevel)
+	tables := m.getLevelTables(m.minSSTableLevel)
 
 	// 在当前层级中按表ID降序查找
 	for _, table := range tables {
@@ -228,7 +233,7 @@ func (m *Manager) Recover() error {
 	var maxID uint64
 	ResetIDGenerator()
 
-	for level := minSSTableLevel; level <= maxSSTableLevel; level++ {
+	for level := m.minSSTableLevel; level <= m.maxSSTableLevel; level++ {
 		dir := sstableLevelPath(level, m.sstPath)
 		files, err := os.ReadDir(dir)
 		if err != nil {
@@ -298,7 +303,7 @@ func (m *Manager) addTable(table *SSTable) {
 	m.totalMap[level] = append(m.totalMap[level], table.FilePath())
 
 	// 更新稀疏索引（仅对 Level 1 及以上层级）
-	if level > minSSTableLevel {
+	if level > m.minSSTableLevel {
 		// 根据最小 Key 更新稀疏索引，进行插入
 		sparseIndexes := m.sparseIndexes[level-1]
 		index := sort.Search(len(sparseIndexes), func(i int) bool {
@@ -325,7 +330,7 @@ func (m *Manager) removeOldSSTables(oldFiles []string, level int) error {
 				}
 			}
 			// 从稀疏索引中移除
-			if level > minSSTableLevel {
+			if level > m.minSSTableLevel {
 				sparseIndexes := m.sparseIndexes[level-1]
 				for i, t := range sparseIndexes {
 					if t.id == sst.id {
@@ -393,11 +398,11 @@ func (m *Manager) getFilesByLevel(level int) []string {
 
 // isLevelNeedToBeMerged 检查层级是否需要合并
 func (m *Manager) isLevelNeedToBeMerged(level int) bool {
-	return len(m.getFilesByLevel(level)) > maxFileNumsInLevel(level)
+	return len(m.getFilesByLevel(level)) > m.maxFileNumsInLevel(level)
 }
 
-func maxFileNumsInLevel(level int) int {
-	return int(math.Pow(float64(levelSizeBase), float64(level+1)))
+func (m *Manager) maxFileNumsInLevel(level int) int {
+	return int(math.Pow(float64(m.levelSizeBase), float64(level+1)))
 }
 
 func (m *Manager) getSSTableByPath(path string) (*SSTable, bool) {

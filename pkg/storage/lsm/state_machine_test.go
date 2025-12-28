@@ -2,14 +2,12 @@ package lsm
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
 	"github.com/xmh1011/go-kv/engine/lsm/database"
-	"github.com/xmh1011/go-kv/pkg/config"
 	"github.com/xmh1011/go-kv/pkg/param"
 )
 
@@ -63,22 +61,7 @@ func setupTestDB(t *testing.T, name string) (*database.Database, string) {
 	dir, err := os.MkdirTemp("", name)
 	assert.NoError(t, err)
 
-	// Update config to use temp dir
-	config.Conf.LSM.RootPath = dir
-	config.Conf.LSM.WALPath = filepath.Join(dir, "wal")
-	config.Conf.LSM.SSTablePath = filepath.Join(dir, "sst")
-
-	// Create directories
-	err = os.MkdirAll(config.Conf.LSM.WALPath, 0755)
-	assert.NoError(t, err)
-	err = os.MkdirAll(config.Conf.LSM.SSTablePath, 0755)
-	assert.NoError(t, err)
-
-	for i := 0; i <= 6; i++ {
-		err = os.MkdirAll(filepath.Join(config.Conf.LSM.SSTablePath, fmt.Sprintf("%d-level", i)), 0755)
-		assert.NoError(t, err)
-	}
-
+	// database.Open 会自动在 dir 下创建 wal 和 sst 目录
 	db := database.Open(dir)
 	return db, dir
 }

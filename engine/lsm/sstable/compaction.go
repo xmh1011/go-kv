@@ -18,28 +18,28 @@ import (
 // Compaction 执行 Level0 的同步合并，并触发后续异步合并
 func (m *Manager) Compaction() error {
 	// 等待同一层级的压缩完成
-	if err := m.waitCompaction(minSSTableLevel); err != nil {
-		log.Errorf("[Compaction] Wait compaction for level %d error: %s", minSSTableLevel, err.Error())
+	if err := m.waitCompaction(m.minSSTableLevel); err != nil {
+		log.Errorf("[Compaction] Wait compaction for level %d error: %s", m.minSSTableLevel, err.Error())
 		return fmt.Errorf("wait compaction error: %w", err)
 	}
 
 	// 检查 Level0 是否需要压缩
-	if !m.isLevelNeedToBeMerged(minSSTableLevel) {
+	if !m.isLevelNeedToBeMerged(m.minSSTableLevel) {
 		log.Debug("[Compaction] Level 0 not need to be merged")
 		return nil
 	}
 
-	log.Infof("[Compaction] Starting compaction for level %d", minSSTableLevel)
+	log.Infof("[Compaction] Starting compaction for level %d", m.minSSTableLevel)
 	// 开始 Level0 压缩
-	if err := m.compactLevel(minSSTableLevel); err != nil {
-		log.Errorf("[Compaction] Compact level %d error: %s", minSSTableLevel, err.Error())
-		return fmt.Errorf("compact level %d error: %w", minSSTableLevel, err)
+	if err := m.compactLevel(m.minSSTableLevel); err != nil {
+		log.Errorf("[Compaction] Compact level %d error: %s", m.minSSTableLevel, err.Error())
+		return fmt.Errorf("compact level %d error: %w", m.minSSTableLevel, err)
 	}
 
 	// 触发下一层级异步压缩（如果需要）
-	if m.isLevelNeedToBeMerged(minSSTableLevel + 1) {
-		log.Infof("[Compaction] Triggering async compaction for level %d", minSSTableLevel+1)
-		go m.asyncCompactLevel(minSSTableLevel + 1)
+	if m.isLevelNeedToBeMerged(m.minSSTableLevel + 1) {
+		log.Infof("[Compaction] Triggering async compaction for level %d", m.minSSTableLevel+1)
+		go m.asyncCompactLevel(m.minSSTableLevel + 1)
 	}
 
 	return nil
@@ -67,7 +67,7 @@ func (m *Manager) asyncCompactLevel(level int) {
 		}
 
 		// 如果下一层级仍需压缩，继续循环（仅对中间层级）
-		if level < maxSSTableLevel && m.isLevelNeedToBeMerged(level+1) {
+		if level < m.maxSSTableLevel && m.isLevelNeedToBeMerged(level+1) {
 			continue
 		}
 		return
@@ -84,8 +84,8 @@ func (m *Manager) compactLevel(level int) error {
 	files := m.getFilesByLevel(level)
 	// 对于 level 1 及以上的层级
 	// 按照时间顺序，只合并超出数量的旧文件
-	if level > minSSTableLevel {
-		files = files[:maxFileNumsInLevel(level)]
+	if level > m.minSSTableLevel {
+		files = files[:m.maxFileNumsInLevel(level)]
 	}
 	allPairs, err := m.loadLevelData(files)
 	if err != nil {
@@ -96,7 +96,7 @@ func (m *Manager) compactLevel(level int) error {
 	// 2. 加载重叠文件
 	var nextLevelPairs []kv.KeyValuePair
 	var oldNextFiles []string
-	if level < maxSSTableLevel {
+	if level < m.maxSSTableLevel {
 		minK, maxK := getGlobalKeyRangeFromPairs(allPairs)
 		nextLevelPairs, oldNextFiles, err = m.mergeNextLevelFiles(level+1, minK, maxK)
 		if err != nil {
@@ -130,7 +130,7 @@ func (m *Manager) compactLevel(level int) error {
 	log.Infof("[Compaction] Level %d compaction finished, generated %d new tables", level, len(newTables))
 
 	// 6. 如果目标层级仍需压缩，递归处理（仅对中间层级）
-	if level < maxSSTableLevel && m.isLevelNeedToBeMerged(level+1) {
+	if level < m.maxSSTableLevel && m.isLevelNeedToBeMerged(level+1) {
 		return m.compactLevel(level + 1)
 	}
 

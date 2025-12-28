@@ -13,6 +13,7 @@ import (
 	"github.com/xmh1011/go-kv/engine/lsm/memtable"
 	"github.com/xmh1011/go-kv/engine/lsm/sstable/block"
 	"github.com/xmh1011/go-kv/engine/lsm/sstable/bloom"
+	"github.com/xmh1011/go-kv/pkg/config"
 )
 
 func TestSSTableManagerCreateNewSSTable(t *testing.T) {
@@ -136,7 +137,7 @@ func TestSSTableManagerSearch(t *testing.T) {
 
 func TestSSTableManagerRecover(t *testing.T) {
 	tmp := t.TempDir()
-	for level := 0; level <= maxSSTableLevel; level++ {
+	for level := 0; level <= config.Conf.LSM.MaxSSTableLevel; level++ {
 		dir := sstableLevelPath(level, tmp)
 		err := os.MkdirAll(dir, 0755)
 		assert.NoError(t, err, "Failed to create directory for level %d", level)
@@ -257,7 +258,7 @@ func TestIsLevelNeedToBeMerged(t *testing.T) {
 
 	// 模拟超过限制的文件
 	level := 2
-	numsInLevel := maxFileNumsInLevel(level)
+	numsInLevel := manager.maxFileNumsInLevel(level)
 	paths := make([]string, numsInLevel+1)
 	for i := 0; i < numsInLevel+1; i++ {
 		paths[i] = filepath.Join("mock", fmt.Sprintf("%d.sst", i))
@@ -297,7 +298,7 @@ func TestAddNewSSTablesFailToWrite(t *testing.T) {
 
 func TestRecoverMultipleLevels(t *testing.T) {
 	tmp := t.TempDir()
-	for level := 0; level <= maxSSTableLevel; level++ {
+	for level := 0; level <= config.Conf.LSM.MaxSSTableLevel; level++ {
 		dir := sstableLevelPath(level, tmp)
 		err := os.MkdirAll(dir, 0755)
 		assert.NoError(t, err, "Failed to create directory for level %d", level)
@@ -317,7 +318,7 @@ func TestRecoverMultipleLevels(t *testing.T) {
 	err := manager.Recover()
 	assert.NoError(t, err)
 
-	for level := 0; level <= maxSSTableLevel; level++ {
+	for level := 0; level <= config.Conf.LSM.MaxSSTableLevel; level++ {
 		tables := manager.getLevelTables(level)
 		assert.Len(t, tables, 1)
 		assert.Equal(t, uint64(level+1), tables[0].id)

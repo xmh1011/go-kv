@@ -10,6 +10,7 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/xmh1011/go-kv/pkg/config"
 	"github.com/xmh1011/go-kv/pkg/param"
 	"github.com/xmh1011/go-kv/pkg/storage"
 	"github.com/xmh1011/go-kv/pkg/transport"
@@ -462,12 +463,14 @@ func TestRequestVote(t *testing.T) {
 			}
 
 			r := &Raft{
-				id:          2,
-				currentTerm: tt.initialState.term,
-				votedFor:    tt.initialState.votedFor,
-				state:       tt.initialState.state,
-				store:       mockStore,
-				mu:          sync.Mutex{},
+				id:               2,
+				currentTerm:      tt.initialState.term,
+				votedFor:         tt.initialState.votedFor,
+				state:            tt.initialState.state,
+				store:            mockStore,
+				mu:               sync.Mutex{},
+				electionTimeout:  config.Conf.Raft.ElectionTimeout,
+				heartbeatTimeout: config.Conf.Raft.HeartbeatTimeout,
 			}
 
 			reply := &param.RequestVoteReply{}

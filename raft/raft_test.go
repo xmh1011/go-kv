@@ -10,6 +10,7 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/xmh1011/go-kv/pkg/config"
 	"github.com/xmh1011/go-kv/pkg/param"
 	"github.com/xmh1011/go-kv/pkg/storage"
 	"github.com/xmh1011/go-kv/pkg/transport"
@@ -704,12 +705,14 @@ func TestWaitForAppliedLog_Timeout(t *testing.T) {
 // TestRandomizedElectionTimeout 验证随机超时是否落在 [T, 2T) 区间内。
 func TestRandomizedElectionTimeout(t *testing.T) {
 	// 创建一个 Raft 实例以访问其上的常量
-	r := &Raft{}
+	r := &Raft{
+		electionTimeout: config.Conf.Raft.ElectionTimeout,
+	}
 
 	for i := 0; i < 100; i++ {
 		timeout := r.randomizedElectionTimeout()
-		assert.GreaterOrEqual(t, timeout, electionTimeout, "Timeout should be >= base electionTimeout")
-		assert.Less(t, timeout, 2*electionTimeout, "Timeout should be < 2 * base electionTimeout")
+		assert.GreaterOrEqual(t, timeout, r.electionTimeout, "Timeout should be >= base electionTimeout")
+		assert.Less(t, timeout, 2*r.electionTimeout, "Timeout should be < 2 * base electionTimeout")
 	}
 }
 

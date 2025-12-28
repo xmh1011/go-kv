@@ -19,7 +19,7 @@ IMPORTS_ORDER := "std,general,company,project"
 
 # --- Targets ---
 
-.PHONY: all deps build test integration-test cover install-mockgen mockgen clean help cluster stop-cluster proto install-protoc-gen install-go-imports-reviser format gen-config
+.PHONY: all deps build test integration-test cover install-mockgen mockgen clean help cluster stop-cluster proto install-protoc-gen install-go-imports-reviser format
 
 .DEFAULT_GOAL := help
 
@@ -81,33 +81,8 @@ proto: install-protoc-gen
 		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
 		pkg/transport/grpc/pb/raft.proto
 
-## gen-config: Generate configuration files for a 3-node cluster.
-gen-config:
-	@echo " generating cluster configuration files..."
-	@mkdir -p conf
-	@for i in 1 2 3; do \
-		echo "raft:" > conf/config-$$i.yaml; \
-		echo "  id: $$i" >> conf/config-$$i.yaml; \
-		echo "  transport: grpc" >> conf/config-$$i.yaml; \
-		echo "  engine: lsm" >> conf/config-$$i.yaml; \
-		echo "  data_dir: ./data" >> conf/config-$$i.yaml; \
-		echo "  peers:" >> conf/config-$$i.yaml; \
-		echo "    - id: 1" >> conf/config-$$i.yaml; \
-		echo "      address: 127.0.0.1:8001" >> conf/config-$$i.yaml; \
-		echo "    - id: 2" >> conf/config-$$i.yaml; \
-		echo "      address: 127.0.0.1:8002" >> conf/config-$$i.yaml; \
-		echo "    - id: 3" >> conf/config-$$i.yaml; \
-		echo "      address: 127.0.0.1:8003" >> conf/config-$$i.yaml; \
-		echo "" >> conf/config-$$i.yaml; \
-		echo "lsm:" >> conf/config-$$i.yaml; \
-		echo "  root_path: ./data/node-$$i/lsm_statemachine" >> conf/config-$$i.yaml; \
-		echo "  wal_path: ./data/node-$$i/lsm_statemachine/wal" >> conf/config-$$i.yaml; \
-		echo "  sstable_path: ./data/node-$$i/lsm_statemachine/sst" >> conf/config-$$i.yaml; \
-	done
-	@echo " configuration files generated in conf/"
-
 ## cluster: Start a 3-node local cluster using generated configs.
-cluster: build gen-config
+cluster: build
 	@echo " starting 3-node cluster..."
 	@mkdir -p data
 	@nohup ./$(SERVER_BINARY) -c conf/config-1.yaml > raft-node-1.log 2>&1 & echo $$! > raft-node-1.pid

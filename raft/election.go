@@ -9,11 +9,6 @@ import (
 	"github.com/xmh1011/go-kv/pkg/param"
 )
 
-const (
-	heartbeatInterval = 50 * time.Millisecond  // 心跳间隔
-	electionTimeout   = 200 * time.Millisecond // 选举超时时间
-)
-
 // electionContext 是一个辅助结构体，用于封装单次选举过程中的所有状态。
 type electionContext struct {
 	// --- 配置信息 ---
@@ -174,7 +169,7 @@ func (r *Raft) handlePreVote(args *param.RequestVoteArgs, reply *param.RequestVo
 // leaderHasLease 检查当前节点是否持有有效的 Leader 租约。
 // 如果距离上次收到 Leader 心跳的时间小于最小选举超时时间，则认为 Leader 存活。
 func (r *Raft) leaderHasLease() bool {
-	return time.Since(r.electionResetEvent) < electionTimeout
+	return time.Since(r.electionResetEvent) < r.electionTimeout
 }
 
 // initializeCandidateState 负责将节点状态转换为 Candidate，更新任期，投票给自己，并持久化这些变更。
@@ -266,7 +261,7 @@ func (r *Raft) handleElectionResult(voteChan <-chan *param.VoteResult, electionT
 	}
 
 	// 2. 启动选举计时器。
-	electionTimer := time.NewTimer(electionTimeout)
+	electionTimer := time.NewTimer(r.electionTimeout)
 	defer electionTimer.Stop()
 
 	// 3. 循环等待，直到选举获胜或超时。

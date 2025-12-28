@@ -10,6 +10,7 @@ import (
 
 	"github.com/xmh1011/go-kv/engine/lsm/kv"
 	"github.com/xmh1011/go-kv/engine/lsm/sstable/block"
+	"github.com/xmh1011/go-kv/pkg/config"
 )
 
 func setupTestEnv(t *testing.T) string {
@@ -248,7 +249,7 @@ func TestEncodeDecode_EmptySSTable(t *testing.T) {
 	tempDir := setupTestEnv(t)
 	defer cleanupTestEnv(t, tempDir)
 
-	table := createSampleSSTable(minSSTableLevel, tempDir)
+	table := createSampleSSTable(config.Conf.LSM.MinSSTableLevel, tempDir)
 	err := table.EncodeTo(table.filePath)
 	assert.NoError(t, err)
 	assert.FileExists(t, table.filePath)

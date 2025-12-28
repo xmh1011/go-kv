@@ -15,9 +15,8 @@ import (
 )
 
 const (
-	sstFileSuffix  = "sst"
-	levelSuffix    = "level"
-	maxSSTableSize = 2 * 1024 * 1024 // 2MB
+	sstFileSuffix = "sst"
+	levelSuffix   = "level"
 )
 
 var idGenerator atomic.Uint64

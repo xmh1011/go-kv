@@ -8,12 +8,9 @@ import (
 	"sync/atomic"
 
 	"github.com/xmh1011/go-kv/engine/lsm/kv"
+	"github.com/xmh1011/go-kv/pkg/config"
 	"github.com/xmh1011/go-kv/pkg/log"
 	"github.com/xmh1011/go-kv/pkg/utils"
-)
-
-const (
-	maxIMemTableCount = 10
 )
 
 var idGenerator atomic.Uint64
@@ -24,10 +21,11 @@ func ResetIDGenerator() {
 }
 
 type Manager struct {
-	mu      sync.RWMutex
-	walPath string
-	Mem     *MemTable
-	IMems   []*IMemTable
+	mu                sync.RWMutex
+	walPath           string
+	Mem               *MemTable
+	IMems             []*IMemTable
+	maxIMemTableCount int
 }
 
 func NewMemTableManager(walPath string) *Manager {
@@ -37,9 +35,10 @@ func NewMemTableManager(walPath string) *Manager {
 	}
 
 	return &Manager{
-		walPath: walPath,
-		Mem:     NewMemTable(idGenerator.Add(1), walPath),
-		IMems:   make([]*IMemTable, 0),
+		walPath:           walPath,
+		Mem:               NewMemTable(idGenerator.Add(1), walPath),
+		IMems:             make([]*IMemTable, 0),
+		maxIMemTableCount: config.Conf.LSM.MaxIMemTableCount,
 	}
 }
 
@@ -125,7 +124,7 @@ func (m *Manager) GetAll() []*IMemTable {
 // promoteLocked：仅在已持有写锁的情况下调用！
 func (m *Manager) promoteLocked() *IMemTable {
 	var evicted *IMemTable
-	if len(m.IMems) >= maxIMemTableCount {
+	if len(m.IMems) >= m.maxIMemTableCount {
 		evicted = m.IMems[0]
 		m.IMems = m.IMems[1:]
 		log.Warn("[MemTableManager] Too many Immutable MemTables, evicting oldest")
@@ -206,8 +205,8 @@ func (m *Manager) Recover() error {
 	}
 
 	// 保证最多 10 个 IMemTable
-	if len(m.IMems) > maxIMemTableCount {
-		m.IMems = m.IMems[len(m.IMems)-maxIMemTableCount:]
+	if len(m.IMems) > m.maxIMemTableCount {
+		m.IMems = m.IMems[len(m.IMems)-m.maxIMemTableCount:]
 	}
 
 	log.Infof("[MemTableManager] Recovered %d Immutable MemTables and 1 Active MemTable", len(m.IMems))
