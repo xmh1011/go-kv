@@ -26,7 +26,7 @@ func TestStateMachineAdapter_ApplyAndGet(t *testing.T) {
 	defer adapter.Close()
 
 	// Test Set
-	cmd := param.KVCommand{Op: "set", Key: "key1", Value: "value1"}
+	cmd := param.KVCommand{Op: param.OpSet, Key: "key1", Value: "value1"}
 	cmdBytes, _ := json.Marshal(cmd)
 	entry := param.LogEntry{Command: cmdBytes}
 
@@ -39,7 +39,7 @@ func TestStateMachineAdapter_ApplyAndGet(t *testing.T) {
 	assert.Equal(t, "value1", val)
 
 	// Test Delete
-	cmd = param.KVCommand{Op: "delete", Key: "key1"}
+	cmd = param.KVCommand{Op: param.OpDelete, Key: "key1"}
 	cmdBytes, _ = json.Marshal(cmd)
 	entry = param.LogEntry{Command: cmdBytes}
 

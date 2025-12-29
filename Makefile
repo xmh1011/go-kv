@@ -120,7 +120,6 @@ clean:
 	@echo " cleaning up..."
 	@go clean -testcache
 	@rm -f coverage.txt unittest.txt $(SERVER_BINARY) $(CLIENT_BINARY) raft-node-*.log raft-node-*.pid
-	@rm -rf data conf/config-*.yaml
 	@find . -type f -name "*.sst" -delete
 	@find . -type f -name "*.wal" -delete
 	@find . -type f -name "*.wf" -delete

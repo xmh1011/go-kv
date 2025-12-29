@@ -2,6 +2,8 @@ package param
 
 import (
 	"encoding/gob"
+	"encoding/json"
+	"fmt"
 )
 
 func init() {
@@ -46,9 +48,43 @@ func NewConfigChangeCommand(newPeerIDs []int) ConfigChangeCommand {
 	}
 }
 
+type OpType int
+
+const (
+	OpUnknown OpType = iota
+	OpGet
+	OpSet
+	OpDelete
+)
+
+func StringToOpType(s string) OpType {
+	switch s {
+	case "get":
+		return OpGet
+	case "set":
+		return OpSet
+	case "delete":
+		return OpDelete
+	default:
+		return OpUnknown
+	}
+}
+
+// UnmarshalJSON 支持从 int 或 string 反序列化 OpType
+func (o *OpType) UnmarshalJSON(data []byte) error {
+	// 尝试作为整数解析
+	var i int
+	if err := json.Unmarshal(data, &i); err == nil {
+		*o = OpType(i)
+		return nil
+	}
+
+	return fmt.Errorf("cannot unmarshal %s into OpType", data)
+}
+
 // KVCommand 定义了客户端与状态机交互的命令格式。
 type KVCommand struct {
-	Op    string `json:"op"`
+	Op    OpType `json:"op"`
 	Key   string `json:"key"`
 	Value string `json:"value"`
 }

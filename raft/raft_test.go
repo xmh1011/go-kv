@@ -430,7 +430,7 @@ func TestHandleLinearizableRead(t *testing.T) {
 				commitIndex: 10,
 				lastApplied: 10,
 			},
-			cmd: param.KVCommand{Op: "get", Key: "testKey"},
+			cmd: param.KVCommand{Op: param.OpGet, Key: "testKey"},
 			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine, r *Raft) {
 				s.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 1, Index: 10}, nil).AnyTimes()
 				tr.EXPECT().SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).
@@ -450,7 +450,7 @@ func TestHandleLinearizableRead(t *testing.T) {
 				state:       Follower,
 				knownLeader: 3,
 			},
-			cmd:             param.KVCommand{Op: "get", Key: "testKey"},
+			cmd:             param.KVCommand{Op: param.OpGet, Key: "testKey"},
 			setupMocks:      nil,
 			expectedSuccess: false,
 			expectedNotLdr:  true,
@@ -462,7 +462,7 @@ func TestHandleLinearizableRead(t *testing.T) {
 				term:  1,
 				state: Leader,
 			},
-			cmd: param.KVCommand{Op: "get", Key: "testKey"},
+			cmd: param.KVCommand{Op: param.OpGet, Key: "testKey"},
 			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine, r *Raft) {
 				s.EXPECT().GetEntry(gomock.Any()).Return(&param.LogEntry{Term: 1, Index: 0}, nil).AnyTimes()
 				tr.EXPECT().SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).
@@ -481,7 +481,7 @@ func TestHandleLinearizableRead(t *testing.T) {
 				commitIndex: 10,
 				lastApplied: 9, // Lagging behind
 			},
-			cmd: param.KVCommand{Op: "get", Key: "testKey"},
+			cmd: param.KVCommand{Op: param.OpGet, Key: "testKey"},
 			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine, r *Raft) {
 				s.EXPECT().GetEntry(gomock.Any()).Return(&param.LogEntry{Term: 1, Index: 10}, nil).AnyTimes()
 				tr.EXPECT().SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).
@@ -925,7 +925,7 @@ func TestTimeoutResets(t *testing.T) {
 
 // helper function 构造一个 "get" 命令
 func newGetCommand(t *testing.T, key string) []byte {
-	cmd := param.KVCommand{Op: "get", Key: key}
+	cmd := param.KVCommand{Op: param.OpGet, Key: key}
 	b, err := json.Marshal(cmd)
 	assert.NoError(t, err)
 	return b
@@ -933,7 +933,7 @@ func newGetCommand(t *testing.T, key string) []byte {
 
 // helper function 构造一个 "set" 命令
 func newSetCommand(t *testing.T, key, value string) []byte {
-	cmd := param.KVCommand{Op: "set", Key: key, Value: value}
+	cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 	b, err := json.Marshal(cmd)
 	assert.NoError(t, err)
 	return b

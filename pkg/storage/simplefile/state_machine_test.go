@@ -24,7 +24,7 @@ func newTestStateMachine(t *testing.T) (*StateMachine, string) {
 func createLogEntry(t *testing.T, op, key, value string) param.LogEntry {
 	t.Helper()
 	cmd := param.KVCommand{
-		Op:    op,
+		Op:    param.StringToOpType(op),
 		Key:   key,
 		Value: value,
 	}

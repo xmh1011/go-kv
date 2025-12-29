@@ -14,7 +14,7 @@ import (
 func createLogEntry(t *testing.T, op, key, value string) param.LogEntry {
 	t.Helper() // Mark this as a test helper function
 	cmd := param.KVCommand{
-		Op:    op,
+		Op:    param.StringToOpType(op),
 		Key:   key,
 		Value: value,
 	}

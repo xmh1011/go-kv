@@ -22,7 +22,7 @@ func init() {
 	logger.SetOutput(os.Stdout)
 	logger.SetFormatter(&logrus.TextFormatter{
 		FullTimestamp:          true,
-		TimestampFormat:        "2006-01-02 15:04:05",
+		TimestampFormat:        time.DateTime,
 		DisableLevelTruncation: true, // 防止日志级别被截断
 	})
 	logger.SetLevel(logrus.InfoLevel)
