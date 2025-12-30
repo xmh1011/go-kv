@@ -53,7 +53,7 @@ type Raft struct {
 	// --- 日志与状态机相关 ---
 	commitIndex     uint64
 	lastApplied     uint64
-	commitChan      chan<- param.CommitEntry
+	commitChan      chan param.CommitEntry
 	lastAppliedCond *sync.Cond // 用于等待 lastApplied 赶上 commitIndex
 
 	// --- 快照相关 ---
@@ -83,7 +83,7 @@ type Raft struct {
 
 // NewRaft 创建一个新的 Raft 节点。
 // 注意：store 参数的类型现在是 storage.KVStorage。
-func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.StateMachine, trans transport.Transport, commitChan chan<- param.CommitEntry) *Raft {
+func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.StateMachine, trans transport.Transport, commitChan chan param.CommitEntry) *Raft {
 	r := &Raft{
 		id:                id,
 		peerIDs:           peerIDs,
@@ -141,6 +141,11 @@ func (r *Raft) StateMachine() storage.StateMachine {
 
 func (r *Raft) Transport() transport.Transport {
 	return r.trans
+}
+
+// CommitChan 返回用于接收提交条目的只读通道。
+func (r *Raft) CommitChan() <-chan param.CommitEntry {
+	return r.commitChan
 }
 
 // State 返回当前节点的状态。
