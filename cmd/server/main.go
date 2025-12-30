@@ -64,11 +64,8 @@ func runServer(_ *cobra.Command, _ []string) error {
 
 // Server represents the Raft server instance
 type Server struct {
-	config     config.AppConfig
-	raft       *raft.Raft
-	transport  transport.Transport
-	store      storage.Storage
-	commitChan chan param.CommitEntry
+	config config.AppConfig
+	raft   *raft.Raft
 }
 
 // NewServer creates a new Server instance
@@ -107,23 +104,20 @@ func NewServer(cfg config.AppConfig) (*Server, error) {
 	rf := raft.NewRaft(cfg.Raft.ID, peerIDs, store, stateMachine, trans, commitChan)
 
 	return &Server{
-		config:     cfg,
-		raft:       rf,
-		transport:  trans,
-		store:      store,
-		commitChan: commitChan,
+		config: cfg,
+		raft:   rf,
 	}, nil
 }
 
 // Start starts the Raft server components
 func (s *Server) Start() error {
 	// Register Raft to transport
-	s.transport.RegisterRaft(s.raft)
+	s.raft.Transport().RegisterRaft(s.raft)
 
 	// Start transport service
 	go func() {
-		log.Infof("Starting %s transport service on %s", s.config.Raft.Transport, s.transport.Addr())
-		if err := s.transport.Start(); err != nil {
+		log.Infof("Starting %s transport service on %s", s.config.Raft.Transport, s.raft.Transport().Addr())
+		if err := s.raft.Transport().Start(); err != nil {
 			log.Fatalf("Failed to start transport service: %v", err)
 		}
 	}()
@@ -142,11 +136,11 @@ func (s *Server) Start() error {
 func (s *Server) Stop() {
 	log.Info("Shutting down...")
 	s.raft.Stop()
-	if err := s.transport.Close(); err != nil {
+	if err := s.raft.Transport().Close(); err != nil {
 		log.Errorf("Failed to close transport: %s", err.Error())
 	}
-	if s.store != nil {
-		if err := s.store.Close(); err != nil {
+	if s.raft.Storage() != nil {
+		if err := s.raft.Storage().Close(); err != nil {
 			log.Errorf("Failed to close store: %s", err.Error())
 		}
 	}
@@ -154,7 +148,7 @@ func (s *Server) Stop() {
 }
 
 func (s *Server) handleCommits() {
-	for entry := range s.commitChan {
+	for entry := range s.raft.CommitChan() {
 		log.Debugf("Node %d committed entry: index=%d term=%d command=%v", s.config.Raft.ID, entry.Index, entry.Term, entry.Command)
 	}
 }
