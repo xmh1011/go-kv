@@ -155,18 +155,42 @@ func TestSSTableIterator(t *testing.T) {
 	})
 
 	t.Run("PositioningMethods", func(t *testing.T) {
-		iter := NewSSTableIterator(loaded)
-		defer iter.Close()
+		tests := []struct {
+			name        string
+			action      func(it *Iterator)
+			expectKey   kv.Key
+			expectValid bool
+		}{
+			{
+				name: "SeekToFirst",
+				action: func(it *Iterator) {
+					it.SeekToFirst()
+				},
+				expectKey:   "a",
+				expectValid: true,
+			},
+			{
+				name: "SeekToLast",
+				action: func(it *Iterator) {
+					it.SeekToLast()
+				},
+				expectKey:   "e",
+				expectValid: true,
+			},
+		}
 
-		// 测试SeekToFirst
-		iter.SeekToFirst()
-		assert.True(t, iter.Valid())
-		assert.Equal(t, "a", string(iter.Key()))
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				iter := NewSSTableIterator(loaded)
+				defer iter.Close()
 
-		// 测试SeekToLast
-		iter.SeekToLast()
-		assert.True(t, iter.Valid())
-		assert.Equal(t, "e", string(iter.Key()))
+				tt.action(iter)
+				assert.Equal(t, tt.expectValid, iter.Valid())
+				if tt.expectValid {
+					assert.Equal(t, tt.expectKey, iter.Key())
+				}
+			})
+		}
 	})
 }
 
@@ -182,10 +206,19 @@ func TestFilterBlockIntegration(t *testing.T) {
 	err = loaded.DecodeFrom(filePath)
 	assert.NoError(t, err)
 
-	// 测试存在的键
-	assert.True(t, loaded.FilterBlock.MayContain("a"))
-	assert.True(t, loaded.FilterBlock.MayContain("e"))
+	tests := []struct {
+		name     string
+		key      string
+		expected bool
+	}{
+		{"ExistingKey_a", "a", true},
+		{"ExistingKey_e", "e", true},
+		{"NonExistingKey_x", "x", false},
+	}
 
-	// 测试不存在的键
-	assert.False(t, loaded.FilterBlock.MayContain("x"))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, loaded.FilterBlock.MayContain(kv.Key(tt.key)))
+		})
+	}
 }
