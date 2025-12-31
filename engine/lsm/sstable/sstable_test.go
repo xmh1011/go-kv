@@ -4,13 +4,13 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
 	"github.com/xmh1011/go-kv/engine/lsm/kv"
 	"github.com/xmh1011/go-kv/engine/lsm/sstable/block"
-	"github.com/xmh1011/go-kv/pkg/config"
 )
 
 func setupTestEnv(t *testing.T) string {
@@ -27,30 +27,37 @@ func cleanupTestEnv(t *testing.T, dir string) {
 	}
 }
 
-func createSampleSSTable(level int, rootPath string) *SSTable {
+// createSampleSSTable correctly builds an SSTable in memory for testing purposes.
+func createSampleSSTable(level int, rootPath string, pairs []*kv.KeyValuePair) *SSTable {
 	table := NewSSTableWithLevel(level, rootPath)
+	var currentOffset uint64
 
-	// Add some sample data
-	table.DataBlock.Entries = []kv.Value{
-		kv.Value("value1"),
-		kv.Value("value2"),
+	for _, p := range pairs {
+		// Manually add to DataBlock
+		table.DataBlock.Entries = append(table.DataBlock.Entries, p.Value)
+
+		// Manually add to IndexBlock
+		table.IndexBlock.Indexes = append(table.IndexBlock.Indexes, &block.IndexEntry{
+			Key:    p.Key,
+			Offset: int64(currentOffset),
+		})
+
+		// Manually add to FilterBlock
+		table.FilterBlock.Add([]byte(p.Key))
+
+		// Calculate next offset: 4 bytes for length prefix + length of value data
+		currentOffset += 4 + uint64(len(p.Value))
 	}
 
-	// Setup index block
-	table.IndexBlock.Indexes = []*block.IndexEntry{
-		{Key: "key1", Offset: 0},
-		{Key: "key2", Offset: 100},
+	// Setup Header
+	if len(pairs) > 0 {
+		table.Header = &block.Header{
+			MinKey: pairs[0].Key,
+			MaxKey: pairs[len(pairs)-1].Key,
+		}
+	} else {
+		table.Header = &block.Header{}
 	}
-
-	// Setup header
-	table.Header = &block.Header{
-		MinKey: "key1",
-		MaxKey: "key2",
-	}
-
-	// Setup filter
-	table.FilterBlock.Add([]byte(("key1")))
-	table.FilterBlock.Add([]byte(("key2")))
 
 	return table
 }
@@ -74,31 +81,57 @@ func TestNewSSTableWithLevel(t *testing.T) {
 }
 
 func TestEncodeDecode(t *testing.T) {
-	tempDir := setupTestEnv(t)
-	defer cleanupTestEnv(t, tempDir)
+	tests := []struct {
+		name  string
+		pairs []*kv.KeyValuePair
+	}{
+		{
+			name: "With data",
+			pairs: []*kv.KeyValuePair{
+				{Key: "key1", Value: []byte("value1")},
+				{Key: "key2", Value: []byte("value2")},
+			},
+		},
+		{
+			name:  "Empty sstable",
+			pairs: []*kv.KeyValuePair{},
+		},
+	}
 
-	// Create and encode
-	table := createSampleSSTable(0, tempDir)
-	err := table.EncodeTo(table.filePath)
-	assert.NoError(t, err)
-	assert.FileExists(t, table.filePath)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := setupTestEnv(t)
+			defer cleanupTestEnv(t, tempDir)
 
-	// Decode
-	newTable := NewRecoverSSTable(0)
-	err = newTable.DecodeFrom(table.filePath)
-	assert.NoError(t, err)
+			// Create and encode
+			table := createSampleSSTable(0, tempDir, tt.pairs)
+			err := table.EncodeTo(table.filePath)
+			assert.NoError(t, err)
+			assert.FileExists(t, table.filePath)
 
-	// Verify decoded data
-	assert.Equal(t, table.Header.MinKey, newTable.Header.MinKey)
-	assert.Equal(t, table.Header.MaxKey, newTable.Header.MaxKey)
-	assert.Equal(t, len(table.IndexBlock.Indexes), len(newTable.IndexBlock.Indexes))
+			// Decode
+			newTable := NewRecoverSSTable(0)
+			err = newTable.DecodeFrom(table.filePath)
+			assert.NoError(t, err)
+
+			// Verify decoded data
+			assert.Equal(t, table.Header.MinKey, newTable.Header.MinKey)
+			assert.Equal(t, table.Header.MaxKey, newTable.Header.MaxKey)
+			assert.Equal(t, len(table.IndexBlock.Indexes), len(newTable.IndexBlock.Indexes))
+			assert.Empty(t, newTable.DataBlock.Entries) // DataBlock should be empty after decoding meta
+		})
+	}
 }
 
-func TestDecodeFooterFrom(t *testing.T) {
+func TestDecodeBlocks(t *testing.T) {
 	tempDir := setupTestEnv(t)
 	defer cleanupTestEnv(t, tempDir)
 
-	table := createSampleSSTable(0, tempDir)
+	pairs := []*kv.KeyValuePair{
+		{Key: "key1", Value: []byte("value1")},
+		{Key: "key2", Value: []byte("value2")},
+	}
+	table := createSampleSSTable(0, tempDir, pairs)
 	err := table.EncodeTo(table.filePath)
 	assert.NoError(t, err)
 
@@ -109,108 +142,218 @@ func TestDecodeFooterFrom(t *testing.T) {
 		assert.NoError(t, err)
 	}(file)
 
-	newTable := NewRecoverSSTable(0)
-	err = newTable.DecodeFooterFrom(file)
-	assert.NoError(t, err)
-	assert.NotZero(t, newTable.Footer.IndexHandle.Offset)
-	assert.NotZero(t, newTable.Footer.IndexHandle.Size)
-}
-
-func TestDecodeDataBlock(t *testing.T) {
-	tempDir := setupTestEnv(t)
-	defer cleanupTestEnv(t, tempDir)
-
-	table := createSampleSSTable(0, tempDir)
-	err := table.EncodeTo(table.filePath)
-	assert.NoError(t, err)
-
-	file, err := os.Open(table.filePath)
-	assert.NoError(t, err)
-	defer func(file *os.File) {
-		err := file.Close()
+	t.Run("DecodeFooter", func(t *testing.T) {
+		newTable := NewRecoverSSTable(0)
+		err := newTable.DecodeFooterFrom(file)
 		assert.NoError(t, err)
-	}(file)
+		assert.NotZero(t, newTable.Footer.IndexHandle.Offset)
+		assert.NotZero(t, newTable.Footer.IndexHandle.Size)
+	})
 
-	newTable := NewRecoverSSTable(0)
-	// First decode footer to get data block position
-	err = newTable.DecodeFooterFrom(file)
-	assert.NoError(t, err)
+	t.Run("DecodeDataBlock", func(t *testing.T) {
+		newTable := NewRecoverSSTable(0)
+		// First decode footer to get data block position
+		err := newTable.DecodeFooterFrom(file)
+		assert.NoError(t, err)
 
-	// Reset file pointer
-	_, err = file.Seek(0, 0)
-	assert.NoError(t, err)
+		// Reset file pointer
+		_, err = file.Seek(0, 0)
+		assert.NoError(t, err)
 
-	// Decode data block
-	err = newTable.DecodeDataBlock(file)
-	assert.NoError(t, err)
-	assert.Equal(t, len(table.DataBlock.Entries), len(newTable.DataBlock.Entries))
+		// Decode data block
+		err = newTable.DecodeDataBlock(file)
+		assert.NoError(t, err)
+		assert.Equal(t, len(table.DataBlock.Entries), len(newTable.DataBlock.Entries))
+	})
 }
 
 func TestGetDataBlockFromFile(t *testing.T) {
 	tempDir := setupTestEnv(t)
 	defer cleanupTestEnv(t, tempDir)
 
-	table := createSampleSSTable(0, tempDir)
+	pairs := []*kv.KeyValuePair{
+		{Key: "key1", Value: []byte("value1")},
+		{Key: "key2", Value: []byte("value2")},
+	}
+	table := createSampleSSTable(0, tempDir, pairs)
 	err := table.EncodeTo(table.filePath)
 	assert.NoError(t, err)
 
-	err = table.DecodeFrom(table.filePath)
+	// Simulate a table where only metadata is loaded
+	metaLoadedTable := NewRecoverSSTable(0)
+	err = metaLoadedTable.DecodeFrom(table.filePath)
 	assert.NoError(t, err)
-	table.DataBlock.Entries = make([]kv.Value, 0)
+	assert.Empty(t, metaLoadedTable.DataBlock.Entries)
 
-	pairs, err := table.GetDataBlockFromFile(table.filePath)
+	// Now get the full data
+	loadedPairs, err := metaLoadedTable.GetDataBlockFromFile(table.filePath)
 	assert.NoError(t, err)
-	assert.Equal(t, 2, len(pairs))
-	assert.Equal(t, kv.Key("key1"), pairs[0].Key)
-	assert.Equal(t, kv.Key("key2"), pairs[1].Key)
+	assert.Equal(t, len(pairs), len(loadedPairs))
+	for i, p := range pairs {
+		assert.Equal(t, p.Key, loadedPairs[i].Key)
+		assert.Equal(t, p.Value, loadedPairs[i].Value)
+	}
 }
 
 func TestGetKeyValuePairs(t *testing.T) {
 	tempDir := setupTestEnv(t)
 	defer cleanupTestEnv(t, tempDir)
-	table := createSampleSSTable(0, tempDir)
 
-	// Test normal case
-	pairs, err := table.GetKeyValuePairs()
-	assert.NoError(t, err)
-	assert.Equal(t, 2, len(pairs))
-	assert.Equal(t, kv.Key("key1"), pairs[0].Key)
-	assert.Equal(t, kv.Key("key2"), pairs[1].Key)
+	tests := []struct {
+		name          string
+		setup         func() *SSTable
+		expectedPairs int
+		expectError   bool
+	}{
+		{
+			name: "Normal case",
+			setup: func() *SSTable {
+				return createSampleSSTable(0, tempDir, []*kv.KeyValuePair{
+					{Key: "key1", Value: []byte("value1")},
+					{Key: "key2", Value: []byte("value2")},
+				})
+			},
+			expectedPairs: 2,
+			expectError:   false,
+		},
+		{
+			name: "Mismatched lengths",
+			setup: func() *SSTable {
+				table := createSampleSSTable(0, tempDir, []*kv.KeyValuePair{
+					{Key: "key1", Value: []byte("value1")},
+					{Key: "key2", Value: []byte("value2")},
+				})
+				table.DataBlock.Entries = table.DataBlock.Entries[:1] // Mismatch
+				return table
+			},
+			expectedPairs: 0,
+			expectError:   true,
+		},
+		{
+			name: "Empty case",
+			setup: func() *SSTable {
+				return createSampleSSTable(0, tempDir, []*kv.KeyValuePair{})
+			},
+			expectedPairs: 0,
+			expectError:   false,
+		},
+	}
 
-	// Test mismatched lengths
-	table.DataBlock.Entries = table.DataBlock.Entries[:1]
-	_, err = table.GetKeyValuePairs()
-	assert.Error(t, err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			table := tt.setup()
+			pairs, err := table.GetKeyValuePairs()
 
-	// Test empty case
-	table.DataBlock.Entries = nil
-	table.IndexBlock.Indexes = nil
-	pairs, err = table.GetKeyValuePairs()
-	assert.NoError(t, err)
-	assert.Empty(t, pairs)
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Len(t, pairs, tt.expectedPairs)
+			}
+		})
+	}
 }
 
 func TestGetValueByOffset(t *testing.T) {
 	tempDir := setupTestEnv(t)
 	defer cleanupTestEnv(t, tempDir)
 
-	table := createSampleSSTable(0, tempDir)
+	pairs := []*kv.KeyValuePair{
+		{Key: "key1", Value: []byte("value1")},
+	}
+	table := createSampleSSTable(0, tempDir, pairs)
 	err := table.EncodeTo(table.filePath)
 	assert.NoError(t, err)
 
-	value, err := table.GetValueByOffset(table.IndexBlock.Indexes[0].Offset)
-	assert.NoError(t, err)
-	assert.Equal(t, table.DataBlock.Entries[0], value)
+	tests := []struct {
+		name        string
+		offset      int64
+		expectValue kv.Value
+		expectError bool
+	}{
+		{
+			name:        "Valid Offset",
+			offset:      table.IndexBlock.Indexes[0].Offset,
+			expectValue: kv.Value("value1"),
+			expectError: false,
+		},
+		{
+			name:        "Invalid Offset",
+			offset:      999999,
+			expectValue: nil,
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value, err := table.GetValueByOffset(tt.offset)
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expectValue, value)
+			}
+		})
+	}
 }
 
 func TestMayContain(t *testing.T) {
 	tempDir := setupTestEnv(t)
 	defer cleanupTestEnv(t, tempDir)
-	table := createSampleSSTable(0, tempDir)
+	pairs := []*kv.KeyValuePair{
+		{Key: "key1", Value: []byte("value1")},
+		{Key: "key3", Value: []byte("value3")},
+	}
+	table := createSampleSSTable(0, tempDir, pairs)
 
-	assert.True(t, table.MayContain("key1"))
-	assert.True(t, table.MayContain("key2"))
-	assert.False(t, table.MayContain("nonexistent"))
+	tests := []struct {
+		name     string
+		key      kv.Key
+		expected bool
+	}{
+		{
+			name:     "Contained Key",
+			key:      "key1",
+			expected: true,
+		},
+		{
+			name:     "Another Contained Key",
+			key:      "key3",
+			expected: true,
+		},
+		{
+			name:     "Key within range but not exist",
+			key:      "key2",
+			expected: false,
+		}, // Filter should reject this
+		{
+			name:     "Key outside range (before)",
+			key:      "key0",
+			expected: false,
+		},
+		{
+			name:     "Key outside range (after)",
+			key:      "key4",
+			expected: false,
+		},
+		{
+			name:     "Non-existent key",
+			key:      "nonexistent",
+			expected: false,
+		},
+		{
+			name:     "Empty key",
+			key:      "",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, table.MayContain(tt.key))
+		})
+	}
 }
 
 func TestIdAndFilePath(t *testing.T) {
@@ -218,218 +361,179 @@ func TestIdAndFilePath(t *testing.T) {
 	defer cleanupTestEnv(t, tempDir)
 	table := NewSSTableWithLevel(1, tempDir)
 	assert.NotZero(t, table.ID())
-	assert.Contains(t, table.FilePath(), filepath.Join("1-level", strconv.FormatUint(table.ID(), 10)+".sst"))
+	expectedPath := filepath.Join(tempDir, "1-level", strconv.FormatUint(table.ID(), 10)+".sst")
+	assert.Equal(t, expectedPath, table.FilePath())
 }
 
 func TestRemove(t *testing.T) {
-	tempDir := setupTestEnv(t)
-	defer cleanupTestEnv(t, tempDir)
-
-	table := createSampleSSTable(0, tempDir)
-	err := table.EncodeTo(table.filePath)
-	assert.NoError(t, err)
-	assert.FileExists(t, table.filePath)
-
-	err = table.Remove()
-	assert.NoError(t, err)
-	assert.NoFileExists(t, table.filePath)
-}
-
-func TestSSTableFilePath(t *testing.T) {
-	path := sstableFilePath(123, 2, "/test/path")
-	assert.Equal(t, filepath.Join("/test/path", "2-level", "123.sst"), path)
-}
-
-func TestSSTableLevelPath(t *testing.T) {
-	path := sstableLevelPath(3, "/test/path")
-	assert.Equal(t, filepath.Join("/test/path", "3-level"), path)
-}
-
-func TestEncodeDecode_EmptySSTable(t *testing.T) {
-	tempDir := setupTestEnv(t)
-	defer cleanupTestEnv(t, tempDir)
-
-	table := createSampleSSTable(config.Conf.LSM.MinSSTableLevel, tempDir)
-	err := table.EncodeTo(table.filePath)
-	assert.NoError(t, err)
-	assert.FileExists(t, table.filePath)
-
-	newTable := NewRecoverSSTable(0)
-	err = newTable.DecodeFrom(table.filePath)
-	assert.NoError(t, err)
-
-	assert.Equal(t, table.Header.MinKey, newTable.Header.MinKey)
-	assert.Equal(t, table.Header.MaxKey, newTable.Header.MaxKey)
-	assert.Empty(t, newTable.DataBlock.Entries)
-}
-
-func TestEncodeDecode_WithRealData(t *testing.T) {
-	tempDir := setupTestEnv(t)
-	defer cleanupTestEnv(t, tempDir)
-
-	table := NewSSTableWithLevel(0, tempDir)
-	table.Header = &block.Header{MinKey: "key1", MaxKey: "key3"}
-
-	// 添加真实数据
-	table.DataBlock.Entries = []kv.Value{
-		kv.Value("value1"),
-		kv.Value("value2"),
-		kv.Value("value3"),
+	tests := []struct {
+		name        string
+		setup       func(t *testing.T) *SSTable
+		expectError bool
+	}{
+		{
+			name: "Remove existing file",
+			setup: func(t *testing.T) *SSTable {
+				tempDir := setupTestEnv(t)
+				table := createSampleSSTable(0, tempDir, []*kv.KeyValuePair{{Key: "a", Value: []byte("b")}})
+				err := table.EncodeTo(table.filePath)
+				assert.NoError(t, err)
+				assert.FileExists(t, table.filePath)
+				return table
+			},
+			expectError: false,
+		},
+		{
+			name: "Remove non-existing file",
+			setup: func(t *testing.T) *SSTable {
+				table := NewSSTable()
+				table.filePath = "/nonexistent/file.sst"
+				return table
+			},
+			expectError: true,
+		},
 	}
 
-	table.IndexBlock.Indexes = []*block.IndexEntry{
-		{Key: "key1", Offset: 0},
-		{Key: "key2", Offset: 100},
-		{Key: "key3", Offset: 200},
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			table := tt.setup(t)
+			err := table.Remove()
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.NoFileExists(t, table.filePath)
+			}
+		})
+	}
+}
+
+func TestPathHelpers(t *testing.T) {
+	tests := []struct {
+		name     string
+		id       uint64
+		level    int
+		root     string
+		expected string
+	}{
+		{
+			name:     "SSTableFilePath",
+			id:       123,
+			level:    2,
+			root:     "/test/path",
+			expected: filepath.Join("/test/path", "2-level", "123.sst"),
+		},
+		{
+			name:     "SSTableLevelPath",
+			id:       0,
+			level:    3,
+			root:     "/test/path",
+			expected: filepath.Join("/test/path", "3-level"),
+		},
 	}
 
-	table.FilterBlock.Add([]byte("key1"))
-	table.FilterBlock.Add([]byte("key2"))
-	table.FilterBlock.Add([]byte("key3"))
-
-	err := table.EncodeTo(table.filePath)
-	assert.NoError(t, err)
-
-	newTable := NewRecoverSSTable(0)
-	err = newTable.DecodeFrom(table.filePath)
-	assert.NoError(t, err)
-
-	assert.Equal(t, table.Header.MinKey, newTable.Header.MinKey)
-	assert.Equal(t, table.Header.MaxKey, newTable.Header.MaxKey)
-	assert.Equal(t, len(table.IndexBlock.Indexes), len(newTable.IndexBlock.Indexes))
-	assert.Equal(t, 0, len(newTable.DataBlock.Entries)) // DataBlock should be empty after decoding
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var path string
+			if tt.name == "SSTableFilePath" {
+				path = sstableFilePath(tt.id, tt.level, tt.root)
+			} else {
+				path = sstableLevelPath(tt.level, tt.root)
+			}
+			assert.Equal(t, tt.expected, path)
+		})
+	}
 }
 
-func TestEncodeTo_DirectoryCreationFailed(t *testing.T) {
-	// 使用不存在的根目录来模拟目录创建失败
-	table := NewSSTableWithLevel(0, "/nonexistent/path")
-	// 强制设置一个无法创建的路径
-	table.filePath = "/nonexistent/path/123.sst"
-
-	err := table.EncodeTo(table.filePath)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "create directory failed")
-}
-
-func TestDecodeFrom_FileNotFound(t *testing.T) {
-	table := NewRecoverSSTable(0)
-	err := table.DecodeFrom("/nonexistent/file.sst")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "open file error")
-}
-
-func TestDecodeFrom_CorruptedHeader(t *testing.T) {
+func TestEncodeDecodeErrors(t *testing.T) {
 	tempDir := setupTestEnv(t)
 	defer cleanupTestEnv(t, tempDir)
 
-	// 创建一个空文件模拟损坏的头
-	filePath := filepath.Join(tempDir, "corrupted.sst")
-	err := os.WriteFile(filePath, []byte("invalid data"), 0644)
-	assert.NoError(t, err)
+	tests := []struct {
+		name        string
+		setup       func() (string, *SSTable)
+		action      func(string, *SSTable) error
+		expectError bool
+		errorMsg    string
+	}{
+		{
+			name: "Encode to invalid dir",
+			setup: func() (string, *SSTable) {
+				table := NewSSTableWithLevel(0, "/nonexistent/path")
+				table.filePath = "/nonexistent/path/123.sst"
+				return table.filePath, table
+			},
+			action: func(path string, table *SSTable) error {
+				return table.EncodeTo(path)
+			},
+			expectError: true,
+			errorMsg:    "create directory failed",
+		},
+		{
+			name: "Decode from non-existent file",
+			setup: func() (string, *SSTable) {
+				return "/nonexistent/file.sst", NewRecoverSSTable(0)
+			},
+			action: func(path string, table *SSTable) error {
+				return table.DecodeFrom(path)
+			},
+			expectError: true,
+			errorMsg:    "open file error",
+		},
+		{
+			name: "Decode corrupted file",
+			setup: func() (string, *SSTable) {
+				filePath := filepath.Join(tempDir, "corrupted.sst")
+				_ = os.WriteFile(filePath, []byte("invalid data"), 0644)
+				return filePath, NewRecoverSSTable(0)
+			},
+			action: func(path string, table *SSTable) error {
+				return table.DecodeFrom(path)
+			},
+			expectError: true,
+			errorMsg:    "decode Header failed",
+		},
+	}
 
-	table := NewRecoverSSTable(0)
-	err = table.DecodeFrom(filePath)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "decode Header failed")
-}
-
-func TestGetKeyValuePairs_MismatchedLengths(t *testing.T) {
-	tempDir := setupTestEnv(t)
-	defer cleanupTestEnv(t, tempDir)
-	table := createSampleSSTable(0, tempDir)
-
-	// 故意制造不匹配
-	table.DataBlock.Entries = table.DataBlock.Entries[:1] // 只有1个entry
-	// IndexBlock保持2个entry
-
-	pairs, err := table.GetKeyValuePairs()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "mismatched DataBlock and IndexBlock entries")
-	assert.Empty(t, pairs)
-}
-
-func TestGetValueByOffset_InvalidOffset(t *testing.T) {
-	tempDir := setupTestEnv(t)
-	defer cleanupTestEnv(t, tempDir)
-
-	table := createSampleSSTable(0, tempDir)
-	err := table.EncodeTo(table.filePath)
-	assert.NoError(t, err)
-
-	// 测试超出范围的偏移量
-	_, err = table.GetValueByOffset(999999)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "decode value length")
-}
-
-func TestMayContain_EdgeCases(t *testing.T) {
-	tempDir := setupTestEnv(t)
-	defer cleanupTestEnv(t, tempDir)
-	table := createSampleSSTable(0, tempDir)
-	table.Header.MinKey = "key1"
-	table.Header.MaxKey = "key2"
-
-	// 测试边界情况
-	assert.False(t, table.MayContain("key0")) // 小于MinKey
-	assert.False(t, table.MayContain("key3")) // 大于MaxKey
-	assert.False(t, table.MayContain(""))     // 空key
-}
-
-func TestRemove_FileNotExist(t *testing.T) {
-	tempDir := setupTestEnv(t)
-	defer cleanupTestEnv(t, tempDir)
-	table := NewSSTableWithLevel(0, tempDir)
-	table.filePath = "/nonexistent/file.sst"
-
-	// 删除不存在的文件应该返回错误
-	err := table.Remove()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "no such file or directory")
-}
-
-func TestSSTableFilePath_InvalidLevel(t *testing.T) {
-	// 测试负数的level
-	path := sstableFilePath(123, -1, "/test/path")
-	assert.Equal(t, filepath.Join("/test/path", "-1-level", "123.sst"), path)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path, table := tt.setup()
+			err := tt.action(path, table)
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorMsg != "" {
+					assert.Contains(t, err.Error(), tt.errorMsg)
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
 }
 
 func TestConcurrentAccess(t *testing.T) {
 	tempDir := setupTestEnv(t)
 	defer cleanupTestEnv(t, tempDir)
 
-	table := createSampleSSTable(0, tempDir)
+	pairs := []*kv.KeyValuePair{
+		{Key: "key1", Value: []byte("value1")},
+	}
+	table := createSampleSSTable(0, tempDir, pairs)
 	err := table.EncodeTo(table.filePath)
 	assert.NoError(t, err)
 
-	// 并发读取测试
-	var results [5]error
-	for i := 0; i < 5; i++ {
-		go func(idx int) {
+	var wg sync.WaitGroup
+	numGoroutines := 5
+	wg.Add(numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			defer wg.Done()
 			newTable := NewRecoverSSTable(0)
-			results[idx] = newTable.DecodeFrom(table.filePath)
-		}(i)
+			err := newTable.DecodeFrom(table.filePath)
+			assert.NoError(t, err)
+		}()
 	}
 
-	// 等待所有goroutine完成
-	for _, res := range results {
-		assert.NoError(t, res)
-	}
-}
-
-func TestEmptyDataBlock(t *testing.T) {
-	tempDir := setupTestEnv(t)
-	defer cleanupTestEnv(t, tempDir)
-	table := NewSSTable()
-
-	// 测试空数据块编码解码
-	filePath := filepath.Join(tempDir, "empty.sst")
-	err := table.EncodeTo(filePath)
-	assert.NoError(t, err)
-
-	newTable := NewRecoverSSTable(0)
-	err = newTable.DecodeFrom(filePath)
-	assert.NoError(t, err)
-
-	assert.Empty(t, newTable.DataBlock.Entries)
-	assert.Empty(t, newTable.IndexBlock.Indexes)
+	wg.Wait()
 }

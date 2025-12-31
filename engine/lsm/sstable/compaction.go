@@ -84,8 +84,13 @@ func (m *Manager) compactLevel(level int) error {
 	files := m.getFilesByLevel(level)
 	// 对于 level 1 及以上的层级
 	// 按照时间顺序，只合并超出数量的旧文件
+	// files 是按 ID 降序排列的（新 -> 旧）
+	// 所以 files[limit:] 是最旧的那些溢出文件
 	if level > m.minSSTableLevel {
-		files = files[:m.maxFileNumsInLevel(level)]
+		limit := m.maxFileNumsInLevel(level)
+		if len(files) > limit {
+			files = files[limit:]
+		}
 	}
 	allPairs, err := m.loadLevelData(files)
 	if err != nil {
