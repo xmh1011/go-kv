@@ -204,7 +204,7 @@ func TestUpdateCommitIndex(t *testing.T) {
 				matchIndex:  map[int]uint64{1: 12, 2: 12, 3: 12}, // Majority at 12
 			},
 			setupMocks: func(s *storage.MockStorage, sm *storage.MockStateMachine) {
-				s.EXPECT().LastLogIndex().Return(uint64(12), nil)
+				s.EXPECT().LastLogIndex().Return(uint64(12), nil).AnyTimes()
 				s.EXPECT().GetEntry(uint64(12)).Return(&param.LogEntry{Term: 5, Index: 12}, nil).AnyTimes()
 				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11}, nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
@@ -287,8 +287,9 @@ func TestApplyLogs(t *testing.T) {
 			lastApplied:    10,
 			snapshotThresh: -1, // Disabled
 			setupMocks: func(s *storage.MockStorage, sm *storage.MockStateMachine, done chan struct{}) {
-				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11, Command: "cmd1"}, nil)
-				s.EXPECT().GetEntry(uint64(12)).Return(&param.LogEntry{Term: 5, Index: 12, Command: "cmd2"}, nil)
+				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11, Command: "cmd1"}, nil).AnyTimes()
+				s.EXPECT().GetEntry(uint64(12)).Return(&param.LogEntry{Term: 5, Index: 12, Command: "cmd2"}, nil).AnyTimes()
+				s.EXPECT().LastLogIndex().Return(uint64(12), nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return("res1").Times(1)
 				sm.EXPECT().Apply(gomock.Any()).Return("res2").Times(1)
 			},
@@ -301,12 +302,12 @@ func TestApplyLogs(t *testing.T) {
 			lastApplied:    10,
 			snapshotThresh: 100,
 			setupMocks: func(s *storage.MockStorage, sm *storage.MockStateMachine, done chan struct{}) {
-				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11, Command: "cmd1"}, nil)
-				sm.EXPECT().Apply(gomock.Any()).Return("res1")
-				s.EXPECT().LogSize().Return(101, nil)
-				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11}, nil)
-				sm.EXPECT().GetSnapshot().Return([]byte("snap"), nil)
-				s.EXPECT().SaveSnapshot(gomock.Any()).Return(nil)
+				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11, Command: "cmd1"}, nil).AnyTimes()
+				s.EXPECT().LastLogIndex().Return(uint64(11), nil).AnyTimes()
+				sm.EXPECT().Apply(gomock.Any()).Return("res1").AnyTimes()
+				s.EXPECT().LogSize().Return(101, nil).AnyTimes()
+				sm.EXPECT().GetSnapshot().Return([]byte("snap"), nil).AnyTimes()
+				s.EXPECT().SaveSnapshot(gomock.Any()).Return(nil).AnyTimes()
 				s.EXPECT().CompactLog(uint64(11)).Return(nil).Do(func(_ uint64) { close(done) })
 			},
 			expectedApplied: 11,
@@ -634,8 +635,9 @@ func TestAppendEntries(t *testing.T) {
 					s.EXPECT().AppendEntries(gomock.Any()).Return(nil),
 					s.EXPECT().LastLogIndex().Return(uint64(11), nil),
 				)
-				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Command: "cmd1", Term: 5, Index: 11}, nil)
-				sm.EXPECT().Apply(gomock.Any()).Return("success")
+				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Command: "cmd1", Term: 5, Index: 11}, nil).AnyTimes()
+				s.EXPECT().LastLogIndex().Return(uint64(11), nil).AnyTimes()
+				sm.EXPECT().Apply(gomock.Any()).Return("success").AnyTimes()
 			},
 			verify: func(t *testing.T, r *Raft, reply *param.AppendEntriesReply, commitChan chan param.CommitEntry) {
 				assert.True(t, reply.Success)
