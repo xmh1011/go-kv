@@ -391,9 +391,18 @@ func (r *Raft) updateFollowerCommitIndex(args *param.AppendEntriesArgs) {
 	// 如果 Leader 的 commitIndex 大于 Follower 的 commitIndex，说明有新的日志可以被提交。
 	if args.LeaderCommit > r.commitIndex {
 		// Follower 的 commitIndex 不能超过其本地日志的最大索引。
-		newLastLogIndex, _ := r.store.LastLogIndex()
+		newLastLogIndex, err := r.store.LastLogIndex()
+		if err != nil {
+			log.Errorf("[Replication] Node %d failed to get last log index: %v", r.id, err)
+			return
+		}
 		oldCommitIndex := r.commitIndex
-		r.commitIndex = min(args.LeaderCommit, newLastLogIndex)
+		// 只更新到确实存在的日志索引
+		if args.LeaderCommit <= newLastLogIndex {
+			r.commitIndex = args.LeaderCommit
+		} else {
+			r.commitIndex = newLastLogIndex
+		}
 
 		// 如果 commitIndex 确实被推进了，则在后台启动一个 goroutine 应用这些新提交的日志。
 		if r.commitIndex > oldCommitIndex {
@@ -430,6 +439,19 @@ func (r *Raft) fetchEntriesToApply() ([]param.LogEntry, uint64) {
 	var entries []param.LogEntry
 	// 检查是否有需要应用的日志。
 	if r.commitIndex > r.lastApplied {
+		// 先获取最后一个日志索引作为边界检查
+		lastLogIndex, err := r.store.LastLogIndex()
+		if err != nil {
+			log.Errorf("[Replication] Node %d failed to get last log index while applying: %v", r.id, err)
+			return entries, r.lastApplied
+		}
+
+		// 确保 commitIndex 不超过存储中的最大索引
+		if r.commitIndex > lastLogIndex {
+			log.Warnf("[Replication] Node %d commitIndex %d exceeds lastLogIndex %d, clamping", r.id, r.commitIndex, lastLogIndex)
+			r.commitIndex = lastLogIndex
+		}
+
 		// 循环从存储中逐条读取已提交的日志。
 		for i := r.lastApplied + 1; i <= r.commitIndex; i++ {
 			entry, err := r.store.GetEntry(i)

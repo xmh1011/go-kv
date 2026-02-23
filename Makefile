@@ -19,7 +19,7 @@ IMPORTS_ORDER := "std,general,company,project"
 
 # --- Targets ---
 
-.PHONY: all deps build test integration-test cover install-mockgen mockgen clean help cluster stop-cluster proto install-protoc-gen install-go-imports-reviser format
+.PHONY: all deps build test integration-test benchmark benchmark-all perf-test cover install-mockgen mockgen clean help cluster stop-cluster proto install-protoc-gen install-go-imports-reviser format
 
 .DEFAULT_GOAL := help
 
@@ -54,6 +54,39 @@ test: deps
 integration-test: deps
 	@echo " running integration tests..."
 	@go test -race -v ./tests/...
+
+## perf-test: Run production performance tests (gRPC + LSM).
+perf-test: deps
+	@echo " running production performance tests (gRPC + LSM)..."
+	@echo " This may take several minutes..."
+	@go test -race -v -timeout=30m -run "TestProduction" ./tests/
+
+## benchmark: Run all benchmarks with memory profiling.
+benchmark: deps
+	@echo " running benchmarks..."
+	@go test -bench=. -benchmem -benchtime=3s -timeout=30m $(PKGS_TO_TEST)
+
+## benchmark-all: Run all benchmarks including integration-level benchmarks.
+benchmark-all: deps
+	@echo " running all benchmarks including integration-level..."
+	@go test -bench=. -benchmem -benchtime=3s -timeout=60m $(PKGS_TO_TEST) ./tests/...
+
+## benchmark-save: Run benchmarks and save results to file.
+benchmark-save: deps
+	@echo " running benchmarks and saving results..."
+	@mkdir -p benchmark_results
+	@go test -bench=. -benchmem -benchtime=3s -timeout=30m $(PKGS_TO_TEST) > benchmark_results/benchmark.txt
+	@go test -bench=. -benchmem -benchtime=3s -timeout=30m ./tests/... > benchmark_results/benchmark_integration.txt
+
+## run-benchmarks: Run comprehensive benchmarks using the benchmark runner script.
+run-benchmarks: deps
+	@echo " running comprehensive benchmarks..."
+	@./scripts/run_benchmarks.sh
+
+## run-tests: Run comprehensive tests using the test runner script.
+run-tests: deps
+	@echo " running comprehensive tests..."
+	@./scripts/run_tests.sh
 
 ## cover: Open the HTML coverage report in your browser.
 cover: test
@@ -119,7 +152,8 @@ format: install-go-imports-reviser
 clean:
 	@echo " cleaning up..."
 	@go clean -testcache
-	@rm -f coverage.txt unittest.txt $(SERVER_BINARY) $(CLIENT_BINARY) raft-node-*.log raft-node-*.pid
+	@rm -f coverage.txt coverage.html unittest.txt $(SERVER_BINARY) $(CLIENT_BINARY) raft-node-*.log raft-node-*.pid
+	@rm -rf benchmark_results test_results
 	@find . -type f -name "*.sst" -delete
 	@find . -type f -name "*.wal" -delete
 	@find . -type f -name "*.wf" -delete
