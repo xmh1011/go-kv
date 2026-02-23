@@ -482,30 +482,39 @@ func (r *Raft) fetchEntriesToApply() ([]param.LogEntry, uint64) {
 func (r *Raft) dispatchEntries(entries []param.LogEntry) {
 	for _, entry := range entries {
 		var result any
+		var notifyChan chan any
+		var ok bool
 
 		switch cmd := entry.Command.(type) {
 		case param.ConfigChangeCommand:
+			// 配置变更命令，持有锁处理
 			r.applyConfigChange(cmd, entry.Index)
 		default:
+			// 普通命令：先应用状态机（不持有锁）
 			result = r.stateMachine.Apply(entry)
+
+			// 获取通知 channel（短暂持锁）
+			r.mu.Lock()
+			notifyChan, ok = r.notifyApply[entry.Index]
+			if ok {
+				// 在发送通知前，从 map 中删除 channel，防止重复通知或内存泄漏。
+				delete(r.notifyApply, entry.Index)
+			}
+			r.mu.Unlock()
+
+			// 发送到 commitChan（不持有锁）
 			r.applyStateMachineCommand(entry)
+
+			if !ok {
+				// 调试日志：只在没有找到通知 channel 时打印
+				log.Infof("[Client] dispatchEntries: No notify channel found for index %d", entry.Index)
+			}
 		}
 
-		r.mu.Lock()
-		notifyChan, ok := r.notifyApply[entry.Index]
-		if ok {
-			// 在发送通知前，从 map 中删除 channel，防止重复通知或内存泄漏。
-			delete(r.notifyApply, entry.Index)
-		}
-		// 打印 map 内容以调试
-		log.Infof("[Client] dispatchEntries: map content before notify: %+v", r.notifyApply)
-		r.mu.Unlock()
-
+		// 通知客户端（不持有锁）
 		if ok {
 			log.Infof("[Client] dispatchEntries: Notifying for index %d", entry.Index)
 			notifyChan <- result
-		} else {
-			log.Infof("[Client] dispatchEntries: No notify channel found for index %d", entry.Index)
 		}
 	}
 }
@@ -559,15 +568,8 @@ func (r *Raft) applyConfigChange(cmd param.ConfigChangeCommand, entryIndex uint6
 }
 
 // applyStateMachineCommand 将普通的日志条目作为 CommitEntry 发送到客户端的状态机通道。
+// 注意：此函数不应该持有 r.mu 锁，以避免死锁。
 func (r *Raft) applyStateMachineCommand(entry param.LogEntry) {
-	// 这个操作在 Raft 锁之外执行，以避免状态机处理缓慢时阻塞 Raft 的核心逻辑。
-	r.mu.Lock()
-	if r.commitChan == nil {
-		r.mu.Unlock()
-		return
-	}
-	r.mu.Unlock()
-
 	// 使用 recover 防止通道关闭时的 panic
 	entryIndex := entry.Index
 	nodeID := r.id
@@ -578,8 +580,18 @@ func (r *Raft) applyStateMachineCommand(entry param.LogEntry) {
 		}
 	}()
 
+	// 快速检查 channel 是否可用，不持有锁
+	r.mu.Lock()
+	commitChan := r.commitChan
+	r.mu.Unlock()
+
+	if commitChan == nil {
+		return
+	}
+
+	// 使用非阻塞发送防止死锁
 	select {
-	case r.commitChan <- param.CommitEntry{
+	case commitChan <- param.CommitEntry{
 		Command: entry.Command,
 		Index:   entry.Index,
 		Term:    entry.Term,
