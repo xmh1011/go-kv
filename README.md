@@ -18,8 +18,6 @@
 
 `go-kv` 的架构分为清晰的几层：客户端、服务器、Raft 共识模块、存储层和网络传输层。
 
-![Architecture Diagram](https://user-images.githubusercontent.com/1089339/209834158-c33a5b2e-7d2d-4b0d-8b0d-8e41c4a5f9e9.png)
-
 ### 1. Raft 共识模块 (`raft/`)
 
 Raft 模块是系统的核心，负责保证数据在多个节点间的一致性。
@@ -131,6 +129,36 @@ make stop-cluster
   ```bash
   make test
   ```
+
+- **运行集成测试**:
+  ```bash
+  make integration-test
+  ```
+
+- **运行基准测试**:
+  ```bash
+  make benchmark
+  ```
+
+- **运行完整基准测试**（包括集成级）:
+  ```bash
+  make benchmark-all
+  ```
+
+- **运行基准测试并保存结果**:
+  ```bash
+  make benchmark-save
+  ```
+
+- **查看性能测试文档**:
+ 详见 [性能测试报告](docs/PERFORMANCE.md)，包含以下内容：
+  - 测试覆盖率统计（38.9%）
+  - LSM 存储引擎性能基准（40K ops/sec 写入，24K ops/sec 读取）
+  - Raft 核心协议性能（序列化 15M ops/sec）
+  - 集成测试结果（所有12 个测试套件通过）
+- 存储后端性能对比
+- 网络传输层性能对比
+- 配置优化建议
 
 - **清理构建产物和数据**:
   ```bash

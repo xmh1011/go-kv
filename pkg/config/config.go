@@ -15,7 +15,6 @@ var Conf AppConfig
 
 // --- 配置项键名常量 ---
 const (
-	// Log
 	KeyLogFilename   = "log.filename"
 	KeyLogLevel      = "log.level"
 	KeyLogMaxSize    = "log.max_size"
@@ -24,7 +23,6 @@ const (
 	KeyLogCompress   = "log.compress"
 	KeyLogConsole    = "log.console"
 
-	// Raft
 	KeyRaftID                = "raft.id"
 	KeyRaftTransport         = "raft.transport"
 	KeyRaftEngine            = "raft.engine"
