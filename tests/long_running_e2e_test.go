@@ -475,10 +475,16 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for elapsed := time.Duration(0); elapsed < duration; {
+	startTime := time.Now()
+	for {
 		select {
 		case <-ticker.C:
-			elapsed = time.Since(time.Now().Add(-duration))
+			elapsed := time.Since(startTime)
+			if elapsed >= duration {
+				close(stopCh)
+				wg.Wait()
+				break
+			}
 			ops := atomic.LoadInt64(&totalOps)
 			success := atomic.LoadInt64(&successOps)
 			failed := atomic.LoadInt64(&failedOps)
@@ -497,10 +503,9 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 				t.Logf("[一致性检查] 已验证: %d 条数据, 结果: %v", verified, consistent)
 			}
 
-		case <-time.After(duration - elapsed):
-			close(stopCh)
-			wg.Wait()
-			break
+		default:
+			// 避免 CPU 忙等待
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
@@ -605,21 +610,25 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
-	elapsed := time.Duration(0)
-	for elapsed < duration {
+	startTime := time.Now()
+	for {
 		select {
 		case <-ticker.C:
-			elapsed = time.Since(time.Now().Add(-duration))
+			elapsed := time.Since(startTime)
+			if elapsed >= duration {
+				close(stopCh)
+				wg.Wait()
+				break
+			}
 			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 写入流量: %.2f MB/s",
 				elapsed,
 				atomic.LoadInt64(&totalOps),
 				atomic.LoadInt64(&successOps),
 				atomic.LoadInt64(&failedOps),
 				float64(atomic.LoadInt64(&bytesWritten))/1024/1024/elapsed.Seconds())
-		case <-time.After(duration - elapsed):
-			close(stopCh)
-			wg.Wait()
-			break
+		default:
+			// 避免 CPU 忙等待
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
@@ -740,11 +749,11 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 	defer failureTicker.Stop()
 
 	failureCount := 0
-	elapsed := time.Duration(0)
+	startTime := time.Now()
 	progressTicker := time.NewTicker(30 * time.Second)
 	defer progressTicker.Stop()
 
-	for elapsed < duration {
+	for {
 		select {
 		case <-failureTicker.C:
 			if failureCount < 2 { // 最多触发2次故障
@@ -774,18 +783,21 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 			}
 
 		case <-progressTicker.C:
-			elapsed = time.Since(time.Now().Add(-duration))
+			elapsed := time.Since(startTime)
+			if elapsed >= duration {
+				close(stopCh)
+				wg.Wait()
+				break
+			}
 			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, Leader切换: %d",
 				elapsed,
 				atomic.LoadInt64(&totalOps),
 				atomic.LoadInt64(&successOps),
 				atomic.LoadInt64(&failedOps),
 				atomic.LoadInt32(&c.leaderElections))
-
-		case <-time.After(duration - elapsed):
-			close(stopCh)
-			wg.Wait()
-			break
+		default:
+			// 避免 CPU 忙等待
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
@@ -886,21 +898,27 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
-	elapsed := time.Duration(0)
-	for elapsed < duration {
+	startTime := time.Now()
+	closed := false
+	for {
 		select {
 		case <-ticker.C:
-			elapsed = time.Since(time.Now().Add(-duration))
+			elapsed := time.Since(startTime)
+			if elapsed >= duration && !closed {
+				closed = true
+				close(stopCh)
+				wg.Wait()
+				break
+			}
 			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 读取流量: %.2f MB/s",
 				elapsed,
 				atomic.LoadInt64(&totalOps),
 				atomic.LoadInt64(&successOps),
 				atomic.LoadInt64(&failedOps),
 				float64(atomic.LoadInt64(&bytesRead))/1024/1024/elapsed.Seconds())
-		case <-time.After(duration - elapsed):
-			close(stopCh)
-			wg.Wait()
-			break
+		default:
+			// 避免 CPU 忙等待
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
@@ -1026,11 +1044,18 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
-	elapsed := time.Duration(0)
-	for elapsed < duration {
+	startTime := time.Now()
+	closed := false
+	for {
 		select {
 		case <-ticker.C:
-			elapsed = time.Since(time.Now().Add(-duration))
+			elapsed := time.Since(startTime)
+			if elapsed >= duration && !closed {
+				closed = true
+				close(stopCh)
+				wg.Wait()
+				break
+			}
 			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 写入: %d, 删除: %d",
 				elapsed,
 				atomic.LoadInt64(&totalOps),
@@ -1038,10 +1063,9 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 				atomic.LoadInt64(&failedOps),
 				atomic.LoadInt64(&writeOps),
 				atomic.LoadInt64(&deleteOps))
-		case <-time.After(duration - elapsed):
-			close(stopCh)
-			wg.Wait()
-			break
+		default:
+			// 避免 CPU 忙等待
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
