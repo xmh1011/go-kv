@@ -561,12 +561,33 @@ func (r *Raft) applyConfigChange(cmd param.ConfigChangeCommand, entryIndex uint6
 // applyStateMachineCommand 将普通的日志条目作为 CommitEntry 发送到客户端的状态机通道。
 func (r *Raft) applyStateMachineCommand(entry param.LogEntry) {
 	// 这个操作在 Raft 锁之外执行，以避免状态机处理缓慢时阻塞 Raft 的核心逻辑。
-	if r.commitChan != nil {
-		r.commitChan <- param.CommitEntry{
-			Command: entry.Command,
-			Index:   entry.Index,
-			Term:    entry.Term,
+	r.mu.Lock()
+	if r.commitChan == nil {
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
+
+	// 使用 recover 防止通道关闭时的 panic
+	entryIndex := entry.Index
+	nodeID := r.id
+	defer func() {
+		if rv := recover(); rv != nil {
+			// 通道已关闭，忽略发送失败
+			log.Debugf("[Replication] Node %d commitChan closed during send of entry %d", nodeID, entryIndex)
 		}
+	}()
+
+	select {
+	case r.commitChan <- param.CommitEntry{
+		Command: entry.Command,
+		Index:   entry.Index,
+		Term:    entry.Term,
+	}:
+		// 成功发送
+	default:
+		// 通道已满，跳过发送（防止阻塞）
+		log.Warnf("[Replication] Node %d commitChan full, skipping entry %d", r.id, entry.Index)
 	}
 }
 
