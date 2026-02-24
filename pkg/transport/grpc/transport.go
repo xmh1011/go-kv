@@ -207,7 +207,7 @@ func (t *Transport) SendRequestVote(target string, req *param.RequestVoteArgs, r
 		PreVote:      req.PreVote,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	pbResp, err := client.RequestVote(ctx, pbReq)
@@ -250,7 +250,7 @@ func (t *Transport) SendAppendEntries(target string, req *param.AppendEntriesArg
 		LeaderCommit: req.LeaderCommit,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	pbResp, err := client.AppendEntries(ctx, pbReq)
@@ -282,7 +282,7 @@ func (t *Transport) SendInstallSnapshot(target string, req *param.InstallSnapsho
 		Done:              req.Done,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	pbResp, err := client.InstallSnapshot(ctx, pbReq)
@@ -311,7 +311,7 @@ func (t *Transport) SendClientRequest(target string, req *param.ClientArgs, resp
 		Command:     cmdBytes,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	pbResp, err := client.ClientRequest(ctx, pbReq)
