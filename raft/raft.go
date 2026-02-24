@@ -79,6 +79,10 @@ type Raft struct {
 
 	// --- 内部控制 ---
 	shutdownChan chan struct{} // 用于关闭 Run 循环
+
+	// --- ReadIndex 优化 ---
+	lastLeadershipConfirm time.Time // 上次确认 Leadership 的时间
+	leadershipCacheTime     time.Duration // Leadership 确认缓存时间
 }
 
 // NewRaft 创建一个新的 Raft 节点。
@@ -103,6 +107,8 @@ func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.
 		snapshotThreshold: -1, // 默认禁用自动快照
 		electionTimeout:   config.Conf.Raft.ElectionTimeout,
 		heartbeatTimeout:  config.Conf.Raft.HeartbeatTimeout,
+		// 初始化 ReadIndex 缓存，缓存时间设置为心跳间隔的一半
+		leadershipCacheTime: config.Conf.Raft.HeartbeatTimeout / 2,
 	}
 	// 从稳定存储中恢复状态。
 	if store != nil {
@@ -323,9 +329,39 @@ func (r *Raft) handleLinearizableRead(cmd param.KVCommand, reply *param.ClientRe
 // 返回 true 表示确认成功（自己仍是 Leader）。
 func (r *Raft) confirmLeadership() bool {
 	r.mu.Lock()
+
+	// 优化1：使用缓存机制，避免短时间内频繁确认 Leadership
+	// 如果距离上次确认的时间小于缓存时间，直接返回 true
+	now := time.Now()
+	if r.state == Leader && !r.lastLeadershipConfirm.IsZero() && now.Sub(r.lastLeadershipConfirm) < r.leadershipCacheTime {
+		r.mu.Unlock()
+		return true
+	}
+
+	// 优化2：检查 lastAck 时间，如果在选举超时内有足够的最近确认，则跳过心跳发送
+	// 这可以减少在读取密集型场景下的网络和锁竞争
 	term := r.currentTerm
 	leaderID := r.id
 	peerIDs := r.getAllPeerIDs()
+	recentAcks := 0
+	for _, pid := range peerIDs {
+		if pid == r.id {
+			recentAcks++
+			continue
+		}
+		if lastAck, ok := r.lastAck[pid]; ok && now.Sub(lastAck) < r.electionTimeout {
+			recentAcks++
+		}
+	}
+	majority := len(peerIDs)/2 + 1
+	if recentAcks >= majority {
+		// 已经有足够的最近确认，不需要发送心跳
+		log.Debugf("[ReadIndex] Node %d has enough recent acks (%d/%d), skipping heartbeat.", leaderID, recentAcks, majority)
+		// 更新缓存时间
+		r.lastLeadershipConfirm = now
+		r.mu.Unlock()
+		return true
+	}
 
 	// 构造心跳请求列表
 	// 我们需要为每个 Peer 构造 args，为了避免在循环网络发送时持有锁，
@@ -338,6 +374,12 @@ func (r *Raft) confirmLeadership() bool {
 
 	for _, pid := range peerIDs {
 		if pid == r.id {
+			continue
+		}
+
+		// 如果这个节点最近确认过，跳过它以减少网络负载
+		if lastAck, ok := r.lastAck[pid]; ok && now.Sub(lastAck) < r.electionTimeout {
+			recentAcks++
 			continue
 		}
 
@@ -359,6 +401,11 @@ func (r *Raft) confirmLeadership() bool {
 		requests = append(requests, hbRequest{pid, args})
 	}
 	r.mu.Unlock()
+
+	// 如果已经满足多数派，直接返回
+	if recentAcks >= majority {
+		return true
+	}
 
 	// 用于收集确认结果的通道
 	ackChan := make(chan bool, len(requests))
@@ -383,11 +430,11 @@ func (r *Raft) confirmLeadership() bool {
 	}
 
 	// 统计票数
-	votes := 1 // 自己算一票
-	majority := len(peerIDs)/2 + 1
+	votes := recentAcks // 包括最近的确认
 
 	// 设置一个较短的超时时间，避免读请求无限阻塞
-	timeout := time.After(r.electionTimeout)
+	// 增加超时时间以应对高负载场景
+	timeout := time.After(r.electionTimeout * 2)
 
 	for i := 0; i < len(requests); i++ {
 		select {
@@ -402,11 +449,16 @@ func (r *Raft) confirmLeadership() bool {
 		}
 
 		if votes >= majority {
-			return true
+			break
 		}
 	}
 
-	return false
+	// 更新缓存时间
+	r.mu.Lock()
+	r.lastLeadershipConfirm = time.Now()
+	r.mu.Unlock()
+
+	return votes >= majority
 }
 
 // handleWriteRequest 处理写请求（通过 Raft 日志）。

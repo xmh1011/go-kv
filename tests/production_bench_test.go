@@ -311,8 +311,8 @@ func BenchmarkProduction_GrpcLsm_MixedWorkload(b *testing.B) {
 
 			cmdBytes, _ := json.Marshal(param.KVCommand{
 				Op:    param.OpSet,
-				Key:    key,
-				Value:  fmt.Sprintf("value%d", i),
+				Key:   key,
+				Value: fmt.Sprintf("value%d", i),
 			})
 			reply := &param.ClientReply{}
 			_ = leader.ClientRequest(&param.ClientArgs{ClientID: rand.Int63(), SequenceNum: i, Command: cmdBytes}, reply)
@@ -339,13 +339,13 @@ func BenchmarkProduction_GrpcLsm_ReadAfterWrite(b *testing.B) {
 		cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 		cmdBytes, _ := json.Marshal(cmd)
 		reply := &param.ClientReply{}
-		_ = leader.ClientRequest(&param.ClientArgs{ClientID: 1, SequenceNum: int64(i)*2, Command: cmdBytes}, reply)
+		_ = leader.ClientRequest(&param.ClientArgs{ClientID: 1, SequenceNum: int64(i) * 2, Command: cmdBytes}, reply)
 
 		// 读取
 		cmd = param.KVCommand{Op: param.OpGet, Key: key}
 		cmdBytes, _ = json.Marshal(cmd)
 		reply = &param.ClientReply{}
-		_ = leader.ClientRequest(&param.ClientArgs{ClientID: 1, SequenceNum: int64(i)*2+1, Command: cmdBytes}, reply)
+		_ = leader.ClientRequest(&param.ClientArgs{ClientID: 1, SequenceNum: int64(i)*2 + 1, Command: cmdBytes}, reply)
 	}
 }
 

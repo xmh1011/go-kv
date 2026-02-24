@@ -17,31 +17,31 @@ import (
 
 // LongRunningMetrics 记录长时测试的性能指标
 type LongRunningMetrics struct {
-	TestName           string
-	Duration           time.Duration
-	TotalOps           int64
-	SuccessOps         int64
-	FailedOps          int64
-	WriteOps           int64
-	ReadOps            int64
-	DeleteOps          int64
-	BytesRead          int64
-	BytesWritten       int64
+	TestName          string
+	Duration          time.Duration
+	TotalOps          int64
+	SuccessOps        int64
+	FailedOps         int64
+	WriteOps          int64
+	ReadOps           int64
+	DeleteOps         int64
+	BytesRead         int64
+	BytesWritten      int64
 	LatencyP50        time.Duration
 	LatencyP95        time.Duration
 	LatencyP99        time.Duration
-	ThroughputOps      float64
-	WriteThroughput    float64
-	ReadThroughput     float64
-	DeleteThroughput   float64
-	ErrorRate          float64
-	LeaderElections    int32
-	LeaderDowntime     time.Duration
-	DataConsistencyOK  bool
-	KeysVerified       int64
-	SnapshotCount      int32
+	ThroughputOps     float64
+	WriteThroughput   float64
+	ReadThroughput    float64
+	DeleteThroughput  float64
+	ErrorRate         float64
+	LeaderElections   int32
+	LeaderDowntime    time.Duration
+	DataConsistencyOK bool
+	KeysVerified      int64
+	SnapshotCount     int32
 	WALSize           int64
-	MemTableFlushes    int32
+	MemTableFlushes   int32
 }
 
 // longRunningCluster 生产环境配置的长时测试集群
@@ -55,7 +55,7 @@ type longRunningCluster struct {
 	dataDir       string
 	// 额外的监控数据
 	leaderElections int32
-	mu             sync.Mutex
+	mu              sync.Mutex
 }
 
 // newLongRunningCluster 创建用于长时测试的生产环境集群
@@ -160,10 +160,14 @@ func (c *longRunningCluster) shutdown() {
 
 // getLeader 获取当前 Leader，超时时间更长以适应长时测试
 func (c *longRunningCluster) getLeader(t *testing.T) *raft.Raft {
-	timeout := time.After(30 * time.Second)
-	for i := 0; i < 60; i++ {
+	timeout := time.NewTimer(30 * time.Second)
+	defer timeout.Stop()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
 		select {
-		case <-time.After(500 * time.Millisecond):
+		case <-ticker.C:
 			for _, node := range c.nodes {
 				if node.IsStopped() {
 					continue
@@ -172,12 +176,10 @@ func (c *longRunningCluster) getLeader(t *testing.T) *raft.Raft {
 					return node
 				}
 			}
-		case <-timeout:
-			t.Fatal("Cluster failed to elect a leader within 30 seconds")
+		case <-timeout.C:
+			t.Fatalf("Cluster failed to elect a leader within 30 seconds")
 		}
 	}
-	t.Fatal("Cluster failed to elect a leader")
-	return nil
 }
 
 // waitForAllNodesReady 等待所有节点就绪
@@ -315,7 +317,7 @@ func (c *longRunningCluster) verifyDataConsistency(t *testing.T, sampleKeys []st
 func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 	duration := 10 * time.Minute
 	if testing.Short() {
-		duration = 1 * time.Minute // 短模式下缩短测试时间
+		duration = 1 * time.Minute
 	}
 
 	c := newLongRunningCluster(t, 3)
@@ -337,9 +339,6 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 
 	// 预热数据
 	warmupCount := 1000
-	if testing.Short() {
-		warmupCount = 100 // 短模式下减少预热数据
-	}
 	t.Logf("预热阶段: 写入 %d 条数据...", warmupCount)
 	for i := 0; i < warmupCount; i++ {
 		key := fmt.Sprintf("warmup-key-%d", i)
@@ -354,20 +353,20 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 
 	// 性能指标
 	var (
-		totalOps          int64
-		successOps        int64
-		failedOps         int64
-		writeOps          int64
-		readOps           int64
-		deleteOps         int64
-		bytesRead         int64
-		bytesWritten      int64
-		latencies        []time.Duration
-		writeLatencies    []time.Duration
-		readLatencies     []time.Duration
-		deleteLatencies   []time.Duration
+		totalOps            int64
+		successOps          int64
+		failedOps           int64
+		writeOps            int64
+		readOps             int64
+		deleteOps           int64
+		bytesRead           int64
+		bytesWritten        int64
+		latencies           []time.Duration
+		writeLatencies      []time.Duration
+		readLatencies       []time.Duration
+		deleteLatencies     []time.Duration
 		keysForVerification []string
-		sampleKeysMutex   sync.Mutex
+		sampleKeysMutex     sync.Mutex
 	)
 
 	// 并发客户端模拟
@@ -476,14 +475,15 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 	defer ticker.Stop()
 
 	startTime := time.Now()
-	for {
+	done := false
+	for !done {
 		select {
 		case <-ticker.C:
 			elapsed := time.Since(startTime)
 			if elapsed >= duration {
 				close(stopCh)
 				wg.Wait()
-				break
+				done = true
 			}
 			ops := atomic.LoadInt64(&totalOps)
 			success := atomic.LoadInt64(&successOps)
@@ -525,9 +525,9 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 		DeleteOps:         deleteOps,
 		BytesRead:         bytesRead,
 		BytesWritten:      bytesWritten,
-		LatencyP50:       percentileLong(latencies, 50),
-		LatencyP95:       percentileLong(latencies, 95),
-		LatencyP99:       percentileLong(latencies, 99),
+		LatencyP50:        percentileLong(latencies, 50),
+		LatencyP95:        percentileLong(latencies, 95),
+		LatencyP99:        percentileLong(latencies, 99),
 		ThroughputOps:     float64(successOps) / duration.Seconds(),
 		WriteThroughput:   float64(writeOps) / duration.Seconds(),
 		ReadThroughput:    float64(readOps) / duration.Seconds(),
@@ -611,14 +611,15 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 	defer ticker.Stop()
 
 	startTime := time.Now()
-	for {
+	done := false
+	for !done {
 		select {
 		case <-ticker.C:
 			elapsed := time.Since(startTime)
 			if elapsed >= duration {
 				close(stopCh)
 				wg.Wait()
-				break
+				done = true
 			}
 			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 写入流量: %.2f MB/s",
 				elapsed,
@@ -633,19 +634,19 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 	}
 
 	metrics := LongRunningMetrics{
-		TestName:         "10分钟写入密集型测试 (gRPC+LSM)",
-		Duration:         duration,
-		TotalOps:         totalOps,
-		SuccessOps:       successOps,
-		FailedOps:        failedOps,
-		BytesWritten:     bytesWritten,
-		LatencyP50:       percentileLong(latencies, 50),
-		LatencyP95:       percentileLong(latencies, 95),
-		LatencyP99:       percentileLong(latencies, 99),
-		ThroughputOps:    float64(successOps) / duration.Seconds(),
-		WriteThroughput:  float64(successOps) / duration.Seconds(),
-		ErrorRate:        float64(failedOps) / float64(totalOps) * 100,
-		LeaderElections:  atomic.LoadInt32(&c.leaderElections),
+		TestName:          "10分钟写入密集型测试 (gRPC+LSM)",
+		Duration:          duration,
+		TotalOps:          totalOps,
+		SuccessOps:        successOps,
+		FailedOps:         failedOps,
+		BytesWritten:      bytesWritten,
+		LatencyP50:        percentileLong(latencies, 50),
+		LatencyP95:        percentileLong(latencies, 95),
+		LatencyP99:        percentileLong(latencies, 99),
+		ThroughputOps:     float64(successOps) / duration.Seconds(),
+		WriteThroughput:   float64(successOps) / duration.Seconds(),
+		ErrorRate:         float64(failedOps) / float64(totalOps) * 100,
+		LeaderElections:   atomic.LoadInt32(&c.leaderElections),
 		DataConsistencyOK: true,
 	}
 
@@ -753,7 +754,8 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 	progressTicker := time.NewTicker(30 * time.Second)
 	defer progressTicker.Stop()
 
-	for {
+	done := false
+	for !done {
 		select {
 		case <-failureTicker.C:
 			if failureCount < 2 { // 最多触发2次故障
@@ -787,7 +789,7 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 			if elapsed >= duration {
 				close(stopCh)
 				wg.Wait()
-				break
+				done = true
 			}
 			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, Leader切换: %d",
 				elapsed,
@@ -812,10 +814,10 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 		LatencyP50:        percentileLong(latencies, 50),
 		LatencyP95:        percentileLong(latencies, 95),
 		LatencyP99:        percentileLong(latencies, 99),
-		ThroughputOps:      float64(successOps) / duration.Seconds(),
+		ThroughputOps:     float64(successOps) / duration.Seconds(),
 		ErrorRate:         float64(failedOps) / float64(totalOps) * 100,
-		LeaderElections:    atomic.LoadInt32(&c.leaderElections),
-		DataConsistencyOK:  true,
+		LeaderElections:   atomic.LoadInt32(&c.leaderElections),
+		DataConsistencyOK: true,
 	}
 
 	printLongRunningMetrics(t, &metrics)
@@ -839,9 +841,6 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 
 	// 预热大量数据
 	warmupCount := 1000
-	if testing.Short() {
-		warmupCount = 100 // 短模式下减少预热数据
-	}
 	t.Logf("预热阶段: 写入 %d 条数据...", warmupCount)
 	for i := 0; i < warmupCount; i++ {
 		key := fmt.Sprintf("read-warmup-key-%d", i)
@@ -899,16 +898,15 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 	defer ticker.Stop()
 
 	startTime := time.Now()
-	closed := false
-	for {
+	done := false
+	for !done {
 		select {
 		case <-ticker.C:
 			elapsed := time.Since(startTime)
-			if elapsed >= duration && !closed {
-				closed = true
+			if elapsed >= duration {
 				close(stopCh)
 				wg.Wait()
-				break
+				done = true
 			}
 			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 读取流量: %.2f MB/s",
 				elapsed,
@@ -923,19 +921,19 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 	}
 
 	metrics := LongRunningMetrics{
-		TestName:        "10分钟读取密集型测试 (gRPC+LSM)",
-		Duration:        duration,
-		TotalOps:        totalOps,
-		SuccessOps:      successOps,
-		FailedOps:       failedOps,
-		BytesRead:       bytesRead,
-		LatencyP50:      percentileLong(latencies, 50),
-		LatencyP95:      percentileLong(latencies, 95),
-		LatencyP99:      percentileLong(latencies, 99),
-		ThroughputOps:   float64(successOps) / duration.Seconds(),
-		ReadThroughput:  float64(successOps) / duration.Seconds(),
-		ErrorRate:       float64(failedOps) / float64(totalOps) * 100,
-		LeaderElections: atomic.LoadInt32(&c.leaderElections),
+		TestName:          "10分钟读取密集型测试 (gRPC+LSM)",
+		Duration:          duration,
+		TotalOps:          totalOps,
+		SuccessOps:        successOps,
+		FailedOps:         failedOps,
+		BytesRead:         bytesRead,
+		LatencyP50:        percentileLong(latencies, 50),
+		LatencyP95:        percentileLong(latencies, 95),
+		LatencyP99:        percentileLong(latencies, 99),
+		ThroughputOps:     float64(successOps) / duration.Seconds(),
+		ReadThroughput:    float64(successOps) / duration.Seconds(),
+		ErrorRate:         float64(failedOps) / float64(totalOps) * 100,
+		LeaderElections:   atomic.LoadInt32(&c.leaderElections),
 		DataConsistencyOK: true,
 	}
 
@@ -963,12 +961,12 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 	defer close(monitorCtx)
 
 	var (
-		totalOps     int64
-		successOps   int64
-		failedOps    int64
-		writeOps     int64
-		deleteOps    int64
-		latencies    []time.Duration
+		totalOps        int64
+		successOps      int64
+		failedOps       int64
+		writeOps        int64
+		deleteOps       int64
+		latencies       []time.Duration
 		deleteLatencies []time.Duration
 	)
 
@@ -1045,16 +1043,15 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 	defer ticker.Stop()
 
 	startTime := time.Now()
-	closed := false
-	for {
+	done := false
+	for !done {
 		select {
 		case <-ticker.C:
 			elapsed := time.Since(startTime)
-			if elapsed >= duration && !closed {
-				closed = true
+			if elapsed >= duration {
 				close(stopCh)
 				wg.Wait()
-				break
+				done = true
 			}
 			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 写入: %d, 删除: %d",
 				elapsed,
@@ -1080,12 +1077,12 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 		LatencyP50:        percentileLong(latencies, 50),
 		LatencyP95:        percentileLong(latencies, 95),
 		LatencyP99:        percentileLong(latencies, 99),
-		ThroughputOps:      float64(successOps) / duration.Seconds(),
-		WriteThroughput:    float64(writeOps) / duration.Seconds(),
-		DeleteThroughput:   float64(deleteOps) / duration.Seconds(),
-		ErrorRate:          float64(failedOps) / float64(totalOps) * 100,
-		LeaderElections:    atomic.LoadInt32(&c.leaderElections),
-		DataConsistencyOK:  true,
+		ThroughputOps:     float64(successOps) / duration.Seconds(),
+		WriteThroughput:   float64(writeOps) / duration.Seconds(),
+		DeleteThroughput:  float64(deleteOps) / duration.Seconds(),
+		ErrorRate:         float64(failedOps) / float64(totalOps) * 100,
+		LeaderElections:   atomic.LoadInt32(&c.leaderElections),
+		DataConsistencyOK: true,
 	}
 
 	printLongRunningMetrics(t, &metrics)

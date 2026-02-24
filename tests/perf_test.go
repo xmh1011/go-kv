@@ -17,25 +17,25 @@ import (
 
 // perfCluster 端到端性能测试集群
 type perfCluster struct {
-	nodes          []*raft.Raft
-	transports     []transport.Transport
-	storages       []storage.Storage
-	stateMachines  []storage.StateMachine
-	commitChans    []chan param.CommitEntry
-	peerMap        map[int]string
-	dataDir        string
+	nodes         []*raft.Raft
+	transports    []transport.Transport
+	storages      []storage.Storage
+	stateMachines []storage.StateMachine
+	commitChans   []chan param.CommitEntry
+	peerMap       map[int]string
+	dataDir       string
 }
 
 // newPerfCluster 创建用于端到端性能测试的集群
 func newPerfCluster(t *testing.T, nodeCount int) *perfCluster {
 	c := &perfCluster{
-		nodes:       make([]*raft.Raft, nodeCount),
-		transports:  make([]transport.Transport, nodeCount),
-		storages:    make([]storage.Storage, nodeCount),
+		nodes:         make([]*raft.Raft, nodeCount),
+		transports:    make([]transport.Transport, nodeCount),
+		storages:      make([]storage.Storage, nodeCount),
 		stateMachines: make([]storage.StateMachine, nodeCount),
-		commitChans:  make([]chan param.CommitEntry, nodeCount),
-		peerMap:     make(map[int]string),
-		dataDir:     t.TempDir(),
+		commitChans:   make([]chan param.CommitEntry, nodeCount),
+		peerMap:       make(map[int]string),
+		dataDir:       t.TempDir(),
 	}
 
 	for i := 0; i < nodeCount; i++ {
@@ -213,17 +213,17 @@ func (s *PerfTestSuite) TestPerf_WriteHeavy(t *testing.T) {
 	close(stopCh)
 
 	metrics := PerfMetrics{
-		TestName:       "WriteHeavy (写密集型)",
-		Duration:       duration,
-		TotalOps:       totalOps,
-		SuccessOps:     totalOps - failedOps,
-		FailedOps:      failedOps,
-		BytesWritten:    bytesWritten,
-		LatencyP50:     percentile(latencies, 50),
-		LatencyP95:     percentile(latencies, 95),
-		LatencyP99:     percentile(latencies, 99),
-		ThroughputOps:   float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:      float64(failedOps) / float64(totalOps) * 100,
+		TestName:      "WriteHeavy (写密集型)",
+		Duration:      duration,
+		TotalOps:      totalOps,
+		SuccessOps:    totalOps - failedOps,
+		FailedOps:     failedOps,
+		BytesWritten:  bytesWritten,
+		LatencyP50:    percentile(latencies, 50),
+		LatencyP95:    percentile(latencies, 95),
+		LatencyP99:    percentile(latencies, 99),
+		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
+		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
 	}
 
 	s.printMetrics(t, &metrics)
@@ -283,17 +283,17 @@ func (s *PerfTestSuite) TestPerf_ReadHeavy(t *testing.T) {
 	close(stopCh)
 
 	metrics := PerfMetrics{
-		TestName:       "ReadHeavy (读密集型)",
-		Duration:       duration,
-		TotalOps:       totalOps,
-		SuccessOps:     totalOps - failedOps,
-		FailedOps:      failedOps,
-		BytesRead:      bytesRead,
-		LatencyP50:     percentile(latencies, 50),
-		LatencyP95:     percentile(latencies, 95),
-		LatencyP99:     percentile(latencies, 99),
-		ThroughputOps:   float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:      float64(failedOps) / float64(totalOps) * 100,
+		TestName:      "ReadHeavy (读密集型)",
+		Duration:      duration,
+		TotalOps:      totalOps,
+		SuccessOps:    totalOps - failedOps,
+		FailedOps:     failedOps,
+		BytesRead:     bytesRead,
+		LatencyP50:    percentile(latencies, 50),
+		LatencyP95:    percentile(latencies, 95),
+		LatencyP99:    percentile(latencies, 99),
+		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
+		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
 	}
 
 	s.printMetrics(t, &metrics)
@@ -370,17 +370,17 @@ func (s *PerfTestSuite) TestPerf_MixedWorkload(t *testing.T) {
 	close(stopCh)
 
 	metrics := PerfMetrics{
-		TestName:       "MixedWorkload (混合负载 - 70%%写/30%%读)",
-		Duration:       duration,
-		TotalOps:       totalOps,
-		SuccessOps:     totalOps - failedOps,
-		BytesRead:      bytesRead,
-		BytesWritten:    bytesWritten,
-		LatencyP50:     percentile(latencies, 50),
-		LatencyP95:     percentile(latencies, 95),
-		LatencyP99:     percentile(latencies,  99),
-		ThroughputOps:   float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:      float64(failedOps) / float64(totalOps) * 100,
+		TestName:      "MixedWorkload (混合负载 - 70%%写/30%%读)",
+		Duration:      duration,
+		TotalOps:      totalOps,
+		SuccessOps:    totalOps - failedOps,
+		BytesRead:     bytesRead,
+		BytesWritten:  bytesWritten,
+		LatencyP50:    percentile(latencies, 50),
+		LatencyP95:    percentile(latencies, 95),
+		LatencyP99:    percentile(latencies, 99),
+		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
+		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
 	}
 
 	s.printMetrics(t, &metrics)

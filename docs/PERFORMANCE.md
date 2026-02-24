@@ -68,45 +68,117 @@
 - **集群配置**: 3节点 Raft 集群
 - **传输层**: gRPC (真实网络通信)
 - **存储引擎**: LSM (持久化存储)
-- **测试时长**: 10分钟 (短模式调整为1分钟)
+- **测试时长**: 10分钟 (可使用 `-short` 标志启用1分钟短模式)
 
-### 测试场景
+### 测试场景详解
 
-| 测试名称 | 描述 | 操作类型分布 | 并发客户端数 |
-|---------|------|-------------|-------------|
-| TestLongRunning_10Min_Comprehensive | 综合混合测试 | 60% 写入, 25% 读取, 15% 删除 | 10 |
-| TestLongRunning_10Min_WriteHeavy | 写入密集型 | 100% 写入 | 8 |
-| TestLongRunning_10Min_ReadHeavy | 读取密集型 | 100% 读取 | 10 |
-| TestLongRunning_10Min_DeleteStress | 删除压力测试 | 写入+周期性删除 | 8 |
-| TestLongRunning_10Min_MixedWithFailures | 带故障恢复的混合测试 | 70% 写入, 30% 读取 | 5 |
+| 测试名称 | 描述 | 操作类型分布 | 并发客户端数 | 特殊功能 |
+|---------|------|-------------|-------------|----------|
+| `TestLongRunning_10Min_Comprehensive` | 综合混合测试 | 60% 写入, 25% 读取, 15% 删除 | 10 | 预热1000条数据，周期性一致性检查 |
+| `TestLongRunning_10Min_WriteHeavy` | 写入密集型 | 100% 写入 | 8 | 持续写入新键，测试写入上限 |
+| `TestLongRunning_10Min_ReadHeavy` | 读取密集型 | 100% 读取 | 10 | 预热1000条数据，读取固定键集 |
+| `TestLongRunning_10Min_DeleteStress` | 删除压力测试 | 写入+周期性删除 | 8 | 模拟频繁写删场景 |
+| `TestLongRunning_10Min_MixedWithFailures` | 带故障恢复的混合测试 | 70% 写入, 30% 读取 | 5 | 每2分钟停止一个Follower，30秒后恢复 |
+
+### 测试流程
+
+#### 1. 集群初始化流程
+```go
+1. 创建 gRPC 传输层 (随机端口)
+2. 构造初始 Peer 配置
+3. 创建 LSM 存储层和状态机
+4. 创建 Raft 实例并注册到 Transport
+5. 启动后台协程消费 commitChan
+6. 启动 Raft 主循环
+```
+
+#### 2. 测试执行流程
+```go
+1. waitForAllNodesReady() - 等待所有节点就绪 (60s超时)
+2. getLeader() - 获取当前 Leader (30s超时)
+3. 启动 monitorLeaderChanges() - 监控 Leader 变化
+4. (可选) 预热数据 - 写入1000条测试数据
+5. 启动并发客户端 - 执行混合读写操作
+6. 定期进度报告 - 每30秒/1分钟输出统计
+7. 最终一致性检查 - 验证数据一致性
+8. 输出完整性能指标
+```
 
 ### 长时测试性能指标
 
 所有长时测试收集以下指标：
 
-| 指标 | 描述 |
-|--------|------|
-| TotalOps | 总操作数 |
-| SuccessOps | 成功操作数 |
-| FailedOps | 失败操作数 |
-| WriteOps | 写入操作数 |
-| ReadOps | 读取操作数 |
-| DeleteOps | 删除操作数 |
-| ThroughputOps | 总吞吐量 (ops/sec) |
-| WriteThroughput | 写入吞吐量 (ops/sec) |
-| ReadThroughput | 读取吞吐量 (ops/sec) |
-| DeleteThroughput | 删除吞吐量 (ops/sec) |
-| LatencyP50 | 50% 延迟 |
-| LatencyP95 | 95% 延迟 |
-| LatencyP99 | 99% 延迟 |
-| BytesRead | 读取字节数 |
-| BytesWritten | 写入字节数 |
-| ErrorRate | 错误率 (%) |
-| LeaderElections | Leader 切换次数 |
-| DataConsistencyOK | 数据一致性检查结果 |
-| KeysVerified | 已验证数据条数 |
+| 指标 | 描述 | 单位 |
+|--------|------|------|
+| TotalOps | 总操作数 | count |
+| SuccessOps | 成功操作数 | count |
+| FailedOps | 失败操作数 | count |
+| WriteOps | 写入操作数 | count |
+| ReadOps | 读取操作数 | count |
+| DeleteOps | 删除操作数 | count |
+| BytesRead | 读取字节数 | bytes |
+| BytesWritten | 写入字节数 | bytes |
+| LatencyP50 | 50% 延迟 | time.Duration |
+| LatencyP95 | 95% 延迟 | time.Duration |
+| LatencyP99 | 99% 延迟 | time.Duration |
+| ThroughputOps | 总吞吐量 | ops/sec |
+| WriteThroughput | 写入吞吐量 | ops/sec |
+| ReadThroughput | 读取吞吐量 | ops/sec |
+| DeleteThroughput | 删除吞吐量 | ops/sec |
+| ErrorRate | 错误率 | % |
+| LeaderElections | Leader 切换次数 | count |
+| DataConsistencyOK | 数据一致性检查结果 | bool |
+| KeysVerified | 已验证数据条数 | count |
 
-### 长时测试实际结果 (1分钟短模式) - 2026-02-23 更新（死锁修复后）
+### 测试代码结构
+
+#### LongRunningMetrics 结构体
+```go
+type LongRunningMetrics struct {
+    TestName          string
+    Duration          time.Duration
+    TotalOps          int64
+    SuccessOps        int64
+    FailedOps         int64
+    WriteOps          int64
+    ReadOps           int64
+    DeleteOps         int64
+    BytesRead         int64
+    BytesWritten      int64
+    LatencyP50        time.Duration
+    LatencyP95        time.Duration
+    LatencyP99        time.Duration
+    ThroughputOps     float64
+    WriteThroughput   float64
+    ReadThroughput    float64
+    DeleteThroughput  float64
+    ErrorRate         float64
+    LeaderElections   int32
+    LeaderDowntime    time.Duration
+    DataConsistencyOK bool
+    KeysVerified      int64
+    SnapshotCount     int32
+    WALSize           int64
+    MemTableFlushes   int32
+}
+```
+
+#### longRunningCluster 结构体
+```go
+type longRunningCluster struct {
+    nodes         []*raft.Raft          // Raft 节点列表
+    transports    []transport.Transport  // 传输层
+    storages      []storage.Storage     // 存储层
+    stateMachines []storage.StateMachine // 状态机
+    commitChans   []chan param.CommitEntry // 提交通道
+    peerMap       map[int]string        // 节点地址映射
+    dataDir       string               // 数据目录
+    leaderElections int32              // Leader 切换计数
+    mu            sync.Mutex           // 互斥锁
+}
+```
+
+### 运行长时测试
 
 | 测试名称 | 总操作数 | 成功率 | 总吞吐量 | 写入吞吐量 | 读取吞吐量 | 删除吞吐量 | 状态 |
 |---------|---------|--------|----------|-----------|-----------|-----------|------|
@@ -182,9 +254,69 @@ go test ./tests/ -run=^TestLongRunning_10Min_DeleteStress -timeout 15m -v
 # 运行带故障恢复的混合测试
 go test ./tests/ -run=^TestLongRunning_10Min_MixedWithFailures -timeout 15m -v
 
-# 使用短模式运行 (约2分钟)
+# 使用短模式运行 (1分钟)
 go test ./tests/ -run=^TestLongRunning_10Min_Comprehensive -short -timeout 5m -v
+
+# 运行所有长时测试 (短模式)
+go test ./tests/ -run=^TestLongRunning_10Min -short -timeout 10m -v
 ```
+
+### 测试输出示例
+
+```
+=== 10分钟长时端到端性能测试开始 ===
+集群配置: 3节点, gRPC传输, LSM存储
+测试持续时间: 10m0s
+初始 Leader: Node 1
+预热阶段: 写入 1000 条数据...
+预热完成
+启动 10 个并发客户端...
+[进度报告] 已运行: 30s, 总操作: 12345, 成功: 12340, 失败: 5, 吞吐量: 411.33 ops/sec
+[一致性检查] 已验证: 150 条数据, 结果: true
+[最终一致性检查] 已验证: 987 条数据, 结果: true
+
+========================================
+长时性能测试结果: 10分钟综合长时测试 (gRPC+LSM)
+========================================
+测试时长: 10m0s
+----------------------------------------
+操作统计:
+  总操作数: 245678
+  成功操作: 245120
+  失败操作: 558
+  成功率: 99.77%
+----------------------------------------
+操作类型分布:
+  写入操作: 147072 (60.00%)
+  读取操作: 61280 (25.00%)
+  删除操作: 36768 (15.00%)
+----------------------------------------
+性能指标:
+  总吞吐量: 408.53 ops/sec
+  写入吞吐量: 245.12 ops/sec
+  读取吞吐量: 102.13 ops/sec
+  删除吞吐量: 61.28 ops/sec
+  错误率: 0.2272%
+----------------------------------------
+延迟统计:
+  P50: 2.5ms
+  P95: 15.3ms
+  P99: 45.8ms
+----------------------------------------
+集群状态:
+  Leader 切换次数: 0
+  数据一致性: true
+  已验证数据条数: 987
+========================================
+```
+
+### 注意事项
+
+1. **短模式**: 使用 `-short` 标志时，所有测试时长设为1分钟，预热数据仍为1000条
+2. **超时设置**: 建议设置 `-timeout` 为预期测试时长的1.5倍以上
+3. **资源消耗**: gRPC+LSM 配置下会产生大量临时文件和日志，确保有足够磁盘空间
+4. **Leader 切换**: 故障恢复测试会主动停止 Follower 节点，可能触发 Leader 选举
+5. **数据一致性**: 测试会定期验证所有节点的数据一致性，发现不一致会记录日志
 
 ## 性能分析
 

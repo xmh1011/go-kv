@@ -223,9 +223,6 @@ func runE2ETest(t *testing.T, testName string, testFunc func(*e2eCluster) PerfMe
 	return metrics
 }
 
-// E2ETestSuite 端到端性能测试套件
-type E2ETestSuite struct{}
-
 // TestE2E_WriteHeavy 写入密集型场景
 func TestE2E_WriteHeavy(t *testing.T) {
 	duration := 30 * time.Second
@@ -701,11 +698,6 @@ func printPerfMetrics(t *testing.T, metrics *PerfMetrics) {
 	t.Logf("P95 延迟: %v", metrics.LatencyP95)
 	t.Logf("P99 延迟: %v", metrics.LatencyP99)
 	t.Logf("==================\n")
-}
-
-// printMetrics 是 E2ETestSuite 的方法（保持向后兼容）
-func (s *E2ETestSuite) printMetrics(t *testing.T, metrics *PerfMetrics) {
-	printPerfMetrics(t, metrics)
 }
 
 // ==================== 真实网络 E2E 测试套件 ====================
