@@ -3,6 +3,7 @@ package transport
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/xmh1011/go-kv/pkg/param"
 	"github.com/xmh1011/go-kv/pkg/transport/grpc"
@@ -40,13 +41,39 @@ type Transport interface {
 	// SendAppendEntries 发送 AppendEntries RPC 请求。
 	SendAppendEntries(target string, req *param.AppendEntriesArgs, resp *param.AppendEntriesReply) error
 
-	// SendInstallSnapshot 发送 InstallSnapshot RPC 请求。
+	// SendInstallSnapshot 发送 InstallSnapshot RPC 请求（单次方式，不推荐用于大快照）。
+	// 超时策略：5 分钟固定超时
+	// 警告：对于大快照（>10MB），建议使用 SendInstallSnapshotStream 流式传输
 	SendInstallSnapshot(target string, req *param.InstallSnapshotArgs, resp *param.InstallSnapshotReply) error
 
 	// SendClientRequest 发送客户端请求到指定的 Raft 节点。
 	SendClientRequest(target string, req *param.ClientArgs, resp *param.ClientReply) error
 }
 
+// StreamingTransport 支持流式传输的 Transport 接口扩展
+type StreamingTransport interface {
+	Transport
+
+	// SetElectionTimeout 设置选举超时，用于动态计算 AppendEntries 超时
+	SetElectionTimeout(timeout time.Duration)
+
+	// SendInstallSnapshotStream 发送 InstallSnapshot RPC 请求（流式传输方式，推荐）。
+	// 支持大文件传输和断点续传，不依赖单一超时。
+	// 参数：
+	//   - target: 目标节点 ID
+	//   - term: 当前任期
+	//   - leaderID: Leader 节点 ID
+	//   - lastIncludedIndex: 快照包含的最后一条日志索引
+	//   - lastIncludedTerm: 快照包含的最后一条日志任期
+	//   - data: 快照数据
+	SendInstallSnapshotStream(
+		target string,
+		term, leaderID, lastIncludedIndex, lastIncludedTerm uint64,
+		data []byte,
+	) error
+}
+
+// NewTransport creates a new Transport instance.
 func NewTransport(transportType, addr string) (Transport, error) {
 	switch transportType {
 	case TcpTransport:
@@ -60,6 +87,7 @@ func NewTransport(transportType, addr string) (Transport, error) {
 	}
 }
 
+// NewClientTransport creates a new Transport for client connections.
 func NewClientTransport(clientAddr, transportType string) (Transport, error) {
 	switch transportType {
 	case TcpTransport:

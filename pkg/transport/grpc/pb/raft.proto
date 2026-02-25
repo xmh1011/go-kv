@@ -7,7 +7,10 @@ option go_package = "github.com/xmh1011/go-kv/pkg/transport/grpc/pb";
 service RaftService {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  // 原 InstallSnapshot: 单次 RPC，不适合大文件传输（保留兼容性）
   rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+  // InstallSnapshotStream: 流式传输，支持大文件和断点续传（推荐）
+  rpc InstallSnapshotStream(stream InstallSnapshotChunk) returns (stream InstallSnapshotAck);
   rpc ClientRequest(ClientRequestRequest) returns (ClientRequestResponse);
 }
 
@@ -59,6 +62,29 @@ message InstallSnapshotRequest {
 
 message InstallSnapshotResponse {
   uint64 term = 1;
+}
+
+// InstallSnapshotChunk: 流式传输的数据块
+message InstallSnapshotChunk {
+  // 快照元数据（只在第一个 chunk 中发送）
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+
+  // 数据块信息
+  uint64 offset = 5;      // 当前块的起始偏移量
+  bytes data = 6;         // 数据块内容
+  uint64 data_size = 7;   // 快照总大小（用于进度计算）
+  bool done = 8;          // 是否最后一个块
+}
+
+// InstallSnapshotAck: 流式传输的确认响应
+message InstallSnapshotAck {
+  bool accepted = 1;       // 是否接受该块
+  uint64 next_offset = 2;  // 服务端期望的下一个偏移量（支持断点续传）
+  string error = 3;        // 错误信息（如果 rejected）
+  uint64 received_bytes = 4; // 已接收的字节数（用于进度显示）
 }
 
 message ClientRequestRequest {

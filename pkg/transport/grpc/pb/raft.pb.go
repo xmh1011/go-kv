@@ -505,6 +505,178 @@ func (x *InstallSnapshotResponse) GetTerm() uint64 {
 	return 0
 }
 
+// InstallSnapshotChunk: 流式传输的数据块
+type InstallSnapshotChunk struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 快照元数据（只在第一个 chunk 中发送）
+	Term              uint64 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	LeaderId          uint64 `protobuf:"varint,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	LastIncludedIndex uint64 `protobuf:"varint,3,opt,name=last_included_index,json=lastIncludedIndex,proto3" json:"last_included_index,omitempty"`
+	LastIncludedTerm  uint64 `protobuf:"varint,4,opt,name=last_included_term,json=lastIncludedTerm,proto3" json:"last_included_term,omitempty"`
+	// 数据块信息
+	Offset        uint64 `protobuf:"varint,5,opt,name=offset,proto3" json:"offset,omitempty"`                     // 当前块的起始偏移量
+	Data          []byte `protobuf:"bytes,6,opt,name=data,proto3" json:"data,omitempty"`                          // 数据块内容
+	DataSize      uint64 `protobuf:"varint,7,opt,name=data_size,json=dataSize,proto3" json:"data_size,omitempty"` // 快照总大小（用于进度计算）
+	Done          bool   `protobuf:"varint,8,opt,name=done,proto3" json:"done,omitempty"`                         // 是否最后一个块
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InstallSnapshotChunk) Reset() {
+	*x = InstallSnapshotChunk{}
+	mi := &file_pkg_transport_grpc_pb_raft_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InstallSnapshotChunk) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InstallSnapshotChunk) ProtoMessage() {}
+
+func (x *InstallSnapshotChunk) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_transport_grpc_pb_raft_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InstallSnapshotChunk.ProtoReflect.Descriptor instead.
+func (*InstallSnapshotChunk) Descriptor() ([]byte, []int) {
+	return file_pkg_transport_grpc_pb_raft_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *InstallSnapshotChunk) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *InstallSnapshotChunk) GetLeaderId() uint64 {
+	if x != nil {
+		return x.LeaderId
+	}
+	return 0
+}
+
+func (x *InstallSnapshotChunk) GetLastIncludedIndex() uint64 {
+	if x != nil {
+		return x.LastIncludedIndex
+	}
+	return 0
+}
+
+func (x *InstallSnapshotChunk) GetLastIncludedTerm() uint64 {
+	if x != nil {
+		return x.LastIncludedTerm
+	}
+	return 0
+}
+
+func (x *InstallSnapshotChunk) GetOffset() uint64 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
+
+func (x *InstallSnapshotChunk) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+func (x *InstallSnapshotChunk) GetDataSize() uint64 {
+	if x != nil {
+		return x.DataSize
+	}
+	return 0
+}
+
+func (x *InstallSnapshotChunk) GetDone() bool {
+	if x != nil {
+		return x.Done
+	}
+	return false
+}
+
+// InstallSnapshotAck: 流式传输的确认响应
+type InstallSnapshotAck struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Accepted      bool                   `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`                                // 是否接受该块
+	NextOffset    uint64                 `protobuf:"varint,2,opt,name=next_offset,json=nextOffset,proto3" json:"next_offset,omitempty"`          // 服务端期望的下一个偏移量（支持断点续传）
+	Error         string                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`                                       // 错误信息（如果 rejected）
+	ReceivedBytes uint64                 `protobuf:"varint,4,opt,name=received_bytes,json=receivedBytes,proto3" json:"received_bytes,omitempty"` // 已接收的字节数（用于进度显示）
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InstallSnapshotAck) Reset() {
+	*x = InstallSnapshotAck{}
+	mi := &file_pkg_transport_grpc_pb_raft_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InstallSnapshotAck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InstallSnapshotAck) ProtoMessage() {}
+
+func (x *InstallSnapshotAck) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_transport_grpc_pb_raft_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InstallSnapshotAck.ProtoReflect.Descriptor instead.
+func (*InstallSnapshotAck) Descriptor() ([]byte, []int) {
+	return file_pkg_transport_grpc_pb_raft_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *InstallSnapshotAck) GetAccepted() bool {
+	if x != nil {
+		return x.Accepted
+	}
+	return false
+}
+
+func (x *InstallSnapshotAck) GetNextOffset() uint64 {
+	if x != nil {
+		return x.NextOffset
+	}
+	return 0
+}
+
+func (x *InstallSnapshotAck) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *InstallSnapshotAck) GetReceivedBytes() uint64 {
+	if x != nil {
+		return x.ReceivedBytes
+	}
+	return 0
+}
+
 type ClientRequestRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ClientId      int64                  `protobuf:"varint,1,opt,name=client_id,json=ClientID,proto3" json:"client_id,omitempty"`
@@ -516,7 +688,7 @@ type ClientRequestRequest struct {
 
 func (x *ClientRequestRequest) Reset() {
 	*x = ClientRequestRequest{}
-	mi := &file_pkg_transport_grpc_pb_raft_proto_msgTypes[7]
+	mi := &file_pkg_transport_grpc_pb_raft_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -528,7 +700,7 @@ func (x *ClientRequestRequest) String() string {
 func (*ClientRequestRequest) ProtoMessage() {}
 
 func (x *ClientRequestRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_transport_grpc_pb_raft_proto_msgTypes[7]
+	mi := &file_pkg_transport_grpc_pb_raft_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -541,7 +713,7 @@ func (x *ClientRequestRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClientRequestRequest.ProtoReflect.Descriptor instead.
 func (*ClientRequestRequest) Descriptor() ([]byte, []int) {
-	return file_pkg_transport_grpc_pb_raft_proto_rawDescGZIP(), []int{7}
+	return file_pkg_transport_grpc_pb_raft_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ClientRequestRequest) GetClientId() int64 {
@@ -577,7 +749,7 @@ type ClientRequestResponse struct {
 
 func (x *ClientRequestResponse) Reset() {
 	*x = ClientRequestResponse{}
-	mi := &file_pkg_transport_grpc_pb_raft_proto_msgTypes[8]
+	mi := &file_pkg_transport_grpc_pb_raft_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -589,7 +761,7 @@ func (x *ClientRequestResponse) String() string {
 func (*ClientRequestResponse) ProtoMessage() {}
 
 func (x *ClientRequestResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_transport_grpc_pb_raft_proto_msgTypes[8]
+	mi := &file_pkg_transport_grpc_pb_raft_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -602,7 +774,7 @@ func (x *ClientRequestResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClientRequestResponse.ProtoReflect.Descriptor instead.
 func (*ClientRequestResponse) Descriptor() ([]byte, []int) {
-	return file_pkg_transport_grpc_pb_raft_proto_rawDescGZIP(), []int{8}
+	return file_pkg_transport_grpc_pb_raft_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ClientRequestResponse) GetSuccess() bool {
@@ -673,7 +845,22 @@ const file_pkg_transport_grpc_pb_raft_proto_rawDesc = "" +
 	"\x04data\x18\x06 \x01(\fR\x04data\x12\x12\n" +
 	"\x04done\x18\a \x01(\bR\x04done\"-\n" +
 	"\x17InstallSnapshotResponse\x12\x12\n" +
-	"\x04term\x18\x01 \x01(\x04R\x04term\"p\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\"\x82\x02\n" +
+	"\x14InstallSnapshotChunk\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1b\n" +
+	"\tleader_id\x18\x02 \x01(\x04R\bleaderId\x12.\n" +
+	"\x13last_included_index\x18\x03 \x01(\x04R\x11lastIncludedIndex\x12,\n" +
+	"\x12last_included_term\x18\x04 \x01(\x04R\x10lastIncludedTerm\x12\x16\n" +
+	"\x06offset\x18\x05 \x01(\x04R\x06offset\x12\x12\n" +
+	"\x04data\x18\x06 \x01(\fR\x04data\x12\x1b\n" +
+	"\tdata_size\x18\a \x01(\x04R\bdataSize\x12\x12\n" +
+	"\x04done\x18\b \x01(\bR\x04done\"\x8e\x01\n" +
+	"\x12InstallSnapshotAck\x12\x1a\n" +
+	"\baccepted\x18\x01 \x01(\bR\baccepted\x12\x1f\n" +
+	"\vnext_offset\x18\x02 \x01(\x04R\n" +
+	"nextOffset\x12\x14\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\x12%\n" +
+	"\x0ereceived_bytes\x18\x04 \x01(\x04R\rreceivedBytes\"p\n" +
 	"\x14ClientRequestRequest\x12\x1b\n" +
 	"\tclient_id\x18\x01 \x01(\x03R\bClientID\x12!\n" +
 	"\fsequence_num\x18\x02 \x01(\x03R\vsequenceNum\x12\x18\n" +
@@ -684,11 +871,12 @@ const file_pkg_transport_grpc_pb_raft_proto_rawDesc = "" +
 	"\n" +
 	"not_leader\x18\x03 \x01(\bR\tnotLeader\x12\x1f\n" +
 	"\vleader_hint\x18\x04 \x01(\x03R\n" +
-	"leaderHint2\xa5\x02\n" +
+	"leaderHint2\xf4\x02\n" +
 	"\vRaftService\x12>\n" +
 	"\vRequestVote\x12\x16.pb.RequestVoteRequest\x1a\x17.pb.RequestVoteResponse\x12D\n" +
 	"\rAppendEntries\x12\x18.pb.AppendEntriesRequest\x1a\x19.pb.AppendEntriesResponse\x12J\n" +
-	"\x0fInstallSnapshot\x12\x1a.pb.InstallSnapshotRequest\x1a\x1b.pb.InstallSnapshotResponse\x12D\n" +
+	"\x0fInstallSnapshot\x12\x1a.pb.InstallSnapshotRequest\x1a\x1b.pb.InstallSnapshotResponse\x12M\n" +
+	"\x15InstallSnapshotStream\x12\x18.pb.InstallSnapshotChunk\x1a\x16.pb.InstallSnapshotAck(\x010\x01\x12D\n" +
 	"\rClientRequest\x12\x18.pb.ClientRequestRequest\x1a\x19.pb.ClientRequestResponseB0Z.github.com/xmh1011/go-kv/pkg/transport/grpc/pbb\x06proto3"
 
 var (
@@ -703,7 +891,7 @@ func file_pkg_transport_grpc_pb_raft_proto_rawDescGZIP() []byte {
 	return file_pkg_transport_grpc_pb_raft_proto_rawDescData
 }
 
-var file_pkg_transport_grpc_pb_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_pkg_transport_grpc_pb_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_pkg_transport_grpc_pb_raft_proto_goTypes = []any{
 	(*RequestVoteRequest)(nil),      // 0: pb.RequestVoteRequest
 	(*RequestVoteResponse)(nil),     // 1: pb.RequestVoteResponse
@@ -712,24 +900,28 @@ var file_pkg_transport_grpc_pb_raft_proto_goTypes = []any{
 	(*AppendEntriesResponse)(nil),   // 4: pb.AppendEntriesResponse
 	(*InstallSnapshotRequest)(nil),  // 5: pb.InstallSnapshotRequest
 	(*InstallSnapshotResponse)(nil), // 6: pb.InstallSnapshotResponse
-	(*ClientRequestRequest)(nil),    // 7: pb.ClientRequestRequest
-	(*ClientRequestResponse)(nil),   // 8: pb.ClientRequestResponse
+	(*InstallSnapshotChunk)(nil),    // 7: pb.InstallSnapshotChunk
+	(*InstallSnapshotAck)(nil),      // 8: pb.InstallSnapshotAck
+	(*ClientRequestRequest)(nil),    // 9: pb.ClientRequestRequest
+	(*ClientRequestResponse)(nil),   // 10: pb.ClientRequestResponse
 }
 var file_pkg_transport_grpc_pb_raft_proto_depIdxs = []int32{
-	2, // 0: pb.AppendEntriesRequest.entries:type_name -> pb.LogEntry
-	0, // 1: pb.RaftService.RequestVote:input_type -> pb.RequestVoteRequest
-	3, // 2: pb.RaftService.AppendEntries:input_type -> pb.AppendEntriesRequest
-	5, // 3: pb.RaftService.InstallSnapshot:input_type -> pb.InstallSnapshotRequest
-	7, // 4: pb.RaftService.ClientRequest:input_type -> pb.ClientRequestRequest
-	1, // 5: pb.RaftService.RequestVote:output_type -> pb.RequestVoteResponse
-	4, // 6: pb.RaftService.AppendEntries:output_type -> pb.AppendEntriesResponse
-	6, // 7: pb.RaftService.InstallSnapshot:output_type -> pb.InstallSnapshotResponse
-	8, // 8: pb.RaftService.ClientRequest:output_type -> pb.ClientRequestResponse
-	5, // [5:9] is the sub-list for method output_type
-	1, // [1:5] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	2,  // 0: pb.AppendEntriesRequest.entries:type_name -> pb.LogEntry
+	0,  // 1: pb.RaftService.RequestVote:input_type -> pb.RequestVoteRequest
+	3,  // 2: pb.RaftService.AppendEntries:input_type -> pb.AppendEntriesRequest
+	5,  // 3: pb.RaftService.InstallSnapshot:input_type -> pb.InstallSnapshotRequest
+	7,  // 4: pb.RaftService.InstallSnapshotStream:input_type -> pb.InstallSnapshotChunk
+	9,  // 5: pb.RaftService.ClientRequest:input_type -> pb.ClientRequestRequest
+	1,  // 6: pb.RaftService.RequestVote:output_type -> pb.RequestVoteResponse
+	4,  // 7: pb.RaftService.AppendEntries:output_type -> pb.AppendEntriesResponse
+	6,  // 8: pb.RaftService.InstallSnapshot:output_type -> pb.InstallSnapshotResponse
+	8,  // 9: pb.RaftService.InstallSnapshotStream:output_type -> pb.InstallSnapshotAck
+	10, // 10: pb.RaftService.ClientRequest:output_type -> pb.ClientRequestResponse
+	6,  // [6:11] is the sub-list for method output_type
+	1,  // [1:6] is the sub-list for method input_type
+	1,  // [1:1] is the sub-list for extension type_name
+	1,  // [1:1] is the sub-list for extension extendee
+	0,  // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_pkg_transport_grpc_pb_raft_proto_init() }
@@ -743,7 +935,7 @@ func file_pkg_transport_grpc_pb_raft_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_transport_grpc_pb_raft_proto_rawDesc), len(file_pkg_transport_grpc_pb_raft_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   9,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
