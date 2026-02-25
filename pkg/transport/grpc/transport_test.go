@@ -32,8 +32,8 @@ func TestGRPCTransport(t *testing.T) {
 	mockRaft2 := api.NewMockRaftService(ctrl)
 	t2.RegisterRaft(mockRaft2)
 
-	assert.NoError(t1.Start())
-	assert.NoError(t2.Start())
+	assert.NoError(t, t1.Start())
+	assert.NoError(t, t2.Start())
 
 	peers := map[int]string{
 		1: t1.Addr(),
@@ -133,8 +133,8 @@ func TestInstallSnapshotStream(t *testing.T) {
 	mockRaft2 := api.NewMockRaftService(ctrl)
 	t2.RegisterRaft(mockRaft2)
 
-	require.NoError(t1.Start())
-	require.NoError(t2.Start())
+	require.NoError(t, t1.Start())
+	require.NoError(t, t2.Start())
 
 	peers := map[int]string{
 		1: t1.Addr(),
@@ -145,42 +145,47 @@ func TestInstallSnapshotStream(t *testing.T) {
 
 	t.Run("SmallSnapshot", func(t *testing.T) {
 		snapshotData := make([]byte, 1024) // 1KB
-		for i := range snapshotData {
-			snapshotData[i] = byte(i % 256)
-		}
 
-		var receivedData [][]byte
+		var callCount int
 		var mu sync.Mutex
 
 		mockRaft2.EXPECT().InstallSnapshot(gomock.Any(), gomock.Any()).
 			DoAndReturn(func(args *param.InstallSnapshotArgs, reply *param.InstallSnapshotReply) error {
 				mu.Lock()
 				defer mu.Unlock()
-				receivedData = append(receivedData, args.Data)
+				callCount++
+				assert.Equal(t, snapshotData, args.Data)
+				assert.Equal(t, uint64(0), args.Offset)
+				assert.True(t, args.Done)
 				reply.Term = args.Term
 				return nil
-			}).MinTimes(1)
+			}).Times(1)
 
 		err := t1.SendInstallSnapshotStream("2", 1, 1, 100, 1, snapshotData)
 		require.NoError(t, err)
 
-		time.Sleep(100 * time.Millisecond)
 		mu.Lock()
-		assert.Greater(t, len(receivedData), 0, "Should have received snapshot data")
+		assert.Equal(t, 1, callCount, "Should have called InstallSnapshot once")
 		mu.Unlock()
 	})
 
 	t.Run("LargeSnapshot", func(t *testing.T) {
 		snapshotData := make([]byte, 10*1024*1024) // 10MB
 
-		var receivedData [][]byte
+		var callCount int
 		var mu sync.Mutex
 
 		mockRaft2.EXPECT().InstallSnapshot(gomock.Any(), gomock.Any()).
 			DoAndReturn(func(args *param.InstallSnapshotArgs, reply *param.InstallSnapshotReply) error {
 				mu.Lock()
 				defer mu.Unlock()
-				receivedData = append(receivedData, args.Data)
+				callCount++
+				assert.LessOrEqual(t, args.Offset, uint64(len(snapshotData)))
+				assert.NotEmpty(t, args.Data)
+				// 最后一次调用应该是 Done=true
+				if args.Done {
+					assert.Equal(t, uint64(len(snapshotData)), args.Offset+uint64(len(args.Data)))
+				}
 				reply.Term = args.Term
 				return nil
 			}).MinTimes(1)
@@ -192,13 +197,10 @@ func TestInstallSnapshotStream(t *testing.T) {
 		require.NoError(t, err)
 		t.Logf("10MB snapshot transferred in %v", elapsed)
 
-		time.Sleep(100 * time.Millisecond)
 		mu.Lock()
-		assert.Greater(t, len(receivedData), 0, "Should have received snapshot data")
+		assert.Greater(t, callCount, 0, "Should have called InstallSnapshot at least once")
 		mu.Unlock()
 	})
-
-	time.Sleep(50 * time.Millisecond)
 }
 
 // TestSendInstallSnapshot 测试通过接口发送快照（内部使用流式传输）
@@ -220,8 +222,8 @@ func TestSendInstallSnapshot(t *testing.T) {
 	mockRaft2 := api.NewMockRaftService(ctrl)
 	t2.RegisterRaft(mockRaft2)
 
-	require.NoError(t1.Start())
-	require.NoError(t2.Start())
+	require.NoError(t, t1.Start())
+	require.NoError(t, t2.Start())
 
 	peers := map[int]string{
 		1: t1.Addr(),
@@ -233,14 +235,15 @@ func TestSendInstallSnapshot(t *testing.T) {
 	t.Run("SendSnapshot", func(t *testing.T) {
 		snapshotData := make([]byte, 5*1024*1024) // 5MB
 
-		var receivedData [][]byte
+		var callCount int
 		var mu sync.Mutex
 
 		mockRaft2.EXPECT().InstallSnapshot(gomock.Any(), gomock.Any()).
 			DoAndReturn(func(args *param.InstallSnapshotArgs, reply *param.InstallSnapshotReply) error {
 				mu.Lock()
 				defer mu.Unlock()
-				receivedData = append(receivedData, args.Data)
+				callCount++
+				assert.NotEmpty(t, args.Data)
 				reply.Term = args.Term
 				return nil
 			}).MinTimes(1)
@@ -258,13 +261,10 @@ func TestSendInstallSnapshot(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, uint64(1), resp.Term)
 
-		time.Sleep(100 * time.Millisecond)
 		mu.Lock()
-		assert.Greater(t, len(receivedData), 0, "Should have received snapshot data")
+		assert.Greater(t, callCount, 0, "Should have called InstallSnapshot at least once")
 		mu.Unlock()
 	})
-
-	time.Sleep(50 * time.Millisecond)
 }
 
 // TestAppendEntriesTimeout 测试 AppendEntries 超时动态计算

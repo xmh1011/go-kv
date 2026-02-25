@@ -30,19 +30,19 @@ import (
 // - ClientRequest: 合理的客户端超时
 
 const (
-	// RequestVote: 选举阶段快速失败进入下一个 Term
+	// DefaultRequestVoteTimeout : 选举阶段快速失败进入下一个 Term
 	// 原因：如果一个节点迟迟不响应投票请求（可能是挂了），
 	// Candidate 应该快速失败并重试其他节点
 	DefaultRequestVoteTimeout = 300 * time.Millisecond
 
-	// ClientRequest: 客户端请求超时
+	// DefaultClientRequestTimeout ClientRequest: 客户端请求超时
 	DefaultClientRequestTimeout = 5 * time.Second
 
-	// InstallSnapshot 流式传输：每个块的发送超时
+	// DefaultChunkSendTimeout InstallSnapshot 流式传输：每个块的发送超时
 	// 原因：流式传输不会因为大文件而超时，只需要设置单块的超时
 	DefaultChunkSendTimeout = 10 * time.Second
 
-	// AppendEntries 基准比例：ElectionTimeout 的百分比
+	// AppendEntriesTimeoutRatio AppendEntries 基准比例：ElectionTimeout 的百分比
 	// 原因：这是最高频调用，包含磁盘 fsync，太短会导致频繁重试
 	// 默认为 70%，可根据网络/磁盘条件调整
 	AppendEntriesTimeoutRatio = 0.70
@@ -73,12 +73,16 @@ func NewTransport(listenAddr string) (*Transport, error) {
 	}
 
 	return &Transport{
-		listener:   listener,
-		localAddr:  listener.Addr().String(),
-		conns:      make(map[string]*grpc.ClientConn),
-		clients:    make(map[string]pb.RaftServiceClient),
-		resolvers:  make(map[int]string),
-		grpcServer: grpc.NewServer(),
+		listener:  listener,
+		localAddr: listener.Addr().String(),
+		conns:     make(map[string]*grpc.ClientConn),
+		clients:   make(map[string]pb.RaftServiceClient),
+		resolvers: make(map[int]string),
+		// 设置最大消息大小为 100MB，支持流式快照传输
+		grpcServer: grpc.NewServer(
+			grpc.MaxRecvMsgSize(100*1024*1024),
+			grpc.MaxSendMsgSize(100*1024*1024),
+		),
 	}, nil
 }
 
@@ -199,7 +203,14 @@ func (t *Transport) getPeerClient(targetID string) (pb.RaftServiceClient, error)
 		return client, nil
 	}
 
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(
+		addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(100*1024*1024),
+			grpc.MaxCallSendMsgSize(100*1024*1024),
+		),
+	)
 	if err != nil {
 		return nil, err
 	}
