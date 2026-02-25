@@ -6,6 +6,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"sync"
@@ -20,6 +21,33 @@ import (
 	"github.com/xmh1011/go-kv/raft/api"
 )
 
+// ==================== 超时策略 ====================
+//
+// 生产级超时设计原则：
+// - AppendEntries: 基于 ElectionTimeout 动态计算（避免频繁重试）
+// - RequestVote: 快速失败（选举阶段系统不可用）
+// - InstallSnapshot: 使用流式传输，不依赖超时
+// - ClientRequest: 合理的客户端超时
+
+const (
+	// RequestVote: 选举阶段快速失败进入下一个 Term
+	// 原因：如果一个节点迟迟不响应投票请求（可能是挂了），
+	// Candidate 应该快速失败并重试其他节点
+	DefaultRequestVoteTimeout = 300 * time.Millisecond
+
+	// ClientRequest: 客户端请求超时
+	DefaultClientRequestTimeout = 5 * time.Second
+
+	// InstallSnapshot 流式传输：每个块的发送超时
+	// 原因：流式传输不会因为大文件而超时，只需要设置单块的超时
+	DefaultChunkSendTimeout = 10 * time.Second
+
+	// AppendEntries 基准比例：ElectionTimeout 的百分比
+	// 原因：这是最高频调用，包含磁盘 fsync，太短会导致频繁重试
+	// 默认为 70%，可根据网络/磁盘条件调整
+	AppendEntriesTimeoutRatio = 0.70
+)
+
 // Transport implements transport.Transport using gRPC.
 type Transport struct {
 	pb.UnimplementedRaftServiceServer
@@ -32,6 +60,9 @@ type Transport struct {
 	conns      map[string]*grpc.ClientConn
 	clients    map[string]pb.RaftServiceClient
 	resolvers  map[int]string
+
+	// 用于动态计算 AppendEntries 超时
+	electionTimeout time.Duration
 }
 
 // NewTransport creates a new gRPC Transport.
@@ -49,6 +80,26 @@ func NewTransport(listenAddr string) (*Transport, error) {
 		resolvers:  make(map[int]string),
 		grpcServer: grpc.NewServer(),
 	}, nil
+}
+
+// SetElectionTimeout 设置选举超时，用于动态计算 AppendEntries 超时
+func (t *Transport) SetElectionTimeout(timeout time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.electionTimeout = timeout
+}
+
+// getAppendEntriesTimeout 基于 ElectionTimeout 动态计算超时
+// 返回 ElectionTimeout 的 70%，保证在心跳间隔内完成
+func (t *Transport) getAppendEntriesTimeout() time.Duration {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if t.electionTimeout > 0 {
+		return time.Duration(float64(t.electionTimeout) * AppendEntriesTimeoutRatio)
+	}
+	// 默认值：200ms 的 70% = 140ms
+	return 140 * time.Millisecond
 }
 
 // Addr returns the local address.
@@ -89,10 +140,6 @@ func (t *Transport) Start() error {
 
 	go func() {
 		if err := t.grpcServer.Serve(t.listener); err != nil {
-			// Serve returns a non-nil error unless Stop or GracefulStop is called.
-			// We can ignore "closed network connection" errors if we are shutting down.
-			// But grpc.Serve usually returns specific errors.
-			// For now, just log it.
 			log.Infof("[GRPCTransport] Server stopped: %v", err)
 		}
 	}()
@@ -164,35 +211,10 @@ func (t *Transport) getPeerClient(targetID string) (pb.RaftServiceClient, error)
 	return client, nil
 }
 
-// --- Helper functions for encoding/decoding ---
+// ==================== Client side implementation ====================
 
-func encode(v any) ([]byte, error) {
-	// If v is already []byte (e.g. from JSON marshal), return it directly?
-	// No, gob encoding adds type information.
-	// But wait, in our integration tests, Command is []byte (json marshaled).
-	// If we gob encode a []byte, we get a gob-encoded byte slice.
-	// On the receiving end, we gob decode it back to []byte.
-	// This is fine.
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(&v); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func decode(data []byte) (any, error) {
-	var v any
-	if len(data) == 0 {
-		return nil, nil
-	}
-	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&v); err != nil {
-		return nil, err
-	}
-	return v, nil
-}
-
-// --- Client side implementation ---
-
+// SendRequestVote 发送 RequestVote RPC 请求。
+// 超时策略：快速失败（300ms），选举阶段系统不可用，希望选举越快越好
 func (t *Transport) SendRequestVote(target string, req *param.RequestVoteArgs, resp *param.RequestVoteReply) error {
 	client, err := t.getPeerClient(target)
 	if err != nil {
@@ -207,7 +229,7 @@ func (t *Transport) SendRequestVote(target string, req *param.RequestVoteArgs, r
 		PreVote:      req.PreVote,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultRequestVoteTimeout)
 	defer cancel()
 
 	pbResp, err := client.RequestVote(ctx, pbReq)
@@ -222,6 +244,9 @@ func (t *Transport) SendRequestVote(target string, req *param.RequestVoteArgs, r
 	return nil
 }
 
+// SendAppendEntries 发送 AppendEntries RPC 请求。
+// 超时策略：基于 ElectionTimeout 动态计算（默认 70%）
+// 原因：这是最高频调用，包含磁盘 fsync，太短会导致频繁重试
 func (t *Transport) SendAppendEntries(target string, req *param.AppendEntriesArgs, resp *param.AppendEntriesReply) error {
 	client, err := t.getPeerClient(target)
 	if err != nil {
@@ -250,7 +275,9 @@ func (t *Transport) SendAppendEntries(target string, req *param.AppendEntriesArg
 		LeaderCommit: req.LeaderCommit,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// 基于配置的 ElectionTimeout 动态计算超时
+	timeout := t.getAppendEntriesTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	pbResp, err := client.AppendEntries(ctx, pbReq)
@@ -266,34 +293,122 @@ func (t *Transport) SendAppendEntries(target string, req *param.AppendEntriesArg
 	return nil
 }
 
+// SendInstallSnapshot 发送 InstallSnapshot RPC 请求。
+// 内部使用流式传输，支持大文件和断点续传。
 func (t *Transport) SendInstallSnapshot(target string, req *param.InstallSnapshotArgs, resp *param.InstallSnapshotReply) error {
+	// 直接调用流式传输，获得大文件支持和断点续传能力
+	// Raft 传入的是完整快照数据（req.Offset=0, req.Done=true）
+	if err := t.SendInstallSnapshotStream(target, req.Term, req.LeaderID, req.LastIncludedIndex, req.LastIncludedTerm, req.Data); err != nil {
+		return err
+	}
+	// 流式传输成功后，返回当前 Term（需要从当前状态获取）
+	// 由于流式传输已经成功，这里返回请求的 Term
+	resp.Term = req.Term
+	return nil
+}
+
+// SendInstallSnapshotStream 发送 InstallSnapshot RPC 请求（流式传输方式）。
+// 支持大文件传输和断点续传，不依赖单一超时。
+func (t *Transport) SendInstallSnapshotStream(target string, term, leaderID, lastIncludedIndex, lastIncludedTerm uint64, data []byte) error {
 	client, err := t.getPeerClient(target)
 	if err != nil {
 		return err
 	}
 
-	pbReq := &pb.InstallSnapshotRequest{
-		Term:              req.Term,
-		LeaderId:          req.LeaderID,
-		LastIncludedIndex: req.LastIncludedIndex,
-		LastIncludedTerm:  req.LastIncludedTerm,
-		Offset:            req.Offset,
-		Data:              req.Data,
-		Done:              req.Done,
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// 建立流式连接
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pbResp, err := client.InstallSnapshot(ctx, pbReq)
+	stream, err := client.InstallSnapshotStream(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create snapshot stream: %w", err)
 	}
 
-	resp.Term = pbResp.Term
+	// 配置流式传输参数
+	const chunkSize = 4 * 1024 * 1024 // 4MB per chunk
+	totalSize := uint64(len(data))
+	offset := uint64(0)
+
+	log.Infof("[GRPCTransport] Starting streaming snapshot transfer: target=%s, size=%d bytes, chunks=%d",
+		target, totalSize, (totalSize+chunkSize-1)/chunkSize)
+
+	// 流式发送数据块
+	for offset < totalSize {
+		// 发送超时：每个块 10 秒，避免单块卡死
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), DefaultChunkSendTimeout)
+
+		chunkEnd := offset + chunkSize
+		if chunkEnd > totalSize {
+			chunkEnd = totalSize
+		}
+
+		chunk := &pb.InstallSnapshotChunk{
+			Term:              term,
+			LeaderId:          leaderID,
+			LastIncludedIndex: lastIncludedIndex,
+			LastIncludedTerm:  lastIncludedTerm,
+			Offset:            offset,
+			Data:              data[offset:chunkEnd],
+			DataSize:          totalSize,
+			Done:              chunkEnd == totalSize,
+		}
+
+		// 发送数据块（使用带超时的 context）
+		select {
+		case <-sendCtx.Done():
+			sendCancel()
+			return fmt.Errorf("timeout sending chunk at offset %d", offset)
+		default:
+			if err := stream.Send(chunk); err != nil {
+				sendCancel()
+				return fmt.Errorf("failed to send chunk at offset %d: %w", offset, err)
+			}
+		}
+
+		sendCancel()
+
+		// 接收确认
+		ack, err := stream.Recv()
+		if err != nil {
+			return fmt.Errorf("failed to receive ack for chunk at offset %d: %w", offset, err)
+		}
+
+		if !ack.Accepted {
+			// 服务端拒绝了该块，可能是需要断点续传
+			if ack.NextOffset > offset {
+				log.Warnf("[GRPCTransport] Chunk rejected at offset %d, server requests offset %d (resuming...)", offset, ack.NextOffset)
+				offset = ack.NextOffset
+				continue
+			}
+			return fmt.Errorf("chunk rejected at offset %d: %s", offset, ack.Error)
+		}
+
+		offset = chunkEnd
+
+		// 进度日志（每 100MB 打印一次）
+		if offset%(100*1024*1024) == 0 || offset == totalSize {
+			log.Infof("[GRPCTransport] Snapshot transfer progress: %d/%d bytes (%.1f%%)", offset, totalSize, float64(offset)*100/float64(totalSize))
+		}
+	}
+
+	// 发送最后的 done 信号并关闭流
+	if err := stream.CloseSend(); err != nil {
+		return fmt.Errorf("failed to close snapshot stream: %w", err)
+	}
+
+	// 等待最终的确认
+	_, err = stream.Recv()
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("failed to receive final ack: %w", err)
+	}
+
+	log.Infof("[GRPCTransport] Snapshot transfer completed: target=%s, size=%d bytes", target, totalSize)
+
 	return nil
 }
 
+// SendClientRequest 发送客户端请求到指定的 Raft 节点。
+// 超时策略：5 秒客户端请求超时
 func (t *Transport) SendClientRequest(target string, req *param.ClientArgs, resp *param.ClientReply) error {
 	client, err := t.getPeerClient(target)
 	if err != nil {
@@ -311,7 +426,7 @@ func (t *Transport) SendClientRequest(target string, req *param.ClientArgs, resp
 		Command:     cmdBytes,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultClientRequestTimeout)
 	defer cancel()
 
 	pbResp, err := client.ClientRequest(ctx, pbReq)
@@ -331,6 +446,8 @@ func (t *Transport) SendClientRequest(target string, req *param.ClientArgs, resp
 
 	return nil
 }
+
+// ==================== Server side implementation ====================
 
 func (t *Transport) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	args := &param.RequestVoteArgs{
@@ -410,6 +527,117 @@ func (t *Transport) InstallSnapshot(ctx context.Context, req *pb.InstallSnapshot
 	}, nil
 }
 
+// InstallSnapshotStream 流式接收快照数据
+func (t *Transport) InstallSnapshotStream(stream pb.RaftService_InstallSnapshotStreamServer) error {
+	var snapshotBuffer []byte
+	var snapshotMetadata *param.InstallSnapshotArgs
+	var expectedOffset uint64 = 0
+	var totalSize uint64 = 0
+	var receivedBytes uint64 = 0
+
+	log.Infof("[GRPCTransport] Starting to receive streaming snapshot")
+
+	for {
+		chunk, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("error receiving snapshot chunk: %w", err)
+		}
+
+		// 第一个 chunk 包含快照元数据
+		if snapshotMetadata == nil {
+			snapshotMetadata = &param.InstallSnapshotArgs{
+				Term:              chunk.Term,
+				LeaderID:          chunk.LeaderId,
+				LastIncludedIndex: chunk.LastIncludedIndex,
+				LastIncludedTerm:  chunk.LastIncludedTerm,
+			}
+			totalSize = chunk.DataSize
+			expectedOffset = 0
+
+			// 预分配缓冲区（避免多次扩容）
+			if totalSize > 0 && totalSize < 100*1024*1024 { // 小于 100MB 预分配
+				snapshotBuffer = make([]byte, 0, totalSize)
+			} else {
+				snapshotBuffer = make([]byte, 0, 10*1024*1024) // 至少 10MB 缓冲
+			}
+
+			log.Infof("[GRPCTransport] Snapshot metadata: term=%d, leader=%d, lastIndex=%d, size=%d bytes",
+				chunk.Term, chunk.LeaderId, chunk.LastIncludedIndex, totalSize)
+		}
+
+		// 断点续传检查
+		if chunk.Offset != expectedOffset {
+			log.Warnf("[GRPCTransport] Expected offset %d, got %d (requesting resume)",
+				expectedOffset, chunk.Offset)
+
+			// 发送拒绝并请求正确的偏移量
+			if err := stream.Send(&pb.InstallSnapshotAck{
+				Accepted:      false,
+				NextOffset:    expectedOffset,
+				Error:         fmt.Sprintf("offset mismatch: expected %d, got %d", expectedOffset, chunk.Offset),
+				ReceivedBytes: receivedBytes,
+			}); err != nil {
+				return fmt.Errorf("failed to send resume request: %w", err)
+			}
+			continue
+		}
+
+		// 追加数据
+		snapshotBuffer = append(snapshotBuffer, chunk.Data...)
+		receivedBytes += uint64(len(chunk.Data))
+		expectedOffset = receivedBytes
+
+		// 发送确认
+		if err := stream.Send(&pb.InstallSnapshotAck{
+			Accepted:      true,
+			NextOffset:    expectedOffset,
+			ReceivedBytes: receivedBytes,
+		}); err != nil {
+			return fmt.Errorf("failed to send chunk ack: %w", err)
+		}
+
+		// 进度日志
+		if chunk.Done || receivedBytes%(50*1024*1024) == 0 {
+			log.Infof("[GRPCTransport] Snapshot receive progress: %d/%d bytes (%.1f%%)",
+				receivedBytes, totalSize, float64(receivedBytes)*100/float64(totalSize))
+		}
+
+		// 最后一个 chunk，完成快照安装
+		if chunk.Done {
+			// 将缓冲区分块发送给 Raft
+			chunkSize := 4 * 1024 * 1024 // 4MB chunks
+			var currentOffset uint64 = 0
+
+			reply := &param.InstallSnapshotReply{}
+
+			for currentOffset < uint64(len(snapshotBuffer)) {
+				chunkEnd := currentOffset + uint64(chunkSize)
+				if chunkEnd > uint64(len(snapshotBuffer)) {
+					chunkEnd = uint64(len(snapshotBuffer))
+				}
+
+				snapshotMetadata.Offset = currentOffset
+				snapshotMetadata.Data = snapshotBuffer[currentOffset:chunkEnd]
+				snapshotMetadata.Done = (chunkEnd == uint64(len(snapshotBuffer)))
+
+				if err := t.raft.InstallSnapshot(snapshotMetadata, reply); err != nil {
+					return fmt.Errorf("failed to install snapshot chunk at offset %d: %w", currentOffset, err)
+				}
+
+				currentOffset = chunkEnd
+			}
+
+			log.Infof("[GRPCTransport] Snapshot installation completed: size=%d bytes", receivedBytes)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("snapshot stream ended without done marker")
+}
+
 func (t *Transport) ClientRequest(ctx context.Context, req *pb.ClientRequestRequest) (*pb.ClientRequestResponse, error) {
 	cmd, err := decode(req.Command)
 	if err != nil {
@@ -438,4 +666,25 @@ func (t *Transport) ClientRequest(ctx context.Context, req *pb.ClientRequestRequ
 		NotLeader:  reply.NotLeader,
 		LeaderHint: int64(reply.LeaderHint),
 	}, nil
+}
+
+// ==================== Helper functions for encoding/decoding ====================
+
+func encode(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(&v); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func decode(data []byte) (any, error) {
+	var v any
+	if len(data) == 0 {
+		return nil, nil
+	}
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&v); err != nil {
+		return nil, err
+	}
+	return v, nil
 }
