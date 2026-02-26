@@ -578,45 +578,12 @@ func (r *Raft) handleWriteRequest(args *param.ClientArgs, reply *param.ClientRep
 		return nil
 	}
 
-	// 2. 检查是否为配置变更命令
-	if configCmd, ok := args.Command.(param.ConfigChangeCommand); ok {
-		log.Infof("[Client] Detected ConfigChangeCommand: %v", configCmd)
-		return r.handleConfigChange(configCmd, reply)
-	}
-
-	// 3. 将命令提交到 Raft 日志，并同步等待其被状态机应用。
+	// 2. 将命令提交到 Raft 日志，并同步等待其被状态机应用。
 	result, ok, leaderID := r.Commit(args.Command)
 
-	// 4. 根据提交和等待的结果，最终填充客户端的响应。
+	// 3. 根据提交和等待的结果，最终填充客户端的响应。
 	r.finalizeClientReply(args, reply, result, ok, leaderID)
 
-	return nil
-}
-
-// handleConfigChange 处理配置变更请求
-func (r *Raft) handleConfigChange(configCmd param.ConfigChangeCommand, reply *param.ClientReply) error {
-	index, _, ok := r.ChangeConfig(configCmd.NewPeerIDs)
-	if !ok {
-		reply.Success = false
-		if !r.isLeader() {
-			reply.NotLeader = true
-			reply.LeaderHint = r.knownLeaderID
-		}
-		return nil
-	}
-
-	// 等待配置变更被应用
-	result, ok := r.waitForAppliedLog(index, 2*time.Second)
-	if ok {
-		reply.Success = true
-		reply.Result = result
-	} else {
-		reply.Success = false
-		if !r.isLeader() {
-			reply.NotLeader = true
-			reply.LeaderHint = r.knownLeaderID
-		}
-	}
 	return nil
 }
 
