@@ -1,4 +1,4 @@
-package raft
+package tests
 
 import (
 	"encoding/json"
@@ -9,6 +9,7 @@ import (
 	"github.com/xmh1011/go-kv/pkg/param"
 	"github.com/xmh1011/go-kv/pkg/storage"
 	"github.com/xmh1011/go-kv/pkg/transport/inmemory"
+	"github.com/xmh1011/go-kv/raft"
 )
 
 // BenchmarkAppendEntries 测试日志复制的性能
@@ -17,7 +18,7 @@ func BenchmarkAppendEntries(b *testing.B) {
 	store, sm, _ := storage.NewStorage(storage.InmemoryStorage, dataDir, 1)
 	defer store.Close()
 
-	rf := NewRaft(1, []int{1, 2, 3}, store, sm, nil, make(chan param.CommitEntry, 1000))
+	rf := raft.NewRaft(1, []int{1, 2, 3}, store, sm, nil, make(chan param.CommitEntry, 1000))
 	rf.Stop()
 
 	entries := make([]param.LogEntry, 10)
@@ -46,7 +47,7 @@ func BenchmarkRequestVote(b *testing.B) {
 	store, sm, _ := storage.NewStorage(storage.InmemoryStorage, dataDir, 1)
 	defer store.Close()
 
-	rf := NewRaft(1, []int{1, 2, 3}, store, sm, nil, make(chan param.CommitEntry, 1000))
+	rf := raft.NewRaft(1, []int{1, 2, 3}, store, sm, nil, make(chan param.CommitEntry, 1000))
 	rf.Stop()
 
 	args := param.NewRequestVoteArgs(1, 1, 100, 1, false)
@@ -116,7 +117,7 @@ func BenchmarkClientRequestProcessing(b *testing.B) {
 	trans := inmemory.NewTransport("127.0.0.1:0")
 	trans.SetPeers(map[int]string{1: trans.Addr()})
 
-	rf := NewRaft(1, []int{1}, store, sm, trans, make(chan param.CommitEntry, 1000))
+	rf := raft.NewRaft(1, []int{1}, store, sm, trans, make(chan param.CommitEntry, 1000))
 	go rf.Run()
 
 	time.Sleep(300 * time.Millisecond)
@@ -225,7 +226,7 @@ func BenchmarkMixedWorkload(b *testing.B) {
 	trans := inmemory.NewTransport("127.0.0.1:0")
 	trans.SetPeers(map[int]string{1: trans.Addr()})
 
-	rf := NewRaft(1, []int{1}, store, sm, trans, make(chan param.CommitEntry, 1000))
+	rf := raft.NewRaft(1, []int{1}, store, sm, trans, make(chan param.CommitEntry, 1000))
 	go rf.Run()
 
 	time.Sleep(300 * time.Millisecond)

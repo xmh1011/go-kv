@@ -457,6 +457,7 @@ func TestApplyConfigChange(t *testing.T) {
 				electionTimeout:  config.Conf.Raft.ElectionTimeout,
 				heartbeatTimeout: config.Conf.Raft.HeartbeatTimeout,
 			}
+			r.lastAppliedCond = sync.NewCond(&r.mu)
 
 			r.applyConfigChange(tt.cmd, 10)
 

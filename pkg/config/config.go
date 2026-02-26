@@ -31,6 +31,7 @@ const (
 	KeyRaftElectionTimeout   = "raft.election_timeout"
 	KeyRaftSnapshotThreshold = "raft.snapshot_threshold"
 	KeyRaftPeers             = "raft.peers"
+	KeyRaftReadIndexMode     = "raft.read_index_mode"
 
 	// LSM
 	KeyLSMMaxMemTableSize   = "lsm.max_mem_table_size"
@@ -61,6 +62,17 @@ const (
 	DefaultMinSSTableLevel   = 0
 	DefaultMaxSSTableLevel   = 6
 	DefaultLevelSizeBase     = 2
+	DefaultReadIndexMode     = "lease" // 默认使用 Lease Read 模式
+)
+
+// ReadIndexMode 定义 ReadIndex 的实现模式
+type ReadIndexMode string
+
+const (
+	// ReadIndexModeHeartbeat 使用心跳确认实现 ReadIndex（保守但较慢）
+	ReadIndexModeHeartbeat ReadIndexMode = "heartbeat"
+	// ReadIndexModeLease 使用租约实现 ReadIndex（高性能，推荐生产环境使用）
+	ReadIndexModeLease ReadIndexMode = "lease"
 )
 
 // AppConfig 是总配置结构体
@@ -80,6 +92,7 @@ type RaftConfig struct {
 	ElectionTimeout   time.Duration `mapstructure:"election_timeout"`
 	SnapshotThreshold int           `mapstructure:"snapshot_threshold"`
 	Peers             []PeerInfo    `mapstructure:"peers"`
+	ReadIndexMode     ReadIndexMode `mapstructure:"read_index_mode"`
 }
 
 // PeerInfo 描述了一个 Raft 集群中的对等节点
@@ -165,6 +178,7 @@ func setDefaults() {
 	viper.SetDefault(KeyRaftElectionTimeout, DefaultElectionTimeout)
 	viper.SetDefault(KeyRaftSnapshotThreshold, DefaultSnapshotThreshold)
 	viper.SetDefault(KeyRaftPeers, []PeerInfo{})
+	viper.SetDefault(KeyRaftReadIndexMode, DefaultReadIndexMode)
 
 	// LSM
 	viper.SetDefault(KeyLSMMaxMemTableSize, DefaultMaxMemTableSize)

@@ -473,6 +473,7 @@ func TestRequestVote(t *testing.T) {
 				electionTimeout:  config.Conf.Raft.ElectionTimeout,
 				heartbeatTimeout: config.Conf.Raft.HeartbeatTimeout,
 			}
+			r.lastAppliedCond = sync.NewCond(&r.mu)
 
 			reply := &param.RequestVoteReply{}
 			err := r.RequestVote(tt.args, reply)

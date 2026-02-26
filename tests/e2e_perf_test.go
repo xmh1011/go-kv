@@ -316,7 +316,7 @@ func TestE2E_ReadHeavy(t *testing.T) {
 				break
 			default:
 				keyNum := rand.Intn(warmupCount)
-				key := fmt.Sprintf("key-%d", keyNum)
+				key := fmt.Sprintf("warmup-key-%d", keyNum)
 				cmd := param.KVCommand{Op: param.OpGet, Key: key, Value: ""}
 				success, latency, _ := c.sendThroughRPC(leader, cmd, 5*time.Second)
 

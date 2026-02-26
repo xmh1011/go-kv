@@ -1,8 +1,10 @@
 # Makefile for the go-kv project
 
 # --- Variables ---
-# Get all packages that contain at least one test file. This is more robust.
-PKGS_TO_TEST := $(shell go list -f '{{if .TestGoFiles}}{{.ImportPath}}{{end}}' ./...)
+# Unit test packages: exclude tests/ directory
+UNIT_TEST_PKGS := $(shell go list ./... | grep -v 'github.com/xmh1011/go-kv/tests')
+# Integration test packages
+INTEGRATION_TEST_PKGS := ./tests/...
 
 # Define the output binary names
 SERVER_BINARY=kv-server
@@ -19,7 +21,7 @@ IMPORTS_ORDER := "std,general,company,project"
 
 # --- Targets ---
 
-.PHONY: all deps build test integration-test benchmark benchmark-all perf-test cover install-mockgen mockgen clean help cluster stop-cluster proto install-protoc-gen install-go-imports-reviser format
+.PHONY: all deps build test integration-test bench-test perf-test cover install-mockgen mockgen clean help cluster stop-cluster proto install-protoc-gen install-go-imports-reviser format
 
 .DEFAULT_GOAL := help
 
@@ -28,7 +30,7 @@ help:
 	@echo "Usage: make [target]"
 	@echo ""
 	@echo "Targets:"
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## //' | awk -F ': ' '{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
 ## all: Run all tests.
 all: test
@@ -45,43 +47,29 @@ build: deps
 	@echo " building $(CLIENT_BINARY)..."
 	@go build -o $(CLIENT_BINARY) $(CLIENT_CMD_PATH)
 
-## test: Run all unit tests with race detector and coverage for ALL packages.
+## test: Run unit tests only (excludes tests/ directory and benchmarks).
 test: deps
 	@echo " running unit tests..."
-	@go test -race -timeout=20m -v -cover -coverprofile=coverage.txt -coverpkg=./... $(PKGS_TO_TEST)
+	@go test -race -timeout=20m -v -cover -coverprofile=coverage.txt -coverpkg=./... $(UNIT_TEST_PKGS)
 
-## integration-test: Run integration tests.
+## integration-test: Run integration tests in tests/ directory only.
 integration-test: deps
 	@echo " running integration tests..."
-	@go test -race -v ./tests/...
+	@go test -race -v -timeout=30m $(INTEGRATION_TEST_PKGS)
 
-## perf-test: Run production performance tests (gRPC + LSM).
+## perf-test: Run production performance tests and save results.
 perf-test: deps
 	@echo " running production performance tests (gRPC + LSM)..."
-	@echo " This may take several minutes..."
-	@go test -race -v -timeout=30m -run "TestProduction" ./tests/
+	@mkdir -p test_results
+	@go test -race -v -timeout=30m -run "TestProduction" ./tests/ 2>&1 | tee test_results/perf_test.txt
+	@echo " results saved to test_results/perf_test.txt"
 
-## benchmark: Run all benchmarks with memory profiling.
-benchmark: deps
-	@echo " running benchmarks..."
-	@go test -bench=. -benchmem -benchtime=3s -timeout=30m $(PKGS_TO_TEST)
-
-## benchmark-all: Run all benchmarks including integration-level benchmarks.
-benchmark-all: deps
-	@echo " running all benchmarks including integration-level..."
-	@go test -bench=. -benchmem -benchtime=3s -timeout=60m $(PKGS_TO_TEST) ./tests/...
-
-## benchmark-save: Run benchmarks and save results to file.
-benchmark-save: deps
-	@echo " running benchmarks and saving results..."
+## bench: Run all benchmark tests and save results to benchmark_results/.
+bench-test: deps
+	@echo " running benchmark tests..."
 	@mkdir -p benchmark_results
-	@go test -bench=. -benchmem -benchtime=3s -timeout=30m $(PKGS_TO_TEST) > benchmark_results/benchmark.txt
-	@go test -bench=. -benchmem -benchtime=3s -timeout=30m ./tests/... > benchmark_results/benchmark_integration.txt
-
-## run-benchmarks: Run comprehensive benchmarks using the benchmark runner script.
-run-benchmarks: deps
-	@echo " running comprehensive benchmarks..."
-	@./scripts/run_benchmarks.sh
+	@go test -bench=. -benchmem -benchtime=3s -timeout=30m ./... 2>&1 | tee benchmark_results/benchmark.txt
+	@echo " results saved to benchmark_results/benchmark.txt"
 
 ## run-tests: Run comprehensive tests using the test runner script.
 run-tests: deps
@@ -148,14 +136,18 @@ format: install-go-imports-reviser
 		gofmt -w "$$file"; \
 	done
 
-## clean: Remove generated files and clear Go test cache.
+## clean: Remove all generated files, test artifacts, and clear Go test cache.
 clean:
 	@echo " cleaning up..."
 	@go clean -testcache
 	@rm -f coverage.txt coverage.html unittest.txt $(SERVER_BINARY) $(CLIENT_BINARY) raft-node-*.log raft-node-*.pid
-	@rm -rf benchmark_results test_results
+	@rm -rf benchmark_results test_results data
 	@find . -type f -name "*.sst" -delete
 	@find . -type f -name "*.wal" -delete
 	@find . -type f -name "*.wf" -delete
 	@find . -type f -name "*.log" -delete
-	@find . -type d -name "*-level" -exec rm -rf {} +
+	@find . -type d -name "*-level" -exec rm -rf {} + 2>/dev/null || true
+	@find . -type d -name "test-temp-*" -exec rm -rf {} + 2>/dev/null || true
+	@find . -type d -name "__debug_bin*" -exec rm -rf {} + 2>/dev/null || true
+	@rm -rf /tmp/go-kv-test-* 2>/dev/null || true
+	@echo " cleanup complete."

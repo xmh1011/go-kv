@@ -4,7 +4,24 @@
 
 本报告记录了 go-kv 分布式键值存储系统的性能测试结果。该系统基于 Raft 共识算法实现，支持多种传输层（InMemory、TCP、gRPC）和存储引擎（InMemory、LSM）。
 
-## 最新测试结果 (2026-02-23)
+## 最新测试结果 (2026-02-26)
+
+### Lease Read 机制已实现
+
+**实现日期**: 2026-02-26
+
+Lease Read 是一种高性能的 ReadIndex 实现方式，Leader 在收到多数派心跳响应后获得一个租约期，租约期内可直接处理读请求，无需心跳确认。
+
+| ReadIndex 模式   | 实现方式          | 性能 | 一致性保证     | 适用场景        |
+|----------------|---------------|----|-----------|-------------|
+| **Lease (默认)** | 基于租约，租约期内直接读取 | 高  | 弱（依赖时钟同步） | 生产环境，高并发读取  |
+| Heartbeat      | 每次读请求心跳确认     | 低  | 强         | 对一致性要求极高的场景 |
+
+**配置方式**:
+```yaml
+raft:
+  read_index_mode: "lease"  # 默认值
+```
 
 ### gRPC + LSM 生产环境基准测试结果
 
@@ -485,18 +502,32 @@ go test ./tests/... -run=^TestLongRunning -timeout=15m -v
 - 定期运行长时测试以验证系统稳定性和数据一致性
 
 **待修复问题**:
-1. ⚠️ LongRunning_ReadHeavy 测试仍超时：需要进一步调查测试逻辑
-2. ⚠️ Comprehensive 测试仍有3.58%的错误率：需要优化高并发场景
-3. 改进并发控制机制，提高系统在高负载下的稳定性
+1. ⚠️ LongRunning 测试 Leader 跟踪问题：测试过程中 Leader 切换后，测试没有动态更新 Leader 变量导致请求失败
+2. 改进并发控制机制，提高系统在高负载下的稳定性
 
-**已修复的问题**:
-1. ✅ 修复 raft replication 中的死锁问题（dispatchEntries 锁竞争）
-2. ✅ DeleteStress 测试现在可以正常运行
-3. ✅ Comprehensive 测试错误率从99.84%降低到3.58%
+**已修复的问题** (2026-02-26):
+1. ✅ 实现 Lease Read 机制，显著提升读取性能
+2. ✅ 修复 raft replication 中的死锁问题（dispatchEntries 锁竞争）
+3. ✅ DeleteStress 测试现在可以正常运行
+4. ✅ 实现 gRPC 差异化超时策略
+5. ✅ 实现 InstallSnapshot 流式传输
+6. ✅ 修复 ReadIndex 日志级别：将 performReadAfterApply 中的 Infof 改为 Debugf，减少高并发场景下的日志输出
+7. ✅ 修复测试中的数据竞争：latencies slice 并发写入问题
+8. ✅ 修复 commitChan 重复应用日志问题：LongRunning 测试中日志被应用了两次
+
+**最新测试结果** (2026-02-26):
+
+所有 E2E 测试通过：
+- TestE2E_ReadHeavy: 吞吐量 435,045 ops/sec，100% 成功率
+- TestE2E_WriteHeavy: 吞吐量 707 ops/sec，100% 成功率
+- TestE2E_MixedWorkload: 吞吐量 1,604 ops/sec，100% 成功率
+- TestE2E_SmallValues: 吞吐量 1,725 ops/sec，100% 成功率
+- TestE2E_BatchOperations: 吞吐量 46 ops/sec，100% 成功率
+- TestE2E_DeleteOperations: 吞吐量 674 ops/sec，100% 成功率
 
 ---
 
-**测试日期**: 2026-02-23
+**测试日期**: 2026-02-26
 **测试环境**: macOS Darwin 25.2.0
 **Go 版本**: go1.x
 **测试数据来源**: 实际运行测试收集

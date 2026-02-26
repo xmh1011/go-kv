@@ -81,8 +81,13 @@ type Raft struct {
 	shutdownChan chan struct{} // 用于关闭 Run 循环
 
 	// --- ReadIndex 优化 ---
-	lastLeadershipConfirm time.Time // 上次确认 Leadership 的时间
-	leadershipCacheTime     time.Duration // Leadership 确认缓存时间
+	lastLeadershipConfirm time.Time     // 上次确认 Leadership 的时间
+	leadershipCacheTime   time.Duration // Leadership 确认缓存时间
+
+	// --- Lease Read ---
+	leaseUntil    time.Time            // 租约到期时间（Leader 专用）
+	leaseDuration time.Duration        // 租约长度，通常设为 electionTimeout
+	readIndexMode config.ReadIndexMode // ReadIndex 实现模式
 }
 
 // NewRaft 创建一个新的 Raft 节点。
@@ -109,6 +114,9 @@ func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.
 		heartbeatTimeout:  config.Conf.Raft.HeartbeatTimeout,
 		// 初始化 ReadIndex 缓存，缓存时间设置为心跳间隔的一半
 		leadershipCacheTime: config.Conf.Raft.HeartbeatTimeout / 2,
+		// 初始化 Lease Read 相关配置
+		leaseDuration: config.Conf.Raft.ElectionTimeout,
+		readIndexMode: config.Conf.Raft.ReadIndexMode,
 	}
 	// 从稳定存储中恢复状态。
 	if store != nil {
@@ -228,6 +236,11 @@ func (r *Raft) Stop() {
 
 	log.Infof("[Core] Node %d received stop signal.", r.id)
 	r.state = Dead
+
+	// 广播 lastAppliedCond，唤醒可能在等待的读请求
+	// 这样它们可以检测到节点已停止并退出
+	r.lastAppliedCond.Broadcast()
+
 	close(r.shutdownChan)
 }
 
@@ -263,6 +276,9 @@ func (r *Raft) ClientRequest(args *param.ClientArgs, reply *param.ClientReply) e
 }
 
 // handleLinearizableRead 处理只读请求，使用 ReadIndex 机制。
+// 支持两种模式：
+//   - Heartbeat 模式：每次读请求都发送心跳确认
+//   - Lease 模式：基于租约，在租约期内无需心跳确认（高性能）
 func (r *Raft) handleLinearizableRead(cmd param.KVCommand, reply *param.ClientReply) error {
 	r.mu.Lock()
 
@@ -279,10 +295,24 @@ func (r *Raft) handleLinearizableRead(cmd param.KVCommand, reply *param.ClientRe
 	// 只要状态机应用到这个 index，就能保证线性一致性。
 	readIndex := r.commitIndex
 
+	// 3. 根据配置的 ReadIndex 模式选择确认方式
+	if r.readIndexMode == config.ReadIndexModeLease {
+		// Lease Read 模式：检查租约是否有效
+		now := time.Now()
+		if now.Before(r.leaseUntil) {
+			// 租约有效，直接执行读操作，无需心跳确认
+			log.Debugf("[Lease Read] Node %d lease valid until %v, performing direct read. ReadIndex: %d", r.id, r.leaseUntil, readIndex)
+			r.mu.Unlock()
+			return r.performReadAfterApply(cmd, reply, readIndex)
+		}
+		log.Debugf("[Lease Read] Node %d lease expired at %v, falling back to heartbeat confirmation", r.id, r.leaseUntil)
+	}
+
+	// Heartbeat 模式或租约已过期：需要心跳确认
 	// 为了不阻塞 Raft 锁，我们先释放锁去进行耗时的网络确认
 	r.mu.Unlock()
 
-	// 3. Heartbeat 确认 (Confirm Leadership)
+	// 4. Heartbeat 确认 (Confirm Leadership)
 	// 向集群广播心跳，确保当前时刻自己依然拥有多数派支持。
 	// 这替代了原先依赖时钟的租约检查 (Lease Check)。
 	if !r.confirmLeadership() {
@@ -293,25 +323,72 @@ func (r *Raft) handleLinearizableRead(cmd param.KVCommand, reply *param.ClientRe
 		return nil
 	}
 
+	return r.performReadAfterApply(cmd, reply, readIndex)
+}
+
+// performReadAfterApply 等待状态机应用到 ReadIndex 后执行读操作
+// 带有超时机制，防止无限阻塞
+func (r *Raft) performReadAfterApply(cmd param.KVCommand, reply *param.ClientReply, readIndex uint64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// 重新加锁后再次检查状态，防止在确认期间被降级
+	// 重新加锁后再次检查状态，防止在确认期间被降级或停止
 	if r.state != Leader {
 		reply.NotLeader = true
 		reply.LeaderHint = r.knownLeaderID
 		return nil
 	}
 
-	log.Infof("[ReadIndex] Node %d confirmed leadership. ReadIndex: %d. Waiting for lastApplied (%d)...", r.id, readIndex, r.lastApplied)
+	log.Debugf("[ReadIndex] Node %d confirmed leadership. ReadIndex: %d. Waiting for lastApplied (%d)...", r.id, readIndex, r.lastApplied)
 
-	// 4. 等待状态机追赶上 ReadIndex
-	for r.lastApplied < readIndex {
+	// 设置超时：使用选举超时的 2 倍作为读请求超时
+	timeout := r.electionTimeout * 2
+	timeoutCh := make(chan struct{})
+
+	// 启动一个 goroutine 在超时后广播条件变量
+	go func() {
+		time.Sleep(timeout)
+		close(timeoutCh)
+		r.lastAppliedCond.Broadcast() // 超时时广播，唤醒等待者
+	}()
+
+	// 等待状态机追赶上 ReadIndex，同时在每次唤醒时检查 Leader 状态和超时
+	for r.lastApplied < readIndex && r.state == Leader {
+		// 检查是否超时
+		select {
+		case <-timeoutCh:
+			log.Warnf("[ReadIndex] Node %d timed out waiting for lastApplied to reach %d (current: %d)", r.id, readIndex, r.lastApplied)
+			reply.Success = false
+			reply.Result = "read timeout"
+			return nil
+		default:
+			// 继续等待
+		}
+
+		// sync.Cond.Wait() 会释放锁并等待，被唤醒后重新获取锁
 		r.lastAppliedCond.Wait()
+
+		// 被唤醒后再次检查超时
+		select {
+		case <-timeoutCh:
+			log.Warnf("[ReadIndex] Node %d timed out waiting for lastApplied to reach %d (current: %d)", r.id, readIndex, r.lastApplied)
+			reply.Success = false
+			reply.Result = "read timeout"
+			return nil
+		default:
+			// 继续检查条件
+		}
 	}
 
-	// 5. 执行本地读取
-	log.Infof("[ReadIndex] Node %d state machine ready (lastApplied=%d). performing read.", r.id, r.lastApplied)
+	// 检查是否因为 Leader 被降级或节点停止而退出循环
+	if r.state != Leader {
+		reply.NotLeader = true
+		reply.LeaderHint = r.knownLeaderID
+		return nil
+	}
+
+	// 执行本地读取
+	log.Debugf("[ReadIndex] Node %d state machine ready (lastApplied=%d). performing read.", r.id, r.lastApplied)
 
 	value, err := r.stateMachine.Get(cmd.Key)
 	if err != nil {
@@ -357,8 +434,12 @@ func (r *Raft) confirmLeadership() bool {
 	if recentAcks >= majority {
 		// 已经有足够的最近确认，不需要发送心跳
 		log.Debugf("[ReadIndex] Node %d has enough recent acks (%d/%d), skipping heartbeat.", leaderID, recentAcks, majority)
-		// 更新缓存时间
+		// 更新缓存时间和租约
 		r.lastLeadershipConfirm = now
+		if r.readIndexMode == config.ReadIndexModeLease {
+			r.leaseUntil = now.Add(r.leaseDuration)
+			log.Debugf("[Lease Read] Node %d renewed lease until %v", r.id, r.leaseUntil)
+		}
 		r.mu.Unlock()
 		return true
 	}
@@ -453,12 +534,41 @@ func (r *Raft) confirmLeadership() bool {
 		}
 	}
 
-	// 更新缓存时间
+	// 更新缓存时间和租约
 	r.mu.Lock()
-	r.lastLeadershipConfirm = time.Now()
+	now = time.Now()
+	r.lastLeadershipConfirm = now
+	if r.readIndexMode == config.ReadIndexModeLease && votes >= majority {
+		r.leaseUntil = now.Add(r.leaseDuration)
+		log.Debugf("[Lease Read] Node %d renewed lease until %v after heartbeat quorum", r.id, r.leaseUntil)
+	}
 	r.mu.Unlock()
 
 	return votes >= majority
+}
+
+// tryRenewLease 检查是否有足够的多数派确认，如果有则更新租约。
+// 此函数必须在持有锁的情况下被调用。
+func (r *Raft) tryRenewLease() {
+	if r.state != Leader {
+		return
+	}
+
+	now := time.Now()
+	peerIDs := r.getAllPeerIDs()
+	recentAcks := 1 // 自己始终算作一个确认
+
+	for _, pid := range peerIDs {
+		if lastAck, ok := r.lastAck[pid]; ok && now.Sub(lastAck) < r.electionTimeout {
+			recentAcks++
+		}
+	}
+
+	majority := len(peerIDs)/2 + 1
+	if recentAcks >= majority {
+		r.leaseUntil = now.Add(r.leaseDuration)
+		log.Debugf("[Lease Read] Node %d renewed lease until %v (acks: %d/%d)", r.id, r.leaseUntil, recentAcks, majority)
+	}
 }
 
 // handleWriteRequest 处理写请求（通过 Raft 日志）。
@@ -697,6 +807,10 @@ func (r *Raft) becomeFollower(newTerm uint64) error {
 	r.electionResetEvent = time.Now()
 	r.currentElectionTimeout = r.randomizedElectionTimeout()
 
+	// 广播 lastAppliedCond，唤醒可能在等待的读请求
+	// 这样它们可以检测到 Leader 状态变化并返回 NotLeader 错误
+	r.lastAppliedCond.Broadcast()
+
 	if err := r.store.SetState(param.HardState{CurrentTerm: r.currentTerm, VotedFor: uint64(r.votedFor)}); err != nil {
 		log.Errorf("[Raft] Node %d failed to persist state after becoming follower: %v", r.id, err)
 		return err
@@ -782,15 +896,20 @@ func (r *Raft) startHeartbeat() {
 		r.mu.Unlock()
 
 		for {
-			<-ticker.C
-
-			r.mu.Lock()
-			if r.state != Leader {
+			select {
+			case <-ticker.C:
+				r.mu.Lock()
+				if r.state != Leader {
+					r.mu.Unlock()
+					return
+				}
+				r.broadcastHeartbeat()
 				r.mu.Unlock()
+
+			case <-r.shutdownChan:
+				// 节点已关闭，退出心跳循环
 				return
 			}
-			r.broadcastHeartbeat()
-			r.mu.Unlock()
 		}
 	}()
 }
