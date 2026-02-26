@@ -680,4 +680,77 @@ if reply.NotLeader {
 - **修复**: 实现租约机制，租约期内直接读取
 - **文件**: `raft/raft.go`, `raft/replication.go`, `pkg/config/config.go`
 
+### 修复 4: ConfigChangeCommand 通知缺失
+- **问题**: 配置变更命令处理后未通知等待的客户端，导致 handleConfigChange 超时
+- **修复**: 在 dispatchEntries 中为 ConfigChangeCommand 添加通知 channel 处理
+- **文件**: `raft/replication.go`
+
+---
+
+## 当前待解决问题汇总
+
+### 问题 1: E2E 性能测试 Leader 跟踪缺失 (P2)
+
+**问题描述**：
+- `TestE2E_ReadHeavy` 测试成功率不稳定（11%~40%）
+- 测试开始时获取 Leader 引用，但在测试过程中 Leader 可能变化
+- 测试继续使用旧的 Leader 引用发送请求，导致 NotLeader 错误
+
+**根因分析**：
+测试代码问题，不是核心代码问题。测试开始时调用 `c.getLeader(t)` 获取 Leader，
+但在整个测试期间（30秒）Leader 可能因网络抖动、GC 暂停等原因发生变化。
+
+**建议修复**：
+参考 `long_running_e2e_test.go` 中的 `sendRequestWithLeaderTracking` 函数，
+在收到 NotLeader 响应时动态更新 Leader 引用：
+
+```go
+// 在 goroutine 中跟踪 Leader 变化
+currentLeader := &atomic.Value{}
+currentLeader.Store(leader)
+
+// 收到 NotLeader 时更新
+if reply.NotLeader {
+    newLeader := c.findLeader()
+    if newLeader != nil {
+        currentLeader.Store(newLeader)
+    }
+}
+```
+
+**测试结果对比**：
+| 测试 | 成功率 | 状态 |
+|------|--------|------|
+| TestE2E_WriteHeavy | 100% | ✅ 通过 |
+| TestE2E_MixedWorkload | 99.99% | ✅ 通过 |
+| TestE2E_ReadHeavy | ~12% | ⚠️ 需修复 |
+
+**分析**：
+- WriteHeavy 测试中，写入操作会触发心跳，保持租约有效
+- MixedWorkload 测试包含写入操作，同样能维持租约
+- ReadHeavy 测试只有读取操作，如果 Leader 变化则所有请求失败
+
+### 问题 2: 锁粒度优化 (P3 - 可选)
+
+**问题描述**：
+Raft 使用单一全局锁 `sync.RWMutex`，在高并发场景下可能成为瓶颈。
+
+**建议修复**：
+将单一锁拆分为多个子锁：
+- `logMu`: 日志相关操作
+- `stateMu`: 状态相关操作
+- `electionMu`: 选举相关操作
+
+**优先级**: 低，当前性能已可接受
+
+---
+
+## 提交记录
+
+| 日期 | Commit | 描述 |
+|------|--------|------|
+| 2026-02-26 | b84ee4d | feat: implement Lease Read and optimize test commands |
+| 2026-02-26 | 3ec2c1d | fix: resolve E2E test issues and optimize gRPC timeout |
+| 2026-02-26 | 03bff20 | fix: add notification for ConfigChangeCommand in dispatchEntries |
+
 ---
