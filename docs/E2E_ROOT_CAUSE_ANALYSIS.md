@@ -594,7 +594,7 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 | ~~P0~~ | ~~ReadIndex 心跳确认~~ | ~~实现 Lease Read 机制~~ | ✅ 已完成 |
 | ~~P0~~ | ~~InstallSnapshot 超时~~ | ~~使用至少 5 分钟超时或流式传输~~ | ✅ 已完成 |
 | ~~P1~~ | ~~gRPC 超时一刀切~~ | ~~实现差异化超时策略~~ | ✅ 已完成 |
-| P2 | 长时测试超时问题 | 优化测试逻辑，增加超时处理 | 🔴 待修复 |
+| P2 | E2E 测试 Leader 跟踪 | 测试中动态跟踪 Leader 变化 | 🔴 待修复 |
 | P3 | 锁粒度优化 | 细化 Raft 锁粒度 | 🟡 可选优化 |
 
 ### 总结
@@ -604,6 +604,7 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 1. **核心代码实现选择问题**: ReadIndex 使用心跳确认而非 Lease Read (✅ 已修复)
 2. ~~核心代码设计缺陷~~: ~~gRPC 超时一刀切，InstallSnapshot 超时过短~~ (✅ 已修复)
 3. **测试代码问题**: `testing.Short()` 未处理 (✅ 已修复)
+4. **数据竞争问题**: 测试中共享变量未同步 (✅ 已修复)
 
 **Lease Read 已实现** (2026-02-26):
 - 默认使用 Lease 模式，高性能读取
@@ -611,63 +612,72 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 - 租约在心跳响应时自动续租
 - 租约期内直接读取，无网络开销
 
-ReadHeavy 测试的高失败率问题通过 Lease Read 机制得到根本性解决。生产环境推荐使用默认的 Lease 模式。
+**gRPC 超时优化** (2026-02-26):
+- AppendEntries 超时从 140ms 提升到 2 秒（默认）
+- 解决高负载场景下的超时问题
 
 ---
 
-## 当前存在问题汇总 (2026-02-26)
+## 当前存在问题汇总 (2026-02-26 更新)
 
-### 问题 1: 长时测试超时
+### 问题 1: E2E 性能测试 Leader 跟踪缺失
 
 **问题描述**：
-- `TestLongRunning_10Min_ReadHeavy` 和部分其他长时测试在 3 分钟超时后失败
-- 测试逻辑中的定时器检查不够及时
+- `TestE2E_ReadHeavy` 测试成功率不稳定（11%~40%）
+- 测试开始时获取 Leader 引用，但在测试过程中 Leader 可能变化
+- 测试继续使用旧的 Leader 引用发送请求，导致 NotLeader 错误
 
 **根因分析**：
-测试使用 1 分钟 ticker 来检查是否超时，但主循环使用 `select` 非阻塞检查，导致可能在超时后才真正停止。
+测试代码问题，不是核心代码问题。测试开始时调用 `c.getLeader(t)` 获取 Leader，
+但在整个测试期间（30秒）Leader 可能因网络抖动、GC 暂停等原因发生变化。
 
 **建议修复**：
-```go
-// 使用 time.AfterFunc 或更短的超时检查间隔
-timeoutTimer := time.NewTimer(duration)
-defer timeoutTimer.Stop()
+参考 `long_running_e2e_test.go` 中的 `sendRequestWithLeaderTracking` 函数，
+在收到 NotLeader 响应时动态更新 Leader 引用：
 
-for {
-    select {
-    case <-timeoutTimer.C:
-        close(stopCh)
-        wg.Wait()
-        return
-    case <-ticker.C:
-        // 进度报告
+```go
+// 在 goroutine 中跟踪 Leader 变化
+currentLeader := &atomic.Value{}
+currentLeader.Store(leader)
+
+// 收到 NotLeader 时更新
+if reply.NotLeader {
+    newLeader := c.findLeader()
+    if newLeader != nil {
+        currentLeader.Store(newLeader)
     }
 }
 ```
 
-### 问题 2: Comprehensive 测试高错误率
+### 问题 2: WriteHeavy 和 MixedWorkload 测试正常
 
-**问题描述**：
-- `TestLongRunning_10Min_Comprehensive` 测试错误率高达 99.92%
-- 发生了 2 次 Leader 切换
+**测试结果** (2026-02-26):
+- TestE2E_WriteHeavy: 100% 成功率
+- TestE2E_MixedWorkload: 99.99% 成功率
+- TestE2E_ReadHeavy: ~12% 成功率（Leader 跟踪问题）
 
-**可能原因**：
-1. 10 个并发客户端 + 混合操作负载过重
-2. Leader 处理请求时发生超时导致 Follower 发起选举
-3. 租约可能在某些边界情况下失效
+**分析**：
+- WriteHeavy 测试中，写入操作会触发心跳，保持租约有效
+- MixedWorkload 测试包含写入操作，同样能维持租约
+- ReadHeavy 测试只有读取操作，如果 Leader 变化则所有请求失败
 
-**建议修复**：
-1. 减少并发客户端数量
-2. 增加请求间的短暂延迟
-3. 调整选举超时参数
+---
 
-### 问题 3: E2E 测试稳定性
+## 已修复问题汇总 (2026-02-26)
 
-**问题描述**：
-部分 E2E 测试在 CI 环境下不稳定，可能出现随机失败。
+### 修复 1: AppendEntries 超时优化
+- **问题**: AppendEntries 超时仅 140ms（ElectionTimeout × 0.7），高负载下频繁超时
+- **修复**: 默认超时提升到 2 秒，最小 500ms
+- **文件**: `pkg/transport/grpc/transport.go`
 
-**建议**：
-1. 增加重试机制
-2. 增加超时容忍度
-3. 使用更稳定的测试环境配置
+### 修复 2: 数据竞争问题
+- **问题**: E2E 测试中共享变量（totalOps、latencies 等）在 goroutine 间未同步
+- **修复**: 使用 `sync/atomic` 和 `sync.Mutex` 保护共享变量
+- **文件**: `tests/e2e_perf_test.go`
+
+### 修复 3: Lease Read 实现
+- **问题**: ReadIndex 使用心跳确认，每次读取都有网络开销
+- **修复**: 实现租约机制，租约期内直接读取
+- **文件**: `raft/raft.go`, `raft/replication.go`, `pkg/config/config.go`
 
 ---

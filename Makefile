@@ -3,8 +3,6 @@
 # --- Variables ---
 # Unit test packages: exclude tests/ directory
 UNIT_TEST_PKGS := $(shell go list ./... | grep -v 'github.com/xmh1011/go-kv/tests')
-# Integration test packages
-INTEGRATION_TEST_PKGS := ./tests/...
 
 # Define the output binary names
 SERVER_BINARY=kv-server
@@ -21,7 +19,7 @@ IMPORTS_ORDER := "std,general,company,project"
 
 # --- Targets ---
 
-.PHONY: all deps build test integration-test bench-test perf-test cover install-mockgen mockgen clean help cluster stop-cluster proto install-protoc-gen install-go-imports-reviser format
+.PHONY: all deps build test integration-test e2e-test bench-test long-test cover install-mockgen mockgen clean help cluster stop-cluster proto install-protoc-gen install-go-imports-reviser format
 
 .DEFAULT_GOAL := help
 
@@ -47,39 +45,41 @@ build: deps
 	@echo " building $(CLIENT_BINARY)..."
 	@go build -o $(CLIENT_BINARY) $(CLIENT_CMD_PATH)
 
-## test: Run unit tests only (excludes tests/ directory and benchmarks).
+# ==================== Test Targets ====================
+
+## test: Run unit tests (excludes tests/ directory).
 test: deps
 	@echo " running unit tests..."
 	@go test -race -timeout=20m -v -cover -coverprofile=coverage.txt -coverpkg=./... $(UNIT_TEST_PKGS)
 
-## integration-test: Run integration tests in tests/ directory only.
+## integration-test: Run integration tests (tests/integration_test.go).
 integration-test: deps
 	@echo " running integration tests..."
-	@go test -race -v -timeout=30m $(INTEGRATION_TEST_PKGS)
+	@go test -race -v -timeout=30m ./tests/integration_test.go
 
-## perf-test: Run production performance tests and save results.
-perf-test: deps
-	@echo " running production performance tests (gRPC + LSM)..."
-	@mkdir -p test_results
-	@go test -race -v -timeout=30m -run "TestProduction" ./tests/ 2>&1 | tee test_results/perf_test.txt
-	@echo " results saved to test_results/perf_test.txt"
+## e2e-test: Run end-to-end performance tests (tests/e2e_perf_test.go).
+e2e-test: deps
+	@echo " running end-to-end tests..."
+	@go test -race -v -timeout=30m ./tests/e2e_perf_test.go
 
-## bench: Run all benchmark tests and save results to benchmark_results/.
+## bench-test: Run benchmark tests and save results.
 bench-test: deps
 	@echo " running benchmark tests..."
 	@mkdir -p benchmark_results
 	@go test -bench=. -benchmem -benchtime=3s -timeout=30m ./... 2>&1 | tee benchmark_results/benchmark.txt
 	@echo " results saved to benchmark_results/benchmark.txt"
 
-## run-tests: Run comprehensive tests using the test runner script.
-run-tests: deps
-	@echo " running comprehensive tests..."
-	@./scripts/run_tests.sh
+## long-test: Run long-running tests (10+ minutes each, for CI/nightly).
+long-test: deps
+	@echo " running long-running tests..."
+	@go test -race -v -timeout=60m ./tests/long_running_e2e_test.go
 
 ## cover: Open the HTML coverage report in your browser.
 cover: test
 	@echo " opening coverage report..."
 	@go tool cover -html=coverage.txt
+
+# ==================== Code Generation ====================
 
 install-mockgen:
 	@echo "Installing mockgen..."
@@ -102,6 +102,8 @@ proto: install-protoc-gen
 		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
 		pkg/transport/grpc/pb/raft.proto
 
+# ==================== Cluster Management ====================
+
 ## cluster: Start a 3-node local cluster using generated configs.
 cluster: build
 	@echo " starting 3-node cluster..."
@@ -119,7 +121,8 @@ stop-cluster:
 	@-if [ -f raft-node-3.pid ]; then kill `cat raft-node-3.pid` && rm raft-node-3.pid; fi
 	@echo " cluster stopped."
 
-# Code style checks
+# ==================== Code Style ====================
+
 install-go-imports-reviser:
 	@echo "Installing go-imports-reviser..."
 	@command -v goimports-reviser >/dev/null 2>&1 || go install github.com/incu6us/goimports-reviser/v3@latest
@@ -136,12 +139,14 @@ format: install-go-imports-reviser
 		gofmt -w "$$file"; \
 	done
 
+# ==================== Cleanup ====================
+
 ## clean: Remove all generated files, test artifacts, and clear Go test cache.
 clean:
 	@echo " cleaning up..."
 	@go clean -testcache
 	@rm -f coverage.txt coverage.html unittest.txt $(SERVER_BINARY) $(CLIENT_BINARY) raft-node-*.log raft-node-*.pid
-	@rm -rf benchmark_results test_results data
+	@rm -rf benchmark_results data
 	@find . -type f -name "*.sst" -delete
 	@find . -type f -name "*.wal" -delete
 	@find . -type f -name "*.wf" -delete
