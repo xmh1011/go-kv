@@ -102,17 +102,13 @@ func newLongRunningCluster(t *testing.T, nodeCount int) *longRunningCluster {
 		c.commitChans[i] = make(chan param.CommitEntry, 10000) // 更大的缓冲区应对生产负载
 
 		// 启动后台协程消费 commitChan
-		go func(ch chan param.CommitEntry, sm storage.StateMachine) {
-			for entry := range ch {
-				// 将 CommitEntry 转换为 LogEntry 传递给状态机
-				logEntry := param.LogEntry{
-					Command: entry.Command,
-					Term:    entry.Term,
-					Index:   entry.Index,
-				}
-				_ = sm.Apply(logEntry)
+		// 注意：Raft 已经在 dispatchEntries 中应用了日志到状态机，
+		// 这里只需要从 channel 中读取以防止阻塞，不需要再次应用
+		go func(ch chan param.CommitEntry) {
+			for range ch {
+				// 仅消费 channel，不重复应用
 			}
-		}(c.commitChans[i], c.stateMachines[i])
+		}(c.commitChans[i])
 
 		// 配置 Transport
 		c.transports[i].SetPeers(c.peerMap)
@@ -249,6 +245,80 @@ func (c *longRunningCluster) sendRequest(node *raft.Raft, cmd param.KVCommand) (
 	return success, latency, err
 }
 
+// sendRequestWithLeaderTracking 发送请求，自动跟踪 Leader 变化
+// 当收到 NotLeader 响应时，自动获取新 Leader 并重试
+// stopCh 用于在测试超时时中断阻塞的请求
+// 注意：核心 Raft 代码已经有超时机制，这里只需要简单的 Leader 跟踪
+func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic.Value, cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, error) {
+	var totalLatency time.Duration
+
+	for retry := 0; retry < maxRetries; retry++ {
+		// 检查是否应该停止
+		select {
+		case <-stopCh:
+			return false, totalLatency, fmt.Errorf("test stopped")
+		default:
+		}
+
+		leader := currentLeader.Load().(*raft.Raft)
+
+		cmdBytes, _ := json.Marshal(cmd)
+		args := &param.ClientArgs{
+			ClientID:    rand.Int63(),
+			SequenceNum: rand.Int63(),
+			Command:     cmdBytes,
+		}
+		reply := &param.ClientReply{}
+
+		start := time.Now()
+		err := leader.ClientRequest(args, reply)
+		latency := time.Since(start)
+		totalLatency += latency
+
+		if err == nil && reply.Success {
+			return true, totalLatency, nil
+		}
+
+		// 如果收到 NotLeader 响应，尝试更新 Leader 并重试
+		if reply.NotLeader {
+			// 尝试找到新 Leader
+			newLeader := c.findLeader()
+			if newLeader != nil {
+				currentLeader.Store(newLeader)
+			}
+			continue
+		}
+
+		// 其他错误，直接返回
+		return false, totalLatency, err
+	}
+
+	return false, totalLatency, fmt.Errorf("max retries exceeded")
+}
+
+// findLeader 遍历所有节点找到当前 Leader
+func (c *longRunningCluster) findLeader() *raft.Raft {
+	for _, node := range c.nodes {
+		if node.State() == raft.Leader {
+			return node
+		}
+	}
+	return nil
+}
+
+// getCurrentLeader 获取当前 Leader
+func (c *longRunningCluster) getCurrentLeader() *raft.Raft {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, node := range c.nodes {
+		if node.State() == raft.Leader {
+			return node
+		}
+	}
+	return nil
+}
+
 // verifyDataConsistency 验证所有节点的数据一致性
 func (c *longRunningCluster) verifyDataConsistency(t *testing.T, sampleKeys []string) (bool, int64) {
 	if len(sampleKeys) == 0 {
@@ -312,6 +382,81 @@ func (c *longRunningCluster) verifyDataConsistency(t *testing.T, sampleKeys []st
 
 // ========== 生产环境 10分钟长时性能测试 ==========
 
+// testRunner 用于管理长时测试的超时和进度报告
+type testRunner struct {
+	duration       time.Duration
+	stopCh         chan struct{}
+	wg             *sync.WaitGroup
+	startTime      time.Time
+	timeoutTimer   *time.Timer
+	progressTicker *time.Ticker
+}
+
+// newTestRunner 创建一个新的测试运行器
+func newTestRunner(duration time.Duration, stopCh chan struct{}, wg *sync.WaitGroup) *testRunner {
+	return &testRunner{
+		duration:       duration,
+		stopCh:         stopCh,
+		wg:             wg,
+		startTime:      time.Now(),
+		timeoutTimer:   time.NewTimer(duration),
+		progressTicker: time.NewTicker(30 * time.Second),
+	}
+}
+
+// stop 停止测试运行器
+func (r *testRunner) stop() {
+	r.timeoutTimer.Stop()
+	r.progressTicker.Stop()
+}
+
+// run 运行测试主循环，返回是否正常完成
+// onProgress 是进度报告回调，每次 ticker 触发时调用
+func (r *testRunner) run(t *testing.T, onProgress func(elapsed time.Duration)) {
+	defer r.stop()
+
+	for {
+		select {
+		case <-r.timeoutTimer.C:
+			// 超时，停止测试
+			t.Logf("[超时] 测试运行 %v 完成，正在停止客户端...", r.duration)
+			close(r.stopCh)
+			r.wg.Wait()
+			return
+
+		case <-r.progressTicker.C:
+			elapsed := time.Since(r.startTime)
+			onProgress(elapsed)
+		}
+	}
+}
+
+// runWithFailureInjection 运行带故障注入的测试主循环
+func (r *testRunner) runWithFailureInjection(t *testing.T, onProgress func(elapsed time.Duration), onFailure func()) {
+	defer r.stop()
+
+	failureTicker := time.NewTicker(2 * time.Minute)
+	defer failureTicker.Stop()
+
+	for {
+		select {
+		case <-r.timeoutTimer.C:
+			// 超时，停止测试
+			t.Logf("[超时] 测试运行 %v 完成，正在停止客户端...", r.duration)
+			close(r.stopCh)
+			r.wg.Wait()
+			return
+
+		case <-r.progressTicker.C:
+			elapsed := time.Since(r.startTime)
+			onProgress(elapsed)
+
+		case <-failureTicker.C:
+			onFailure()
+		}
+	}
+}
+
 // TestLongRunning_10Min_Comprehensive 10分钟综合性能测试
 // 模拟生产环境：使用 gRPC + LSM，三节点集群，混合读写删除操作
 func TestLongRunning_10Min_Comprehensive(t *testing.T) {
@@ -367,6 +512,7 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 		deleteLatencies     []time.Duration
 		keysForVerification []string
 		sampleKeysMutex     sync.Mutex
+		latencyMu           sync.Mutex // 保护所有 latencies slice 的并发访问
 	)
 
 	// 并发客户端模拟
@@ -402,7 +548,9 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 						success, latency, _ = c.sendRequest(leader, cmd)
 
 						atomic.AddInt64(&writeOps, 1)
+						latencyMu.Lock()
 						writeLatencies = append(writeLatencies, latency)
+						latencyMu.Unlock()
 
 						localKeys = append(localKeys, key)
 
@@ -423,7 +571,9 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 						success, latency, _ = c.sendRequest(leader, cmd)
 
 						atomic.AddInt64(&readOps, 1)
+						latencyMu.Lock()
 						readLatencies = append(readLatencies, latency)
+						latencyMu.Unlock()
 
 						if success {
 							val, _ := c.stateMachines[leader.ID()-1].Get(key)
@@ -439,7 +589,9 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 							success, latency, _ = c.sendRequest(leader, cmd)
 
 							atomic.AddInt64(&deleteOps, 1)
+							latencyMu.Lock()
 							deleteLatencies = append(deleteLatencies, latency)
+							latencyMu.Unlock()
 
 							if success {
 								// 移除已删除的键
@@ -451,7 +603,9 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 					atomic.AddInt64(&totalOps, 1)
 					if success {
 						atomic.AddInt64(&successOps, 1)
+						latencyMu.Lock()
 						latencies = append(latencies, latency)
+						latencyMu.Unlock()
 					} else {
 						atomic.AddInt64(&failedOps, 1)
 					}
@@ -470,44 +624,27 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 		}(clientID)
 	}
 
-	// 定期一致性检查和进度报告
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	// 使用 testRunner 管理超时和进度报告
+	runner := newTestRunner(duration, stopCh, &wg)
+	runner.run(t, func(elapsed time.Duration) {
+		ops := atomic.LoadInt64(&totalOps)
+		success := atomic.LoadInt64(&successOps)
+		failed := atomic.LoadInt64(&failedOps)
 
-	startTime := time.Now()
-	done := false
-	for !done {
-		select {
-		case <-ticker.C:
-			elapsed := time.Since(startTime)
-			if elapsed >= duration {
-				close(stopCh)
-				wg.Wait()
-				done = true
-			}
-			ops := atomic.LoadInt64(&totalOps)
-			success := atomic.LoadInt64(&successOps)
-			failed := atomic.LoadInt64(&failedOps)
+		t.Logf("[进度报告] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 吞吐量: %.2f ops/sec",
+			elapsed, ops, success, failed, float64(success)/elapsed.Seconds())
 
-			t.Logf("[进度报告] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 吞吐量: %.2f ops/sec",
-				elapsed, ops, success, failed, float64(success)/elapsed.Seconds())
+		// 进行一致性检查
+		sampleKeysMutex.Lock()
+		sampleKeys := make([]string, len(keysForVerification))
+		copy(sampleKeys, keysForVerification)
+		sampleKeysMutex.Unlock()
 
-			// 进行一致性检查
-			sampleKeysMutex.Lock()
-			sampleKeys := make([]string, len(keysForVerification))
-			copy(sampleKeys, keysForVerification)
-			sampleKeysMutex.Unlock()
-
-			if len(sampleKeys) > 0 {
-				consistent, verified := c.verifyDataConsistency(t, sampleKeys)
-				t.Logf("[一致性检查] 已验证: %d 条数据, 结果: %v", verified, consistent)
-			}
-
-		default:
-			// 避免 CPU 忙等待
-			time.Sleep(100 * time.Millisecond)
+		if len(sampleKeys) > 0 {
+			consistent, verified := c.verifyDataConsistency(t, sampleKeys)
+			t.Logf("[一致性检查] 已验证: %d 条数据, 结果: %v", verified, consistent)
 		}
-	}
+	})
 
 	// 最终一致性检查
 	finalConsistent, finalVerified := c.verifyDataConsistency(t, keysForVerification)
@@ -567,6 +704,7 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 		failedOps    int64
 		bytesWritten int64
 		latencies    []time.Duration
+		latencyMu    sync.Mutex // 保护 latencies slice 的并发访问
 	)
 
 	numClients := 8
@@ -596,7 +734,9 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 					if success {
 						atomic.AddInt64(&successOps, 1)
 						atomic.AddInt64(&bytesWritten, int64(len(key)+len(value)))
+						latencyMu.Lock()
 						latencies = append(latencies, latency)
+						latencyMu.Unlock()
 					} else {
 						atomic.AddInt64(&failedOps, 1)
 					}
@@ -606,32 +746,16 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 		}(clientID)
 	}
 
-	// 定期进度报告
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-
-	startTime := time.Now()
-	done := false
-	for !done {
-		select {
-		case <-ticker.C:
-			elapsed := time.Since(startTime)
-			if elapsed >= duration {
-				close(stopCh)
-				wg.Wait()
-				done = true
-			}
-			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 写入流量: %.2f MB/s",
-				elapsed,
-				atomic.LoadInt64(&totalOps),
-				atomic.LoadInt64(&successOps),
-				atomic.LoadInt64(&failedOps),
-				float64(atomic.LoadInt64(&bytesWritten))/1024/1024/elapsed.Seconds())
-		default:
-			// 避免 CPU 忙等待
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
+	// 使用 testRunner 管理超时和进度报告
+	runner := newTestRunner(duration, stopCh, &wg)
+	runner.run(t, func(elapsed time.Duration) {
+		t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 写入流量: %.2f MB/s",
+			elapsed,
+			atomic.LoadInt64(&totalOps),
+			atomic.LoadInt64(&successOps),
+			atomic.LoadInt64(&failedOps),
+			float64(atomic.LoadInt64(&bytesWritten))/1024/1024/elapsed.Seconds())
+	})
 
 	metrics := LongRunningMetrics{
 		TestName:          "10分钟写入密集型测试 (gRPC+LSM)",
@@ -680,6 +804,7 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 		bytesRead    int64
 		bytesWritten int64
 		latencies    []time.Duration
+		latencyMu    sync.Mutex // 保护 latencies slice 的并发访问
 	)
 
 	numClients := 5
@@ -713,7 +838,9 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 							atomic.AddInt64(&successOps, 1)
 							atomic.AddInt64(&bytesWritten, int64(len(key)+len(value)))
 							localKeys = append(localKeys, key)
+							latencyMu.Lock()
 							latencies = append(latencies, latency)
+							latencyMu.Unlock()
 						} else {
 							atomic.AddInt64(&failedOps, 1)
 						}
@@ -734,7 +861,9 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 							atomic.AddInt64(&successOps, 1)
 							val, _ := c.stateMachines[leader.ID()-1].Get(key)
 							atomic.AddInt64(&bytesRead, int64(len(key)+len(val)))
+							latencyMu.Lock()
 							latencies = append(latencies, latency)
+							latencyMu.Unlock()
 						} else {
 							atomic.AddInt64(&failedOps, 1)
 						}
@@ -745,19 +874,19 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 		}(clientID)
 	}
 
-	// 模拟节点故障恢复
-	failureTicker := time.NewTicker(2 * time.Minute)
-	defer failureTicker.Stop()
-
+	// 使用 testRunner 管理超时、进度报告和故障注入
+	runner := newTestRunner(duration, stopCh, &wg)
 	failureCount := 0
-	startTime := time.Now()
-	progressTicker := time.NewTicker(30 * time.Second)
-	defer progressTicker.Stop()
-
-	done := false
-	for !done {
-		select {
-		case <-failureTicker.C:
+	runner.runWithFailureInjection(t,
+		func(elapsed time.Duration) {
+			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, Leader切换: %d",
+				elapsed,
+				atomic.LoadInt64(&totalOps),
+				atomic.LoadInt64(&successOps),
+				atomic.LoadInt64(&failedOps),
+				atomic.LoadInt32(&c.leaderElections))
+		},
+		func() {
 			if failureCount < 2 { // 最多触发2次故障
 				// 随机选择一个 Follower 节点停止
 				var victim *raft.Raft
@@ -783,25 +912,7 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 					failureCount++
 				}
 			}
-
-		case <-progressTicker.C:
-			elapsed := time.Since(startTime)
-			if elapsed >= duration {
-				close(stopCh)
-				wg.Wait()
-				done = true
-			}
-			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, Leader切换: %d",
-				elapsed,
-				atomic.LoadInt64(&totalOps),
-				atomic.LoadInt64(&successOps),
-				atomic.LoadInt64(&failedOps),
-				atomic.LoadInt32(&c.leaderElections))
-		default:
-			// 避免 CPU 忙等待
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
+		})
 
 	metrics := LongRunningMetrics{
 		TestName:          "10分钟带故障恢复的混合测试 (gRPC+LSM)",
@@ -839,6 +950,10 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 	c.waitForAllNodesReady(t)
 	leader := c.getLeader(t)
 
+	// 使用 atomic.Value 存储 Leader，支持动态更新
+	currentLeader := &atomic.Value{}
+	currentLeader.Store(leader)
+
 	// 预热大量数据
 	warmupCount := 1000
 	t.Logf("预热阶段: 写入 %d 条数据...", warmupCount)
@@ -846,7 +961,8 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 		key := fmt.Sprintf("read-warmup-key-%d", i)
 		value := fmt.Sprintf("read-warmup-value-%d", i)
 		cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
-		c.sendRequest(leader, cmd)
+		// 预热阶段使用 nil stopCh，因为没有启动客户端
+		c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, nil)
 	}
 	t.Logf("预热完成，等待同步...")
 	time.Sleep(3 * time.Second)
@@ -857,6 +973,7 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 		failedOps  int64
 		bytesRead  int64
 		latencies  []time.Duration
+		latencyMu  sync.Mutex // 保护 latencies slice 的并发访问
 	)
 
 	numClients := 10
@@ -870,55 +987,52 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 		go func(cid int) {
 			defer wg.Done()
 			for {
+				// 先检查是否应该停止
 				select {
 				case <-stopCh:
 					return
 				default:
-					key := fmt.Sprintf("read-warmup-key-%d", rand.Intn(warmupCount))
-					cmd := param.KVCommand{Op: param.OpGet, Key: key}
+				}
 
-					success, latency, _ := c.sendRequest(leader, cmd)
+				key := fmt.Sprintf("read-warmup-key-%d", rand.Intn(warmupCount))
+				cmd := param.KVCommand{Op: param.OpGet, Key: key}
 
-					atomic.AddInt64(&totalOps, 1)
-					if success {
-						atomic.AddInt64(&successOps, 1)
-						val, _ := c.stateMachines[leader.ID()-1].Get(key)
-						atomic.AddInt64(&bytesRead, int64(len(key)+len(val)))
-						latencies = append(latencies, latency)
-					} else {
-						atomic.AddInt64(&failedOps, 1)
-					}
+				success, latency, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+
+				// 请求完成后再次检查是否应该停止
+				select {
+				case <-stopCh:
+					return
+				default:
+				}
+
+				atomic.AddInt64(&totalOps, 1)
+				if success {
+					atomic.AddInt64(&successOps, 1)
+					// 使用当前 Leader 获取数据大小
+					l := currentLeader.Load().(*raft.Raft)
+					val, _ := c.stateMachines[l.ID()-1].Get(key)
+					atomic.AddInt64(&bytesRead, int64(len(key)+len(val)))
+					latencyMu.Lock()
+					latencies = append(latencies, latency)
+					latencyMu.Unlock()
+				} else {
+					atomic.AddInt64(&failedOps, 1)
 				}
 			}
 		}(clientID)
 	}
 
-	// 定期进度报告
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-
-	startTime := time.Now()
-	done := false
-	for !done {
-		select {
-		case <-ticker.C:
-			elapsed := time.Since(startTime)
-			if elapsed >= duration {
-				close(stopCh)
-				wg.Wait()
-				done = true
-			}
-			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 读取流量: %.2f MB/s",
-				elapsed,
-				atomic.LoadInt64(&totalOps),
-				atomic.LoadInt64(&successOps),
-				atomic.LoadInt64(&failedOps),
-				float64(atomic.LoadInt64(&bytesRead))/1024/1024/elapsed.Seconds())
-		default:
-			// 避免 CPU 忙等待
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
+	// 使用 testRunner 管理超时和进度报告
+	runner := newTestRunner(duration, stopCh, &wg)
+	runner.run(t, func(elapsed time.Duration) {
+		t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 读取流量: %.2f MB/s",
+			elapsed,
+			atomic.LoadInt64(&totalOps),
+			atomic.LoadInt64(&successOps),
+			atomic.LoadInt64(&failedOps),
+			float64(atomic.LoadInt64(&bytesRead))/1024/1024/elapsed.Seconds())
+	})
 
 	metrics := LongRunningMetrics{
 		TestName:          "10分钟读取密集型测试 (gRPC+LSM)",
@@ -968,6 +1082,7 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 		deleteOps       int64
 		latencies       []time.Duration
 		deleteLatencies []time.Duration
+		latencyMu       sync.Mutex // 保护 latencies slice 的并发访问
 	)
 
 	numClients := 8
@@ -1006,14 +1121,19 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 						if success {
 							atomic.AddInt64(&successOps, 1)
 							atomic.AddInt64(&deleteOps, 1)
+							latencyMu.Lock()
 							deleteLatencies = append(deleteLatencies, latency)
+							latencies = append(latencies, latency)
+							latencyMu.Unlock()
 
 							// 移除已删除的键
 							clientKeys[cid] = append(clientKeys[cid][:idx], clientKeys[cid][idx+1:]...)
 						} else {
 							atomic.AddInt64(&failedOps, 1)
+							latencyMu.Lock()
+							latencies = append(latencies, latency)
+							latencyMu.Unlock()
 						}
-						latencies = append(latencies, latency)
 					} else {
 						// 写入操作
 						key := fmt.Sprintf("delete-test-key-%d-%d", cid, opCount)
@@ -1030,7 +1150,9 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 						} else {
 							atomic.AddInt64(&failedOps, 1)
 						}
+						latencyMu.Lock()
 						latencies = append(latencies, latency)
+						latencyMu.Unlock()
 					}
 					opCount++
 				}
@@ -1038,33 +1160,17 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 		}(clientID)
 	}
 
-	// 定期进度报告
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-
-	startTime := time.Now()
-	done := false
-	for !done {
-		select {
-		case <-ticker.C:
-			elapsed := time.Since(startTime)
-			if elapsed >= duration {
-				close(stopCh)
-				wg.Wait()
-				done = true
-			}
-			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 写入: %d, 删除: %d",
-				elapsed,
-				atomic.LoadInt64(&totalOps),
-				atomic.LoadInt64(&successOps),
-				atomic.LoadInt64(&failedOps),
-				atomic.LoadInt64(&writeOps),
-				atomic.LoadInt64(&deleteOps))
-		default:
-			// 避免 CPU 忙等待
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
+	// 使用 testRunner 管理超时和进度报告
+	runner := newTestRunner(duration, stopCh, &wg)
+	runner.run(t, func(elapsed time.Duration) {
+		t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 写入: %d, 删除: %d",
+			elapsed,
+			atomic.LoadInt64(&totalOps),
+			atomic.LoadInt64(&successOps),
+			atomic.LoadInt64(&failedOps),
+			atomic.LoadInt64(&writeOps),
+			atomic.LoadInt64(&deleteOps))
+	})
 
 	metrics := LongRunningMetrics{
 		TestName:          "10分钟删除压力测试 (gRPC+LSM)",

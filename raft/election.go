@@ -341,6 +341,9 @@ func (r *Raft) transitionToLeader(electionTerm uint64) {
 		r.state = Leader
 		r.initLeaderState()
 		r.startHeartbeat()
+		// 初始化租约：新当选的 Leader 需要通过心跳确认后才能获得租约
+		// 这里将租约设为过去时间，强制第一次读操作时进行心跳确认
+		r.leaseUntil = time.Time{} // 零值，表示租约无效
 	}
 }
 

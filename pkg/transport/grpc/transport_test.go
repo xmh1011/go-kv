@@ -270,29 +270,29 @@ func TestSendInstallSnapshot(t *testing.T) {
 // TestAppendEntriesTimeout 测试 AppendEntries 超时动态计算
 func TestAppendEntriesTimeout(t *testing.T) {
 	tests := []struct {
-		name              string
-		electionTimeout   time.Duration
-		expectedTimeout   time.Duration
+		name            string
+		electionTimeout time.Duration
+		expectedTimeout time.Duration
 	}{
 		{
-			name:              "Default",
-			electionTimeout:   0,
-			expectedTimeout:   140 * time.Millisecond,
+			name:            "Default",
+			electionTimeout: 0,
+			expectedTimeout: 140 * time.Millisecond,
 		},
 		{
-			name:              "200ms",
-			electionTimeout:   200 * time.Millisecond,
-			expectedTimeout:   140 * time.Millisecond, // 200ms * 0.7
+			name:            "200ms",
+			electionTimeout: 200 * time.Millisecond,
+			expectedTimeout: 140 * time.Millisecond, // 200ms * 0.7
 		},
 		{
-			name:              "500ms",
-			electionTimeout:   500 * time.Millisecond,
-			expectedTimeout:   350 * time.Millisecond, // 500ms * 0.7
+			name:            "500ms",
+			electionTimeout: 500 * time.Millisecond,
+			expectedTimeout: 350 * time.Millisecond, // 500ms * 0.7
 		},
 		{
-			name:              "1s",
-			electionTimeout:   1 * time.Second,
-			expectedTimeout:   700 * time.Millisecond, // 1s * 0.7
+			name:            "1s",
+			electionTimeout: 1 * time.Second,
+			expectedTimeout: 700 * time.Millisecond, // 1s * 0.7
 		},
 	}
 

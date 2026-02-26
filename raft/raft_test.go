@@ -938,3 +938,288 @@ func newSetCommand(t *testing.T, key, value string) []byte {
 	assert.NoError(t, err)
 	return b
 }
+
+// TestLeaseRead_LeaseValid 测试租约有效时的直接读取
+func TestLeaseRead_LeaseValid(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockTrans := transport.NewMockTransport(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+
+	r := NewRaft(1, []int{2, 3}, mockStore, mockSM, mockTrans, nil)
+	r.currentTerm = 2
+	r.state = Leader
+	r.readIndexMode = config.ReadIndexModeLease
+	r.leaseDuration = 200 * time.Millisecond
+
+	// 设置一个有效的租约
+	r.leaseUntil = time.Now().Add(r.leaseDuration)
+	r.lastApplied = 5
+	r.commitIndex = 5
+
+	// 设置状态机返回值
+	mockSM.EXPECT().Get("test-key").Return("test-value", nil).Times(1)
+
+	cmd := param.KVCommand{Op: param.OpGet, Key: "test-key"}
+	cmdBytes, _ := json.Marshal(cmd)
+	args := &param.ClientArgs{Command: cmdBytes}
+	reply := &param.ClientReply{}
+
+	err := r.ClientRequest(args, reply)
+	assert.NoError(t, err)
+	assert.True(t, reply.Success)
+	assert.Equal(t, "test-value", reply.Result)
+}
+
+// TestLeaseRead_LeaseExpired 测试租约过期后回退到心跳确认
+func TestLeaseRead_LeaseExpired(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockTrans := transport.NewMockTransport(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+
+	peerIDs := []int{2, 3}
+	r := NewRaft(1, peerIDs, mockStore, mockSM, mockTrans, nil)
+	r.currentTerm = 2
+	r.state = Leader
+	r.readIndexMode = config.ReadIndexModeLease
+	r.leaseDuration = 200 * time.Millisecond
+	r.electionTimeout = 200 * time.Millisecond
+
+	// 设置一个过期的租约
+	r.leaseUntil = time.Now().Add(-time.Second)
+	r.lastApplied = 5
+	r.commitIndex = 5
+
+	// 初始化 nextIndex
+	lastLogIndex := uint64(5)
+	for _, peerID := range peerIDs {
+		r.nextIndex[peerID] = lastLogIndex + 1
+	}
+
+	// 设置 mock 期望
+	mockStore.EXPECT().LastLogIndex().Return(lastLogIndex, nil).AnyTimes()
+	mockStore.EXPECT().FirstLogIndex().Return(uint64(1), nil).AnyTimes()
+	mockStore.EXPECT().GetEntry(gomock.Any()).Return(&param.LogEntry{Term: 2, Index: 5}, nil).AnyTimes()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// 心跳响应
+	mockTrans.EXPECT().SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(id string, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
+			reply.Success = true
+			reply.Term = args.Term
+			wg.Done()
+			return nil
+		}).Times(2)
+
+	// 状态机读取
+	mockSM.EXPECT().Get("test-key").Return("test-value", nil).Times(1)
+
+	cmd := param.KVCommand{Op: param.OpGet, Key: "test-key"}
+	cmdBytes, _ := json.Marshal(cmd)
+	args := &param.ClientArgs{Command: cmdBytes}
+	reply := &param.ClientReply{}
+
+	err := r.ClientRequest(args, reply)
+	assert.NoError(t, err)
+	assert.True(t, reply.Success)
+	assert.Equal(t, "test-value", reply.Result)
+
+	// 验证租约被更新
+	assert.True(t, time.Now().Before(r.leaseUntil), "lease should be renewed after heartbeat confirmation")
+}
+
+// TestLeaseRead_HeartbeatMode 测试心跳模式下总是进行心跳确认
+func TestLeaseRead_HeartbeatMode(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockTrans := transport.NewMockTransport(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+
+	peerIDs := []int{2, 3}
+	r := NewRaft(1, peerIDs, mockStore, mockSM, mockTrans, nil)
+	r.currentTerm = 2
+	r.state = Leader
+	r.readIndexMode = config.ReadIndexModeHeartbeat // 使用心跳模式
+	r.electionTimeout = 200 * time.Millisecond
+
+	r.lastApplied = 5
+	r.commitIndex = 5
+
+	// 初始化 nextIndex
+	lastLogIndex := uint64(5)
+	for _, peerID := range peerIDs {
+		r.nextIndex[peerID] = lastLogIndex + 1
+	}
+
+	// 设置 mock 期望
+	mockStore.EXPECT().LastLogIndex().Return(lastLogIndex, nil).AnyTimes()
+	mockStore.EXPECT().FirstLogIndex().Return(uint64(1), nil).AnyTimes()
+	mockStore.EXPECT().GetEntry(gomock.Any()).Return(&param.LogEntry{Term: 2, Index: 5}, nil).AnyTimes()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// 心跳响应
+	mockTrans.EXPECT().SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(id string, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
+			reply.Success = true
+			reply.Term = args.Term
+			wg.Done()
+			return nil
+		}).Times(2)
+
+	// 状态机读取
+	mockSM.EXPECT().Get("test-key").Return("test-value", nil).Times(1)
+
+	cmd := param.KVCommand{Op: param.OpGet, Key: "test-key"}
+	cmdBytes, _ := json.Marshal(cmd)
+	args := &param.ClientArgs{Command: cmdBytes}
+	reply := &param.ClientReply{}
+
+	err := r.ClientRequest(args, reply)
+	assert.NoError(t, err)
+	assert.True(t, reply.Success)
+	assert.Equal(t, "test-value", reply.Result)
+}
+
+// TestTryRenewLease 测试租约续租逻辑
+func TestTryRenewLease(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockTrans := transport.NewMockTransport(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+
+	r := NewRaft(1, []int{2, 3}, mockStore, mockSM, mockTrans, nil)
+	r.currentTerm = 2
+	r.state = Leader
+	r.readIndexMode = config.ReadIndexModeLease
+	r.leaseDuration = 200 * time.Millisecond
+
+	// 初始状态：租约无效
+	r.leaseUntil = time.Time{}
+
+	// 没有收到任何 ACK，不应该续租
+	r.tryRenewLease()
+	assert.True(t, r.leaseUntil.IsZero(), "lease should not be renewed without majority acks")
+
+	// 收到多数派的 ACK
+	now := time.Now()
+	r.lastAck[2] = now
+	r.lastAck[3] = now
+
+	r.tryRenewLease()
+	assert.False(t, r.leaseUntil.IsZero(), "lease should be renewed with majority acks")
+	assert.True(t, r.leaseUntil.After(now), "lease should be in the future")
+}
+
+// TestLeaseRead_NotLeader 测试非 Leader 节点的读取请求
+func TestLeaseRead_NotLeader(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockTrans := transport.NewMockTransport(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+
+	r := NewRaft(1, []int{2, 3}, mockStore, mockSM, mockTrans, nil)
+	r.currentTerm = 2
+	r.state = Follower // 非 Leader
+	r.knownLeaderID = 2
+	r.readIndexMode = config.ReadIndexModeLease
+
+	cmd := param.KVCommand{Op: param.OpGet, Key: "test-key"}
+	cmdBytes, _ := json.Marshal(cmd)
+	args := &param.ClientArgs{Command: cmdBytes}
+	reply := &param.ClientReply{}
+
+	err := r.ClientRequest(args, reply)
+	assert.NoError(t, err)
+	assert.True(t, reply.NotLeader)
+	assert.Equal(t, 2, reply.LeaderHint)
+}
+
+// TestLeaseRead_RenewOnHeartbeatResponse 测试心跳响应后自动续租
+func TestLeaseRead_RenewOnHeartbeatResponse(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockTrans := transport.NewMockTransport(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+
+	peerIDs := []int{2, 3}
+	r := NewRaft(1, peerIDs, mockStore, mockSM, mockTrans, nil)
+	r.currentTerm = 2
+	r.state = Leader
+	r.readIndexMode = config.ReadIndexModeLease
+	r.leaseDuration = 200 * time.Millisecond
+	r.electionTimeout = 200 * time.Millisecond
+
+	// 初始化 nextIndex
+	lastLogIndex := uint64(5)
+	for _, peerID := range peerIDs {
+		r.nextIndex[peerID] = lastLogIndex + 1
+	}
+	r.matchIndex[2] = 0
+	r.matchIndex[3] = 0
+
+	// 设置 mock 期望
+	mockStore.EXPECT().LastLogIndex().Return(lastLogIndex, nil).AnyTimes()
+	mockStore.EXPECT().GetEntry(gomock.Any()).Return(&param.LogEntry{Term: 2, Index: 5}, nil).AnyTimes()
+	mockStore.EXPECT().FirstLogIndex().Return(uint64(1), nil).AnyTimes()
+	mockSM.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
+
+	// 模拟收到心跳响应
+	args := param.NewAppendEntriesArgs(2, 1, 5, 2, 5, nil)
+	reply := param.NewAppendEntriesReply()
+	reply.Success = true
+	reply.Term = 2
+
+	// 初始状态：租约无效
+	r.leaseUntil = time.Time{}
+
+	// 处理第一个响应（节点 2）
+	// 3 节点集群需要 2 个确认（包括自己），现在只有自己 + 节点2 = 2 个确认 = 多数派
+	r.mu.Lock()
+	r.processAppendEntriesReply(2, args, reply, 2)
+	r.mu.Unlock()
+
+	// 验证租约被更新（自己 + 节点2 = 多数派）
+	assert.False(t, r.leaseUntil.IsZero(), "lease should be renewed after first heartbeat response (we have majority: self + peer 2)")
+
+	firstLease := r.leaseUntil
+
+	// 等待一小段时间
+	time.Sleep(10 * time.Millisecond)
+
+	// 处理第二个响应（节点 3）
+	r.mu.Lock()
+	r.processAppendEntriesReply(3, args, reply, 2)
+	r.mu.Unlock()
+
+	// 租约应该被更新
+	assert.True(t, r.leaseUntil.After(firstLease) || r.leaseUntil.Equal(firstLease), "lease should be maintained or extended")
+}

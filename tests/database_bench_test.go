@@ -1,9 +1,11 @@
-package database
+package tests
 
 import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/xmh1011/go-kv/engine/lsm/database"
 )
 
 // BenchmarkPut 测试 Put 操作的吞吐量和平均时延
@@ -11,7 +13,7 @@ func BenchmarkPut(b *testing.B) {
 	// 使用临时目录作为数据库存储目录
 	dir := b.TempDir()
 
-	db := Open(dir)
+	db := database.Open(dir)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -30,7 +32,7 @@ func BenchmarkGet(b *testing.B) {
 	// 使用临时目录作为数据库存储目录
 	dir := b.TempDir()
 
-	db := Open(dir)
+	db := database.Open(dir)
 
 	// 预先写入固定数量的 key-value，后续循环中周期性获取这些 key 的数据
 	keyCount := 100000
@@ -66,7 +68,7 @@ func BenchmarkDelete(b *testing.B) {
 	// 使用临时目录作为数据库存储目录
 	dir := b.TempDir()
 
-	db := Open(dir)
+	db := database.Open(dir)
 
 	keyCount := 100000
 	for i := 0; i < keyCount; i++ {

@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/xmh1011/go-kv/pkg/config"
 	"github.com/xmh1011/go-kv/pkg/log"
 	"github.com/xmh1011/go-kv/pkg/param"
 )
@@ -153,6 +154,12 @@ func (r *Raft) processAppendEntriesReply(peerID int, args *param.AppendEntriesAr
 		// 只要任期匹配，就说明 Follower 确认了我们的 Leader 地位。
 		// 这足以用于 ReadIndex 的租约。
 		r.lastAck[peerID] = time.Now()
+
+		// 在 Lease Read 模式下，检查是否获得了多数派确认
+		// 如果有，则更新租约
+		if r.readIndexMode == config.ReadIndexModeLease {
+			r.tryRenewLease()
+		}
 
 		if reply.Success {
 			r.handleSuccessfulAppendEntries(peerID, args)
