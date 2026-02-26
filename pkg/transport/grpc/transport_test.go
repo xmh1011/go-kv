@@ -277,22 +277,27 @@ func TestAppendEntriesTimeout(t *testing.T) {
 		{
 			name:            "Default",
 			electionTimeout: 0,
-			expectedTimeout: 140 * time.Millisecond,
+			expectedTimeout: DefaultAppendEntriesTimeout, // 2s
 		},
 		{
-			name:            "200ms",
+			name:            "200ms_below_min",
 			electionTimeout: 200 * time.Millisecond,
-			expectedTimeout: 140 * time.Millisecond, // 200ms * 0.7
+			expectedTimeout: DefaultAppendEntriesTimeout, // 使用默认 2s
 		},
 		{
-			name:            "500ms",
+			name:            "500ms_below_min",
 			electionTimeout: 500 * time.Millisecond,
-			expectedTimeout: 350 * time.Millisecond, // 500ms * 0.7
+			expectedTimeout: DefaultAppendEntriesTimeout, // 使用默认 2s
 		},
 		{
-			name:            "1s",
+			name:            "1s_below_default",
 			electionTimeout: 1 * time.Second,
-			expectedTimeout: 700 * time.Millisecond, // 1s * 0.7
+			expectedTimeout: DefaultAppendEntriesTimeout, // 使用默认 2s
+		},
+		{
+			name:            "3s_above_default",
+			electionTimeout: 3 * time.Second,
+			expectedTimeout: 3 * time.Second, // 使用配置值
 		},
 	}
 
@@ -313,7 +318,8 @@ func TestTimeoutConstants(t *testing.T) {
 	assert.Equal(t, 300*time.Millisecond, DefaultRequestVoteTimeout)
 	assert.Equal(t, 5*time.Second, DefaultClientRequestTimeout)
 	assert.Equal(t, 10*time.Second, DefaultChunkSendTimeout)
-	assert.Equal(t, float64(0.70), AppendEntriesTimeoutRatio)
+	assert.Equal(t, 2*time.Second, DefaultAppendEntriesTimeout)
+	assert.Equal(t, 500*time.Millisecond, MinAppendEntriesTimeout)
 }
 
 // TestChunkSize 测试分块大小

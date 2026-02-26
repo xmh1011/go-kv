@@ -24,7 +24,7 @@ import (
 // ==================== 超时策略 ====================
 //
 // 生产级超时设计原则：
-// - AppendEntries: 基于 ElectionTimeout 动态计算（避免频繁重试）
+// - AppendEntries: 基于网络条件和负载动态调整，最小 2 秒
 // - RequestVote: 快速失败（选举阶段系统不可用）
 // - InstallSnapshot: 使用流式传输，不依赖超时
 // - ClientRequest: 合理的客户端超时
@@ -42,10 +42,13 @@ const (
 	// 原因：流式传输不会因为大文件而超时，只需要设置单块的超时
 	DefaultChunkSendTimeout = 10 * time.Second
 
-	// AppendEntriesTimeoutRatio AppendEntries 基准比例：ElectionTimeout 的百分比
-	// 原因：这是最高频调用，包含磁盘 fsync，太短会导致频繁重试
-	// 默认为 70%，可根据网络/磁盘条件调整
-	AppendEntriesTimeoutRatio = 0.70
+	// DefaultAppendEntriesTimeout AppendEntries 默认超时
+	// 原因：这是最高频调用，包含磁盘 fsync，需要足够的时间
+	// 在高负载场景下，140ms 完全不够，设置最小 2 秒
+	DefaultAppendEntriesTimeout = 2 * time.Second
+
+	// MinAppendEntriesTimeout AppendEntries 最小超时
+	MinAppendEntriesTimeout = 500 * time.Millisecond
 )
 
 // Transport implements transport.Transport using gRPC.
@@ -93,17 +96,22 @@ func (t *Transport) SetElectionTimeout(timeout time.Duration) {
 	t.electionTimeout = timeout
 }
 
-// getAppendEntriesTimeout 基于 ElectionTimeout 动态计算超时
-// 返回 ElectionTimeout 的 70%，保证在心跳间隔内完成
+// getAppendEntriesTimeout 获取 AppendEntries 超时
+// 策略：使用默认超时（2秒），保证在高负载场景下有足够时间完成复制
 func (t *Transport) getAppendEntriesTimeout() time.Duration {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	if t.electionTimeout > 0 {
-		return time.Duration(float64(t.electionTimeout) * AppendEntriesTimeoutRatio)
+	// 如果配置了 ElectionTimeout 且大于最小超时，使用 ElectionTimeout
+	// 否则使用默认的 2 秒超时
+	if t.electionTimeout > MinAppendEntriesTimeout {
+		// 使用 ElectionTimeout，但至少是 MinAppendEntriesTimeout
+		if t.electionTimeout > DefaultAppendEntriesTimeout {
+			return t.electionTimeout
+		}
+		return DefaultAppendEntriesTimeout
 	}
-	// 默认值：200ms 的 70% = 140ms
-	return 140 * time.Millisecond
+	return DefaultAppendEntriesTimeout
 }
 
 // Addr returns the local address.
