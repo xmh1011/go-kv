@@ -496,6 +496,20 @@ func (r *Raft) dispatchEntries(entries []param.LogEntry) {
 		case param.ConfigChangeCommand:
 			// 配置变更命令，持有锁处理
 			r.applyConfigChange(cmd, entry.Index)
+
+			// 获取通知 channel（短暂持锁）
+			r.mu.Lock()
+			notifyChan, ok = r.notifyApply[entry.Index]
+			if ok {
+				delete(r.notifyApply, entry.Index)
+			}
+			r.mu.Unlock()
+
+			// 发送通知，结果为配置变更的索引
+			if ok {
+				log.Infof("[Client] dispatchEntries: Notifying for config change at index %d", entry.Index)
+				notifyChan <- entry.Index
+			}
 		default:
 			// 普通命令：先应用状态机（不持有锁）
 			result = r.stateMachine.Apply(entry)
