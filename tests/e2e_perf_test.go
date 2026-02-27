@@ -157,6 +157,16 @@ func (c *e2eCluster) getLeader(t *testing.T) *raft.Raft {
 	return nil
 }
 
+// findLeader 遍历所有节点找到当前 Leader
+func (c *e2eCluster) findLeader() *raft.Raft {
+	for _, node := range c.nodes {
+		if !node.IsStopped() && node.State() == raft.Leader {
+			return node
+		}
+	}
+	return nil
+}
+
 func (c *e2eCluster) sendThroughRPC(node *raft.Raft, cmd param.KVCommand, timeout time.Duration) (bool, time.Duration, error) {
 	cmdBytes, _ := json.Marshal(cmd)
 	args := &param.ClientArgs{
@@ -172,6 +182,47 @@ func (c *e2eCluster) sendThroughRPC(node *raft.Raft, cmd param.KVCommand, timeou
 
 	success := err == nil && reply.Success
 	return success, latency, err
+}
+
+// sendThroughRPCWithLeaderTracking 发送请求，自动跟踪 Leader 变化
+// 当收到 NotLeader 响应时，自动获取新 Leader 并重试
+func (c *e2eCluster) sendThroughRPCWithLeaderTracking(currentLeader *atomic.Value, cmd param.KVCommand, maxRetries int) (bool, time.Duration, error) {
+	var totalLatency time.Duration
+
+	for retry := 0; retry < maxRetries; retry++ {
+		leader := currentLeader.Load().(*raft.Raft)
+
+		cmdBytes, _ := json.Marshal(cmd)
+		args := &param.ClientArgs{
+			ClientID:    rand.Int63(),
+			SequenceNum: rand.Int63(),
+			Command:     cmdBytes,
+		}
+		reply := &param.ClientReply{}
+
+		start := time.Now()
+		err := leader.ClientRequest(args, reply)
+		latency := time.Since(start)
+		totalLatency += latency
+
+		if err == nil && reply.Success {
+			return true, totalLatency, nil
+		}
+
+		// 如果收到 NotLeader 响应，尝试更新 Leader 并重试
+		if reply.NotLeader {
+			newLeader := c.findLeader()
+			if newLeader != nil {
+				currentLeader.Store(newLeader)
+			}
+			continue
+		}
+
+		// 其他错误，直接返回
+		return false, totalLatency, err
+	}
+
+	return false, totalLatency, fmt.Errorf("max retries exceeded")
 }
 
 // sendThroughNetwork 通过真实网络模拟发送请求
@@ -274,18 +325,23 @@ func TestE2E_WriteHeavy(t *testing.T) {
 	p99 := percentile(latencies, 99)
 	latenciesMu.Unlock()
 
+	// 使用 atomic.LoadInt64 读取 atomic 变量
+	finalTotalOps := atomic.LoadInt64(&totalOps)
+	finalFailedOps := atomic.LoadInt64(&failedOps)
+	finalBytesWritten := atomic.LoadInt64(&bytesWritten)
+
 	metrics := PerfMetrics{
 		TestName:      "WriteHeavy (写密集型)",
 		Duration:      duration,
-		TotalOps:      totalOps,
-		SuccessOps:    totalOps - failedOps,
-		FailedOps:     failedOps,
-		BytesWritten:  bytesWritten,
+		TotalOps:      finalTotalOps,
+		SuccessOps:    finalTotalOps - finalFailedOps,
+		FailedOps:     finalFailedOps,
+		BytesWritten:  finalBytesWritten,
 		LatencyP50:    p50,
 		LatencyP95:    p95,
 		LatencyP99:    p99,
-		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
+		ThroughputOps: float64(finalTotalOps-finalFailedOps) / duration.Seconds(),
+		ErrorRate:     float64(finalFailedOps) / float64(finalTotalOps) * 100,
 	}
 
 	printPerfMetrics(t, &metrics)
@@ -303,6 +359,10 @@ func TestE2E_ReadHeavy(t *testing.T) {
 
 	leader := c.getLeader(t)
 	t.Logf("Test: ReadHeavy, Leader: Node %d", leader.ID())
+
+	// 使用 atomic.Value 存储 Leader 引用，支持动态更新
+	currentLeader := &atomic.Value{}
+	currentLeader.Store(leader)
 
 	// 预热数据
 	warmupCount := 1000
@@ -329,11 +389,13 @@ func TestE2E_ReadHeavy(t *testing.T) {
 				keyNum := rand.Intn(warmupCount)
 				key := fmt.Sprintf("warmup-key-%d", keyNum)
 				cmd := param.KVCommand{Op: param.OpGet, Key: key, Value: ""}
-				success, latency, _ := c.sendThroughRPC(leader, cmd, 5*time.Second)
+				success, latency, _ := c.sendThroughRPCWithLeaderTracking(currentLeader, cmd, 3)
 
 				atomic.AddInt64(&totalOps, 1)
 				if success {
-					val, _ := c.stateMachines[leader.ID()-1].Get(key)
+					// 从当前 Leader 获取状态机
+					currLeader := currentLeader.Load().(*raft.Raft)
+					val, _ := c.stateMachines[currLeader.ID()-1].Get(key)
 					atomic.AddInt64(&bytesRead, int64(len(key)+len(val)))
 					latenciesMu.Lock()
 					latencies = append(latencies, latency)
@@ -354,18 +416,23 @@ func TestE2E_ReadHeavy(t *testing.T) {
 	p99 := percentile(latencies, 99)
 	latenciesMu.Unlock()
 
+	// 使用 atomic.LoadInt64 读取 atomic 变量
+	finalTotalOps := atomic.LoadInt64(&totalOps)
+	finalFailedOps := atomic.LoadInt64(&failedOps)
+	finalBytesRead := atomic.LoadInt64(&bytesRead)
+
 	metrics := PerfMetrics{
 		TestName:      "ReadHeavy (读密集型)",
 		Duration:      duration,
-		TotalOps:      totalOps,
-		SuccessOps:    totalOps - failedOps,
-		FailedOps:     failedOps,
-		BytesRead:     bytesRead,
+		TotalOps:      finalTotalOps,
+		SuccessOps:    finalTotalOps - finalFailedOps,
+		FailedOps:     finalFailedOps,
+		BytesRead:     finalBytesRead,
 		LatencyP50:    p50,
 		LatencyP95:    p95,
 		LatencyP99:    p99,
-		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
+		ThroughputOps: float64(finalTotalOps-finalFailedOps) / duration.Seconds(),
+		ErrorRate:     float64(finalFailedOps) / float64(finalTotalOps) * 100,
 	}
 
 	printPerfMetrics(t, &metrics)
@@ -399,6 +466,10 @@ func TestE2E_MixedWorkload(t *testing.T) {
 	}
 	time.Sleep(2 * time.Second)
 
+	// 使用 atomic.Value 存储 Leader 引用，支持动态更新
+	currentLeader := &atomic.Value{}
+	currentLeader.Store(leader)
+
 	stopCh := make(chan struct{})
 	go func() {
 		for {
@@ -416,15 +487,16 @@ func TestE2E_MixedWorkload(t *testing.T) {
 				if isWrite {
 					value := fmt.Sprintf("val-%d", rand.Intn(1000))
 					cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
-					success, latency, _ = c.sendThroughRPC(leader, cmd, 5*time.Second)
+					success, latency, _ = c.sendThroughRPCWithLeaderTracking(currentLeader, cmd, 3)
 					if success {
 						atomic.AddInt64(&bytesWritten, int64(len(key)+len(value)))
 					}
 				} else {
 					cmd := param.KVCommand{Op: param.OpGet, Key: key}
-					success, latency, _ = c.sendThroughRPC(leader, cmd, 5*time.Second)
+					success, latency, _ = c.sendThroughRPCWithLeaderTracking(currentLeader, cmd, 3)
 					if success {
-						val, _ := c.stateMachines[leader.ID()-1].Get(key)
+						currLeader := currentLeader.Load().(*raft.Raft)
+						val, _ := c.stateMachines[currLeader.ID()-1].Get(key)
 						atomic.AddInt64(&bytesRead, int64(len(key)+len(val)))
 					}
 				}
@@ -449,19 +521,25 @@ func TestE2E_MixedWorkload(t *testing.T) {
 	p99 := percentile(latencies, 99)
 	latenciesMu.Unlock()
 
+	// 使用 atomic.LoadInt64 读取 atomic 变量
+	finalTotalOps := atomic.LoadInt64(&totalOps)
+	finalFailedOps := atomic.LoadInt64(&failedOps)
+	finalBytesRead := atomic.LoadInt64(&bytesRead)
+	finalBytesWritten := atomic.LoadInt64(&bytesWritten)
+
 	metrics := PerfMetrics{
 		TestName:      "MixedWorkload (混合负载 - 70%%写/30%%读)",
 		Duration:      duration,
-		TotalOps:      totalOps,
-		SuccessOps:    totalOps - failedOps,
-		FailedOps:     failedOps,
-		BytesRead:     bytesRead,
-		BytesWritten:  bytesWritten,
+		TotalOps:      finalTotalOps,
+		SuccessOps:    finalTotalOps - finalFailedOps,
+		FailedOps:     finalFailedOps,
+		BytesRead:     finalBytesRead,
+		BytesWritten:  finalBytesWritten,
 		LatencyP50:    p50,
 		LatencyP95:    p95,
 		LatencyP99:    p99,
-		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
+		ThroughputOps: float64(finalTotalOps-finalFailedOps) / duration.Seconds(),
+		ErrorRate:     float64(finalFailedOps) / float64(finalTotalOps) * 100,
 	}
 
 	printPerfMetrics(t, &metrics)
@@ -480,6 +558,10 @@ func TestE2E_SmallValues(t *testing.T) {
 	leader := c.getLeader(t)
 	t.Logf("Test: SmallValues, Leader: %d", leader.ID())
 
+	// 使用 atomic.Value 存储 Leader 引用，支持动态更新
+	currentLeader := &atomic.Value{}
+	currentLeader.Store(leader)
+
 	stopCh := make(chan struct{})
 	go func() {
 		for {
@@ -496,15 +578,16 @@ func TestE2E_SmallValues(t *testing.T) {
 				if isWrite {
 					value := fmt.Sprintf("v%d", rand.Intn(1000))
 					cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
-					success, latency, _ = c.sendThroughRPC(leader, cmd, 5*time.Second)
+					success, latency, _ = c.sendThroughRPCWithLeaderTracking(currentLeader, cmd, 3)
 					if success {
 						atomic.AddInt64(&bytesWritten, int64(len(key)+len(value)))
 					}
 				} else {
 					cmd := param.KVCommand{Op: param.OpGet, Key: key}
-					success, latency, _ = c.sendThroughRPC(leader, cmd, 5*time.Second)
+					success, latency, _ = c.sendThroughRPCWithLeaderTracking(currentLeader, cmd, 3)
 					if success {
-						val, _ := c.stateMachines[leader.ID()-1].Get(key)
+						currLeader := currentLeader.Load().(*raft.Raft)
+						val, _ := c.stateMachines[currLeader.ID()-1].Get(key)
 						atomic.AddInt64(&bytesRead, int64(len(key)+len(val)))
 					}
 				}
@@ -529,18 +612,24 @@ func TestE2E_SmallValues(t *testing.T) {
 	p99 := percentile(latencies, 99)
 	latenciesMu.Unlock()
 
+	// 使用 atomic.LoadInt64 读取 atomic 变量
+	finalTotalOps := atomic.LoadInt64(&totalOps)
+	finalFailedOps := atomic.LoadInt64(&failedOps)
+	finalBytesRead := atomic.LoadInt64(&bytesRead)
+	finalBytesWritten := atomic.LoadInt64(&bytesWritten)
+
 	metrics := PerfMetrics{
 		TestName:      "SmallValues (小值操作 - 50%%写/50%%读)",
 		Duration:      duration,
-		TotalOps:      totalOps,
-		SuccessOps:    totalOps - failedOps,
-		BytesRead:     bytesRead,
-		BytesWritten:  bytesWritten,
+		TotalOps:      finalTotalOps,
+		SuccessOps:    finalTotalOps - finalFailedOps,
+		BytesRead:     finalBytesRead,
+		BytesWritten:  finalBytesWritten,
 		LatencyP50:    p50,
 		LatencyP95:    p95,
 		LatencyP99:    p99,
-		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
+		ThroughputOps: float64(finalTotalOps-finalFailedOps) / duration.Seconds(),
+		ErrorRate:     float64(finalFailedOps) / float64(finalTotalOps) * 100,
 	}
 
 	printPerfMetrics(t, &metrics)
@@ -627,19 +716,25 @@ func TestE2E_BatchOperations(t *testing.T) {
 	p99 := percentile(batchLatencies, 99)
 	batchLatenciesMu.Unlock()
 
+	// 使用 atomic.LoadInt64 读取 atomic 变量
+	finalTotalOps := atomic.LoadInt64(&totalOps)
+	finalFailedOps := atomic.LoadInt64(&failedOps)
+	finalBytesRead := atomic.LoadInt64(&bytesRead)
+	finalBytesWritten := atomic.LoadInt64(&bytesWritten)
+
 	metrics := PerfMetrics{
 		TestName:      "BatchOperations (批量操作 - 50条/批)",
 		Duration:      duration,
-		TotalOps:      totalOps,
-		SuccessOps:    totalOps - failedOps,
-		FailedOps:     failedOps,
-		BytesRead:     bytesRead,
-		BytesWritten:  bytesWritten,
+		TotalOps:      finalTotalOps,
+		SuccessOps:    finalTotalOps - finalFailedOps,
+		FailedOps:     finalFailedOps,
+		BytesRead:     finalBytesRead,
+		BytesWritten:  finalBytesWritten,
 		LatencyP50:    p50,
 		LatencyP95:    p95,
 		LatencyP99:    p99,
-		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
+		ThroughputOps: float64(finalTotalOps-finalFailedOps) / duration.Seconds(),
+		ErrorRate:     float64(finalFailedOps) / float64(finalTotalOps) * 100,
 	}
 
 	printPerfMetrics(t, &metrics)
@@ -706,19 +801,23 @@ func TestE2E_DeleteOperations(t *testing.T) {
 	p99 := percentile(latencies, 99)
 	latenciesMu.Unlock()
 
+	// 使用 atomic.LoadInt64 读取 atomic 变量
+	finalTotalOps := atomic.LoadInt64(&totalOps)
+	finalFailedOps := atomic.LoadInt64(&failedOps)
+
 	metrics := PerfMetrics{
 		TestName:      "DeleteOperations (删除操作)",
 		Duration:      duration,
-		TotalOps:      totalOps,
-		SuccessOps:    totalOps - failedOps,
-		FailedOps:     failedOps,
+		TotalOps:      finalTotalOps,
+		SuccessOps:    finalTotalOps - finalFailedOps,
+		FailedOps:     finalFailedOps,
 		BytesRead:     0,
 		BytesWritten:  0,
 		LatencyP50:    p50,
 		LatencyP95:    p95,
 		LatencyP99:    p99,
-		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
+		ThroughputOps: float64(finalTotalOps-finalFailedOps) / duration.Seconds(),
+		ErrorRate:     float64(finalFailedOps) / float64(finalTotalOps) * 100,
 	}
 
 	printPerfMetrics(t, &metrics)
@@ -811,18 +910,23 @@ func TestNetworkE2E_WriteHeavy(t *testing.T) {
 	p99 := percentile(latencies, 99)
 	latenciesMu.Unlock()
 
+	// 使用 atomic.LoadInt64 读取 atomic 变量
+	finalTotalOps := atomic.LoadInt64(&totalOps)
+	finalFailedOps := atomic.LoadInt64(&failedOps)
+	finalBytesWritten := atomic.LoadInt64(&bytesWritten)
+
 	metrics := PerfMetrics{
 		TestName:      "[Network E2E] WriteHeavy (写密集型)",
 		Duration:      duration,
-		TotalOps:      totalOps,
-		SuccessOps:    totalOps - failedOps,
-		FailedOps:     failedOps,
-		BytesWritten:  bytesWritten,
+		TotalOps:      finalTotalOps,
+		SuccessOps:    finalTotalOps - finalFailedOps,
+		FailedOps:     finalFailedOps,
+		BytesWritten:  finalBytesWritten,
 		LatencyP50:    p50,
 		LatencyP95:    p95,
 		LatencyP99:    p99,
-		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
+		ThroughputOps: float64(finalTotalOps-finalFailedOps) / duration.Seconds(),
+		ErrorRate:     float64(finalFailedOps) / float64(finalTotalOps) * 100,
 	}
 
 	printPerfMetrics(t, &metrics)
@@ -886,18 +990,23 @@ func TestNetworkE2E_ReadHeavy(t *testing.T) {
 	p99 := percentile(latencies, 99)
 	latenciesMu.Unlock()
 
+	// 使用 atomic.LoadInt64 读取 atomic 变量
+	finalTotalOps := atomic.LoadInt64(&totalOps)
+	finalFailedOps := atomic.LoadInt64(&failedOps)
+	finalBytesRead := atomic.LoadInt64(&bytesRead)
+
 	metrics := PerfMetrics{
 		TestName:      "[Network E2E] ReadHeavy (读密集型)",
 		Duration:      duration,
-		TotalOps:      totalOps,
-		SuccessOps:    totalOps - failedOps,
-		FailedOps:     failedOps,
-		BytesRead:     bytesRead,
+		TotalOps:      finalTotalOps,
+		SuccessOps:    finalTotalOps - finalFailedOps,
+		FailedOps:     finalFailedOps,
+		BytesRead:     finalBytesRead,
 		LatencyP50:    p50,
 		LatencyP95:    p95,
 		LatencyP99:    p99,
-		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
+		ThroughputOps: float64(finalTotalOps-finalFailedOps) / duration.Seconds(),
+		ErrorRate:     float64(finalFailedOps) / float64(finalTotalOps) * 100,
 	}
 
 	printPerfMetrics(t, &metrics)
@@ -976,19 +1085,25 @@ func TestNetworkE2E_MixedWorkload(t *testing.T) {
 	p99 := percentile(latencies, 99)
 	latenciesMu.Unlock()
 
+	// 使用 atomic.LoadInt64 读取 atomic 变量
+	finalTotalOps := atomic.LoadInt64(&totalOps)
+	finalFailedOps := atomic.LoadInt64(&failedOps)
+	finalBytesRead := atomic.LoadInt64(&bytesRead)
+	finalBytesWritten := atomic.LoadInt64(&bytesWritten)
+
 	metrics := PerfMetrics{
 		TestName:      "[Network E2E] MixedWorkload (混合负载 - 70%%写/30%%读)",
 		Duration:      duration,
-		TotalOps:      totalOps,
-		SuccessOps:    totalOps - failedOps,
-		FailedOps:     failedOps,
-		BytesRead:     bytesRead,
-		BytesWritten:  bytesWritten,
+		TotalOps:      finalTotalOps,
+		SuccessOps:    finalTotalOps - finalFailedOps,
+		FailedOps:     finalFailedOps,
+		BytesRead:     finalBytesRead,
+		BytesWritten:  finalBytesWritten,
 		LatencyP50:    p50,
 		LatencyP95:    p95,
 		LatencyP99:    p99,
-		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
+		ThroughputOps: float64(finalTotalOps-finalFailedOps) / duration.Seconds(),
+		ErrorRate:     float64(finalFailedOps) / float64(finalTotalOps) * 100,
 	}
 
 	printPerfMetrics(t, &metrics)
@@ -1056,19 +1171,25 @@ func TestNetworkE2E_SmallValues(t *testing.T) {
 	p99 := percentile(latencies, 99)
 	latenciesMu.Unlock()
 
+	// 使用 atomic.LoadInt64 读取 atomic 变量
+	finalTotalOps := atomic.LoadInt64(&totalOps)
+	finalFailedOps := atomic.LoadInt64(&failedOps)
+	finalBytesRead := atomic.LoadInt64(&bytesRead)
+	finalBytesWritten := atomic.LoadInt64(&bytesWritten)
+
 	metrics := PerfMetrics{
 		TestName:      "[Network E2E] SmallValues (小值操作 - 50%%写/50%%读)",
 		Duration:      duration,
-		TotalOps:      totalOps,
-		SuccessOps:    totalOps - failedOps,
-		FailedOps:     failedOps,
-		BytesRead:     bytesRead,
-		BytesWritten:  bytesWritten,
+		TotalOps:      finalTotalOps,
+		SuccessOps:    finalTotalOps - finalFailedOps,
+		FailedOps:     finalFailedOps,
+		BytesRead:     finalBytesRead,
+		BytesWritten:  finalBytesWritten,
 		LatencyP50:    p50,
 		LatencyP95:    p95,
 		LatencyP99:    p99,
-		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
+		ThroughputOps: float64(finalTotalOps-finalFailedOps) / duration.Seconds(),
+		ErrorRate:     float64(finalFailedOps) / float64(finalTotalOps) * 100,
 	}
 
 	printPerfMetrics(t, &metrics)
@@ -1147,19 +1268,25 @@ func TestNetworkE2E_BatchOperations(t *testing.T) {
 	p99 := percentile(batchLatencies, 99)
 	batchLatenciesMu.Unlock()
 
+	// 使用 atomic.LoadInt64 读取 atomic 变量
+	finalTotalOps := atomic.LoadInt64(&totalOps)
+	finalFailedOps := atomic.LoadInt64(&failedOps)
+	finalBytesRead := atomic.LoadInt64(&bytesRead)
+	finalBytesWritten := atomic.LoadInt64(&bytesWritten)
+
 	metrics := PerfMetrics{
 		TestName:      "[Network E2E] BatchOperations (批量操作 - 50条/批)",
 		Duration:      duration,
-		TotalOps:      totalOps,
-		SuccessOps:    totalOps - failedOps,
-		FailedOps:     failedOps,
-		BytesRead:     bytesRead,
-		BytesWritten:  bytesWritten,
+		TotalOps:      finalTotalOps,
+		SuccessOps:    finalTotalOps - finalFailedOps,
+		FailedOps:     finalFailedOps,
+		BytesRead:     finalBytesRead,
+		BytesWritten:  finalBytesWritten,
 		LatencyP50:    p50,
 		LatencyP95:    p95,
 		LatencyP99:    p99,
-		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
+		ThroughputOps: float64(finalTotalOps-finalFailedOps) / duration.Seconds(),
+		ErrorRate:     float64(finalFailedOps) / float64(finalTotalOps) * 100,
 	}
 
 	printPerfMetrics(t, &metrics)
@@ -1221,19 +1348,23 @@ func TestNetworkE2E_DeleteOperations(t *testing.T) {
 	p99 := percentile(latencies, 99)
 	latenciesMu.Unlock()
 
+	// 使用 atomic.LoadInt64 读取 atomic 变量
+	finalTotalOps := atomic.LoadInt64(&totalOps)
+	finalFailedOps := atomic.LoadInt64(&failedOps)
+
 	metrics := PerfMetrics{
 		TestName:      "[Network E2E] DeleteOperations (删除操作)",
 		Duration:      duration,
-		TotalOps:      totalOps,
-		SuccessOps:    totalOps - failedOps,
-		FailedOps:     failedOps,
+		TotalOps:      finalTotalOps,
+		SuccessOps:    finalTotalOps - finalFailedOps,
+		FailedOps:     finalFailedOps,
 		BytesRead:     0,
 		BytesWritten:  0,
 		LatencyP50:    p50,
 		LatencyP95:    p95,
 		LatencyP99:    p99,
-		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
+		ThroughputOps: float64(finalTotalOps-finalFailedOps) / duration.Seconds(),
+		ErrorRate:     float64(finalFailedOps) / float64(finalTotalOps) * 100,
 	}
 
 	printPerfMetrics(t, &metrics)
@@ -1296,18 +1427,23 @@ func TestNetworkE2E_ConcurrentClients(t *testing.T) {
 	p99 := percentile(latencies, 99)
 	latenciesMu.Unlock()
 
+	// 使用 atomic.LoadInt64 读取 atomic 变量
+	finalTotalOps := atomic.LoadInt64(&totalOps)
+	finalFailedOps := atomic.LoadInt64(&failedOps)
+	finalBytesWritten := atomic.LoadInt64(&bytesWritten)
+
 	metrics := PerfMetrics{
 		TestName:      fmt.Sprintf("[Network E2E] ConcurrentClients (%d并发客户端)", numClients),
 		Duration:      duration,
-		TotalOps:      totalOps,
-		SuccessOps:    totalOps - failedOps,
-		FailedOps:     failedOps,
-		BytesWritten:  bytesWritten,
+		TotalOps:      finalTotalOps,
+		SuccessOps:    finalTotalOps - finalFailedOps,
+		FailedOps:     finalFailedOps,
+		BytesWritten:  finalBytesWritten,
 		LatencyP50:    p50,
 		LatencyP95:    p95,
 		LatencyP99:    p99,
-		ThroughputOps: float64(totalOps-failedOps) / duration.Seconds(),
-		ErrorRate:     float64(failedOps) / float64(totalOps) * 100,
+		ThroughputOps: float64(finalTotalOps-finalFailedOps) / duration.Seconds(),
+		ErrorRate:     float64(finalFailedOps) / float64(finalTotalOps) * 100,
 	}
 
 	printPerfMetrics(t, &metrics)
