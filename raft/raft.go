@@ -671,8 +671,9 @@ func (r *Raft) Commit(command any) (any, bool, int) {
 	}
 
 	// 等待命令被状态机成功应用，或等待超时。
+	// 使用 5 秒超时以应对高负载场景下的日志复制延迟
 	log.Infof("[Client] Waiting for log index %d to be applied...", index)
-	result, ok := r.waitForAppliedLog(index, 2*time.Second)
+	result, ok := r.waitForAppliedLog(index, 5*time.Second)
 	return result, ok, r.id
 }
 

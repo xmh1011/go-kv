@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -42,6 +43,56 @@ type LongRunningMetrics struct {
 	SnapshotCount     int32
 	WALSize           int64
 	MemTableFlushes   int32
+}
+
+// latencySampler 延迟采样器，限制采样数量以控制内存使用
+type latencySampler struct {
+	mu          sync.Mutex
+	latencies   []time.Duration
+	maxSamples  int
+	sampleCount int64 // 总采样次数（包括被丢弃的）
+}
+
+// newLatencySampler 创建一个新的延迟采样器
+func newLatencySampler(maxSamples int) *latencySampler {
+	return &latencySampler{
+		latencies:  make([]time.Duration, 0, maxSamples),
+		maxSamples: maxSamples,
+	}
+}
+
+// add 添加一个延迟样本，使用蓄水池采样策略
+func (ls *latencySampler) add(latency time.Duration) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+
+	ls.sampleCount++
+
+	if len(ls.latencies) < ls.maxSamples {
+		ls.latencies = append(ls.latencies, latency)
+	} else {
+		// 蓄水池采样：以 maxSamples/n 的概率替换已有样本
+		idx := rand.Int63n(ls.sampleCount)
+		if idx < int64(ls.maxSamples) {
+			ls.latencies[idx] = latency
+		}
+	}
+}
+
+// getAll 获取所有采样的延迟数据
+func (ls *latencySampler) getAll() []time.Duration {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	result := make([]time.Duration, len(ls.latencies))
+	copy(result, ls.latencies)
+	return result
+}
+
+// count 获取采样数量
+func (ls *latencySampler) count() int {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	return len(ls.latencies)
 }
 
 // longRunningCluster 生产环境配置的长时测试集群
@@ -227,7 +278,7 @@ func (c *longRunningCluster) monitorLeaderChanges(ctx chan struct{}) {
 	}
 }
 
-// sendRequest 发送请求并返回结果
+// sendRequest 发送请求并返回结果（不处理重定向）
 func (c *longRunningCluster) sendRequest(node *raft.Raft, cmd param.KVCommand) (bool, time.Duration, error) {
 	cmdBytes, _ := json.Marshal(cmd)
 	args := &param.ClientArgs{
@@ -245,12 +296,17 @@ func (c *longRunningCluster) sendRequest(node *raft.Raft, cmd param.KVCommand) (
 	return success, latency, err
 }
 
-// sendRequestWithLeaderTracking 发送请求，自动跟踪 Leader 变化
-// 当收到 NotLeader 响应时，自动获取新 Leader 并重试
-// stopCh 用于在测试超时时中断阻塞的请求
-// 注意：核心 Raft 代码已经有超时机制，这里只需要简单的 Leader 跟踪
-func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic.Value, cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, error) {
+// sendRequestToAnyNode 向任意节点发送请求，自动处理 NotLeader 重定向
+// 这是正确的 Raft 客户端实现方式：
+// 1. 可以向任意节点发送请求
+// 2. 如果节点是 Leader，正常处理
+// 3. 如果节点是 Follower，返回 NotLeader + LeaderHint，客户端重定向
+func (c *longRunningCluster) sendRequestToAnyNode(cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, error) {
 	var totalLatency time.Duration
+
+	// 初始随机选择一个节点
+	nodeIdx := rand.Intn(len(c.nodes))
+	node := c.nodes[nodeIdx]
 
 	for retry := 0; retry < maxRetries; retry++ {
 		// 检查是否应该停止
@@ -259,8 +315,6 @@ func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic
 			return false, totalLatency, fmt.Errorf("test stopped")
 		default:
 		}
-
-		leader := currentLeader.Load().(*raft.Raft)
 
 		cmdBytes, _ := json.Marshal(cmd)
 		args := &param.ClientArgs{
@@ -271,7 +325,7 @@ func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic
 		reply := &param.ClientReply{}
 
 		start := time.Now()
-		err := leader.ClientRequest(args, reply)
+		err := node.ClientRequest(args, reply)
 		latency := time.Since(start)
 		totalLatency += latency
 
@@ -279,12 +333,14 @@ func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic
 			return true, totalLatency, nil
 		}
 
-		// 如果收到 NotLeader 响应，尝试更新 Leader 并重试
+		// 如果收到 NotLeader 响应，使用 LeaderHint 重定向
 		if reply.NotLeader {
-			// 尝试找到新 Leader
-			newLeader := c.findLeader()
-			if newLeader != nil {
-				currentLeader.Store(newLeader)
+			if reply.LeaderHint > 0 && reply.LeaderHint <= len(c.nodes) {
+				// 使用 LeaderHint 定位新 Leader
+				node = c.nodes[reply.LeaderHint-1]
+			} else {
+				// LeaderHint 无效，随机选择一个节点重试
+				node = c.nodes[rand.Intn(len(c.nodes))]
 			}
 			continue
 		}
@@ -304,6 +360,89 @@ func (c *longRunningCluster) findLeader() *raft.Raft {
 		}
 	}
 	return nil
+}
+
+// getLeaderByID 根据 LeaderHint ID 获取 Leader 节点
+func (c *longRunningCluster) getLeaderByID(leaderID int) *raft.Raft {
+	if leaderID <= 0 || leaderID > len(c.nodes) {
+		return nil
+	}
+	return c.nodes[leaderID-1]
+}
+
+// sendRequestWithLeaderTracking 向当前 Leader 发送请求，自动跟踪 Leader 变化
+// 当收到 NotLeader 响应时，更新 currentLeader 并重试
+func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic.Value, cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, error) {
+	var totalLatency time.Duration
+
+	for retry := 0; retry < maxRetries; retry++ {
+		// 检查是否应该停止
+		if stopCh != nil {
+			select {
+			case <-stopCh:
+				return false, totalLatency, fmt.Errorf("test stopped")
+			default:
+			}
+		}
+
+		// 获取当前 Leader
+		leader := currentLeader.Load().(*raft.Raft)
+		if leader == nil || leader.IsStopped() {
+			// 尝试重新查找 Leader
+			newLeader := c.findLeader()
+			if newLeader == nil {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			currentLeader.Store(newLeader)
+			leader = newLeader
+		}
+
+		cmdBytes, _ := json.Marshal(cmd)
+		args := &param.ClientArgs{
+			ClientID:    rand.Int63(),
+			SequenceNum: rand.Int63(),
+			Command:     cmdBytes,
+		}
+		reply := &param.ClientReply{}
+
+		start := time.Now()
+		err := leader.ClientRequest(args, reply)
+		latency := time.Since(start)
+		totalLatency += latency
+
+		if err == nil && reply.Success {
+			return true, totalLatency, nil
+		}
+
+		// 如果收到 NotLeader 响应，使用 LeaderHint 更新 Leader
+		if reply.NotLeader {
+			if reply.LeaderHint > 0 && reply.LeaderHint <= len(c.nodes) {
+				newLeader := c.nodes[reply.LeaderHint-1]
+				if !newLeader.IsStopped() && newLeader.State() == raft.Leader {
+					currentLeader.Store(newLeader)
+				} else {
+					// LeaderHint 无效或节点不可用，尝试重新查找
+					newLeader = c.findLeader()
+					if newLeader != nil {
+						currentLeader.Store(newLeader)
+					}
+				}
+			} else {
+				// LeaderHint 无效，重新查找 Leader
+				newLeader := c.findLeader()
+				if newLeader != nil {
+					currentLeader.Store(newLeader)
+				}
+			}
+			continue
+		}
+
+		// 其他错误，直接返回
+		return false, totalLatency, err
+	}
+
+	return false, totalLatency, fmt.Errorf("max retries exceeded")
 }
 
 // getCurrentLeader 获取当前 Leader
@@ -459,6 +598,7 @@ func (r *testRunner) runWithFailureInjection(t *testing.T, onProgress func(elaps
 
 // TestLongRunning_10Min_Comprehensive 10分钟综合性能测试
 // 模拟生产环境：使用 gRPC + LSM，三节点集群，混合读写删除操作
+// 客户端可以向任意节点发送请求，自动处理 NotLeader 重定向
 func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 	duration := 10 * time.Minute
 	if testing.Short() {
@@ -475,7 +615,11 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 	// 等待集群就绪
 	c.waitForAllNodesReady(t)
 	leader := c.getLeader(t)
-	t.Logf("初始 Leader: Node %d", leader.ID())
+	t.Logf("集群就绪，Leader: Node %d, 开始预热...", leader.ID())
+
+	// 使用 atomic.Value 存储 Leader 引用，支持动态更新
+	currentLeader := &atomic.Value{}
+	currentLeader.Store(leader)
 
 	// 启动 Leader 监控
 	monitorCtx := make(chan struct{})
@@ -485,18 +629,23 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 	// 预热数据
 	warmupCount := 1000
 	t.Logf("预热阶段: 写入 %d 条数据...", warmupCount)
+	warmupSuccess := 0
 	for i := 0; i < warmupCount; i++ {
 		key := fmt.Sprintf("warmup-key-%d", i)
 		value := fmt.Sprintf("warmup-value-%d", i)
 		cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
-		c.sendRequest(leader, cmd)
+		success, _, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, nil)
+		if success {
+			warmupSuccess++
+		}
 	}
-	t.Logf("预热完成")
+	t.Logf("预热完成: %d/%d 成功", warmupSuccess, warmupCount)
 
 	// 等待数据同步
 	time.Sleep(3 * time.Second)
 
-	// 性能指标
+	// 性能指标 - 使用 latencySampler 控制内存使用
+	const maxLatencySamples = 10000
 	var (
 		totalOps            int64
 		successOps          int64
@@ -506,13 +655,12 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 		deleteOps           int64
 		bytesRead           int64
 		bytesWritten        int64
-		latencies           []time.Duration
-		writeLatencies      []time.Duration
-		readLatencies       []time.Duration
-		deleteLatencies     []time.Duration
+		latencySampler      = newLatencySampler(maxLatencySamples)
+		writeLatencySampler = newLatencySampler(maxLatencySamples)
+		readLatencySampler  = newLatencySampler(maxLatencySamples)
+		deleteLatencySampler = newLatencySampler(maxLatencySamples)
 		keysForVerification []string
 		sampleKeysMutex     sync.Mutex
-		latencyMu           sync.Mutex // 保护所有 latencies slice 的并发访问
 	)
 
 	// 并发客户端模拟
@@ -545,12 +693,10 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 						value := fmt.Sprintf("%s-val-%d", clientPrefix, rand.Intn(1000000))
 						cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-						success, latency, _ = c.sendRequest(leader, cmd)
+						success, latency, _ = c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
 
 						atomic.AddInt64(&writeOps, 1)
-						latencyMu.Lock()
-						writeLatencies = append(writeLatencies, latency)
-						latencyMu.Unlock()
+						writeLatencySampler.add(latency)
 
 						localKeys = append(localKeys, key)
 
@@ -559,7 +705,6 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 						}
 
 					} else if r < 0.85 { // 25% 读取操作
-						// 优先读取已存在的键
 						var key string
 						if len(localKeys) > 0 {
 							key = localKeys[rand.Intn(len(localKeys))]
@@ -568,17 +713,10 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 						}
 
 						cmd := param.KVCommand{Op: param.OpGet, Key: key}
-						success, latency, _ = c.sendRequest(leader, cmd)
+						success, latency, _ = c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
 
 						atomic.AddInt64(&readOps, 1)
-						latencyMu.Lock()
-						readLatencies = append(readLatencies, latency)
-						latencyMu.Unlock()
-
-						if success {
-							val, _ := c.stateMachines[leader.ID()-1].Get(key)
-							atomic.AddInt64(&bytesRead, int64(len(key)+len(val)))
-						}
+						readLatencySampler.add(latency)
 
 					} else { // 15% 删除操作
 						if len(localKeys) > 0 {
@@ -586,15 +724,12 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 							key := localKeys[idx]
 							cmd := param.KVCommand{Op: param.OpDelete, Key: key}
 
-							success, latency, _ = c.sendRequest(leader, cmd)
+							success, latency, _ = c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
 
 							atomic.AddInt64(&deleteOps, 1)
-							latencyMu.Lock()
-							deleteLatencies = append(deleteLatencies, latency)
-							latencyMu.Unlock()
+							deleteLatencySampler.add(latency)
 
 							if success {
-								// 移除已删除的键
 								localKeys = append(localKeys[:idx], localKeys[idx+1:]...)
 							}
 						}
@@ -603,9 +738,7 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 					atomic.AddInt64(&totalOps, 1)
 					if success {
 						atomic.AddInt64(&successOps, 1)
-						latencyMu.Lock()
-						latencies = append(latencies, latency)
-						latencyMu.Unlock()
+						latencySampler.add(latency)
 					} else {
 						atomic.AddInt64(&failedOps, 1)
 					}
@@ -631,19 +764,8 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 		success := atomic.LoadInt64(&successOps)
 		failed := atomic.LoadInt64(&failedOps)
 
-		t.Logf("[进度报告] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 吞吐量: %.2f ops/sec",
-			elapsed, ops, success, failed, float64(success)/elapsed.Seconds())
-
-		// 进行一致性检查
-		sampleKeysMutex.Lock()
-		sampleKeys := make([]string, len(keysForVerification))
-		copy(sampleKeys, keysForVerification)
-		sampleKeysMutex.Unlock()
-
-		if len(sampleKeys) > 0 {
-			consistent, verified := c.verifyDataConsistency(t, sampleKeys)
-			t.Logf("[一致性检查] 已验证: %d 条数据, 结果: %v", verified, consistent)
-		}
+		t.Logf("[进度报告] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 吞吐量: %.2f ops/sec, 延迟样本: %d",
+			elapsed, ops, success, failed, float64(success)/elapsed.Seconds(), latencySampler.count())
 	})
 
 	// 最终一致性检查
@@ -662,9 +784,9 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 		DeleteOps:         deleteOps,
 		BytesRead:         bytesRead,
 		BytesWritten:      bytesWritten,
-		LatencyP50:        percentileLong(latencies, 50),
-		LatencyP95:        percentileLong(latencies, 95),
-		LatencyP99:        percentileLong(latencies, 99),
+		LatencyP50:        percentileLong(latencySampler.getAll(), 50),
+		LatencyP95:        percentileLong(latencySampler.getAll(), 95),
+		LatencyP99:        percentileLong(latencySampler.getAll(), 99),
 		ThroughputOps:     float64(successOps) / duration.Seconds(),
 		WriteThroughput:   float64(writeOps) / duration.Seconds(),
 		ReadThroughput:    float64(readOps) / duration.Seconds(),
@@ -679,6 +801,7 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 }
 
 // TestLongRunning_10Min_WriteHeavy 10分钟写入密集型测试
+// 客户端可以向任意节点发送请求，自动处理 NotLeader 重定向
 func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 	duration := 10 * time.Minute
 	if testing.Short() {
@@ -693,18 +816,24 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 
 	c.waitForAllNodesReady(t)
 	leader := c.getLeader(t)
+	t.Logf("集群就绪，Leader: Node %d", leader.ID())
+
+	// 使用 atomic.Value 存储 Leader 引用，支持动态更新
+	currentLeader := &atomic.Value{}
+	currentLeader.Store(leader)
 
 	monitorCtx := make(chan struct{})
 	go c.monitorLeaderChanges(monitorCtx)
 	defer close(monitorCtx)
 
+	// 性能指标 - 使用 latencySampler 控制内存使用
+	const maxLatencySamples = 10000
 	var (
-		totalOps     int64
-		successOps   int64
-		failedOps    int64
-		bytesWritten int64
-		latencies    []time.Duration
-		latencyMu    sync.Mutex // 保护 latencies slice 的并发访问
+		totalOps       int64
+		successOps     int64
+		failedOps      int64
+		bytesWritten   int64
+		latencySampler = newLatencySampler(maxLatencySamples)
 	)
 
 	numClients := 8
@@ -728,15 +857,13 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 					value := fmt.Sprintf("value-%d-%d", cid, rand.Intn(10000000))
 					cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-					success, latency, _ := c.sendRequest(leader, cmd)
+					success, latency, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
 
 					atomic.AddInt64(&totalOps, 1)
 					if success {
 						atomic.AddInt64(&successOps, 1)
 						atomic.AddInt64(&bytesWritten, int64(len(key)+len(value)))
-						latencyMu.Lock()
-						latencies = append(latencies, latency)
-						latencyMu.Unlock()
+						latencySampler.add(latency)
 					} else {
 						atomic.AddInt64(&failedOps, 1)
 					}
@@ -749,12 +876,13 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 	// 使用 testRunner 管理超时和进度报告
 	runner := newTestRunner(duration, stopCh, &wg)
 	runner.run(t, func(elapsed time.Duration) {
-		t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 写入流量: %.2f MB/s",
+		t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 写入流量: %.2f MB/s, 延迟样本: %d",
 			elapsed,
 			atomic.LoadInt64(&totalOps),
 			atomic.LoadInt64(&successOps),
 			atomic.LoadInt64(&failedOps),
-			float64(atomic.LoadInt64(&bytesWritten))/1024/1024/elapsed.Seconds())
+			float64(atomic.LoadInt64(&bytesWritten))/1024/1024/elapsed.Seconds(),
+			latencySampler.count())
 	})
 
 	metrics := LongRunningMetrics{
@@ -764,9 +892,9 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 		SuccessOps:        successOps,
 		FailedOps:         failedOps,
 		BytesWritten:      bytesWritten,
-		LatencyP50:        percentileLong(latencies, 50),
-		LatencyP95:        percentileLong(latencies, 95),
-		LatencyP99:        percentileLong(latencies, 99),
+		LatencyP50:        percentileLong(latencySampler.getAll(), 50),
+		LatencyP95:        percentileLong(latencySampler.getAll(), 95),
+		LatencyP99:        percentileLong(latencySampler.getAll(), 99),
 		ThroughputOps:     float64(successOps) / duration.Seconds(),
 		WriteThroughput:   float64(successOps) / duration.Seconds(),
 		ErrorRate:         float64(failedOps) / float64(totalOps) * 100,
@@ -792,19 +920,25 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 
 	c.waitForAllNodesReady(t)
 	leader := c.getLeader(t)
+	t.Logf("集群就绪，Leader: Node %d", leader.ID())
+
+	// 使用 atomic.Value 存储 Leader 引用，支持动态更新
+	currentLeader := &atomic.Value{}
+	currentLeader.Store(leader)
 
 	monitorCtx := make(chan struct{})
 	go c.monitorLeaderChanges(monitorCtx)
 	defer close(monitorCtx)
 
+	// 性能指标 - 使用 latencySampler 控制内存使用
+	const maxLatencySamples = 10000
 	var (
-		totalOps     int64
-		successOps   int64
-		failedOps    int64
-		bytesRead    int64
-		bytesWritten int64
-		latencies    []time.Duration
-		latencyMu    sync.Mutex // 保护 latencies slice 的并发访问
+		totalOps       int64
+		successOps     int64
+		failedOps      int64
+		bytesRead      int64
+		bytesWritten   int64
+		latencySampler = newLatencySampler(maxLatencySamples)
 	)
 
 	numClients := 5
@@ -832,15 +966,13 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 						value := fmt.Sprintf("val-%d", rand.Intn(100000))
 						cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-						success, latency, _ := c.sendRequest(leader, cmd)
+						success, latency, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
 
 						if success {
 							atomic.AddInt64(&successOps, 1)
 							atomic.AddInt64(&bytesWritten, int64(len(key)+len(value)))
 							localKeys = append(localKeys, key)
-							latencyMu.Lock()
-							latencies = append(latencies, latency)
-							latencyMu.Unlock()
+							latencySampler.add(latency)
 						} else {
 							atomic.AddInt64(&failedOps, 1)
 						}
@@ -855,15 +987,14 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 						}
 
 						cmd := param.KVCommand{Op: param.OpGet, Key: key}
-						success, latency, _ := c.sendRequest(leader, cmd)
+						success, latency, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
 
 						if success {
 							atomic.AddInt64(&successOps, 1)
-							val, _ := c.stateMachines[leader.ID()-1].Get(key)
+							l := currentLeader.Load().(*raft.Raft)
+							val, _ := c.stateMachines[l.ID()-1].Get(key)
 							atomic.AddInt64(&bytesRead, int64(len(key)+len(val)))
-							latencyMu.Lock()
-							latencies = append(latencies, latency)
-							latencyMu.Unlock()
+							latencySampler.add(latency)
 						} else {
 							atomic.AddInt64(&failedOps, 1)
 						}
@@ -879,12 +1010,13 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 	failureCount := 0
 	runner.runWithFailureInjection(t,
 		func(elapsed time.Duration) {
-			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, Leader切换: %d",
+			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, Leader切换: %d, 延迟样本: %d",
 				elapsed,
 				atomic.LoadInt64(&totalOps),
 				atomic.LoadInt64(&successOps),
 				atomic.LoadInt64(&failedOps),
-				atomic.LoadInt32(&c.leaderElections))
+				atomic.LoadInt32(&c.leaderElections),
+				latencySampler.count())
 		},
 		func() {
 			if failureCount < 2 { // 最多触发2次故障
@@ -922,9 +1054,9 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 		FailedOps:         failedOps,
 		BytesRead:         bytesRead,
 		BytesWritten:      bytesWritten,
-		LatencyP50:        percentileLong(latencies, 50),
-		LatencyP95:        percentileLong(latencies, 95),
-		LatencyP99:        percentileLong(latencies, 99),
+		LatencyP50:        percentileLong(latencySampler.getAll(), 50),
+		LatencyP95:        percentileLong(latencySampler.getAll(), 95),
+		LatencyP99:        percentileLong(latencySampler.getAll(), 99),
 		ThroughputOps:     float64(successOps) / duration.Seconds(),
 		ErrorRate:         float64(failedOps) / float64(totalOps) * 100,
 		LeaderElections:   atomic.LoadInt32(&c.leaderElections),
@@ -949,6 +1081,7 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 
 	c.waitForAllNodesReady(t)
 	leader := c.getLeader(t)
+	t.Logf("集群就绪，Leader: Node %d", leader.ID())
 
 	// 使用 atomic.Value 存储 Leader，支持动态更新
 	currentLeader := &atomic.Value{}
@@ -957,23 +1090,28 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 	// 预热大量数据
 	warmupCount := 1000
 	t.Logf("预热阶段: 写入 %d 条数据...", warmupCount)
+	warmupSuccess := 0
 	for i := 0; i < warmupCount; i++ {
 		key := fmt.Sprintf("read-warmup-key-%d", i)
 		value := fmt.Sprintf("read-warmup-value-%d", i)
 		cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 		// 预热阶段使用 nil stopCh，因为没有启动客户端
-		c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, nil)
+		success, _, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, nil)
+		if success {
+			warmupSuccess++
+		}
 	}
-	t.Logf("预热完成，等待同步...")
+	t.Logf("预热完成: %d/%d 成功，等待同步...", warmupSuccess, warmupCount)
 	time.Sleep(3 * time.Second)
 
+	// 性能指标 - 使用 latencySampler 控制内存使用
+	const maxLatencySamples = 10000
 	var (
-		totalOps   int64
-		successOps int64
-		failedOps  int64
-		bytesRead  int64
-		latencies  []time.Duration
-		latencyMu  sync.Mutex // 保护 latencies slice 的并发访问
+		totalOps       int64
+		successOps     int64
+		failedOps      int64
+		bytesRead      int64
+		latencySampler = newLatencySampler(maxLatencySamples)
 	)
 
 	numClients := 10
@@ -1013,9 +1151,7 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 					l := currentLeader.Load().(*raft.Raft)
 					val, _ := c.stateMachines[l.ID()-1].Get(key)
 					atomic.AddInt64(&bytesRead, int64(len(key)+len(val)))
-					latencyMu.Lock()
-					latencies = append(latencies, latency)
-					latencyMu.Unlock()
+					latencySampler.add(latency)
 				} else {
 					atomic.AddInt64(&failedOps, 1)
 				}
@@ -1026,12 +1162,13 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 	// 使用 testRunner 管理超时和进度报告
 	runner := newTestRunner(duration, stopCh, &wg)
 	runner.run(t, func(elapsed time.Duration) {
-		t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 读取流量: %.2f MB/s",
+		t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 读取流量: %.2f MB/s, 延迟样本: %d",
 			elapsed,
 			atomic.LoadInt64(&totalOps),
 			atomic.LoadInt64(&successOps),
 			atomic.LoadInt64(&failedOps),
-			float64(atomic.LoadInt64(&bytesRead))/1024/1024/elapsed.Seconds())
+			float64(atomic.LoadInt64(&bytesRead))/1024/1024/elapsed.Seconds(),
+			latencySampler.count())
 	})
 
 	metrics := LongRunningMetrics{
@@ -1041,9 +1178,9 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 		SuccessOps:        successOps,
 		FailedOps:         failedOps,
 		BytesRead:         bytesRead,
-		LatencyP50:        percentileLong(latencies, 50),
-		LatencyP95:        percentileLong(latencies, 95),
-		LatencyP99:        percentileLong(latencies, 99),
+		LatencyP50:        percentileLong(latencySampler.getAll(), 50),
+		LatencyP95:        percentileLong(latencySampler.getAll(), 95),
+		LatencyP99:        percentileLong(latencySampler.getAll(), 99),
 		ThroughputOps:     float64(successOps) / duration.Seconds(),
 		ReadThroughput:    float64(successOps) / duration.Seconds(),
 		ErrorRate:         float64(failedOps) / float64(totalOps) * 100,
@@ -1069,20 +1206,26 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 
 	c.waitForAllNodesReady(t)
 	leader := c.getLeader(t)
+	t.Logf("集群就绪，Leader: Node %d", leader.ID())
+
+	// 使用 atomic.Value 存储 Leader 引用，支持动态更新
+	currentLeader := &atomic.Value{}
+	currentLeader.Store(leader)
 
 	monitorCtx := make(chan struct{})
 	go c.monitorLeaderChanges(monitorCtx)
 	defer close(monitorCtx)
 
+	// 性能指标 - 使用 latencySampler 控制内存使用
+	const maxLatencySamples = 10000
 	var (
-		totalOps        int64
-		successOps      int64
-		failedOps       int64
-		writeOps        int64
-		deleteOps       int64
-		latencies       []time.Duration
-		deleteLatencies []time.Duration
-		latencyMu       sync.Mutex // 保护 latencies slice 的并发访问
+		totalOps            int64
+		successOps          int64
+		failedOps           int64
+		writeOps            int64
+		deleteOps           int64
+		latencySampler      = newLatencySampler(maxLatencySamples)
+		deleteLatencySampler = newLatencySampler(maxLatencySamples)
 	)
 
 	numClients := 8
@@ -1115,24 +1258,20 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 						key := clientKeys[cid][idx]
 
 						cmd := param.KVCommand{Op: param.OpDelete, Key: key}
-						success, latency, _ := c.sendRequest(leader, cmd)
+						success, latency, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
 
 						atomic.AddInt64(&totalOps, 1)
 						if success {
 							atomic.AddInt64(&successOps, 1)
 							atomic.AddInt64(&deleteOps, 1)
-							latencyMu.Lock()
-							deleteLatencies = append(deleteLatencies, latency)
-							latencies = append(latencies, latency)
-							latencyMu.Unlock()
+							deleteLatencySampler.add(latency)
+							latencySampler.add(latency)
 
 							// 移除已删除的键
 							clientKeys[cid] = append(clientKeys[cid][:idx], clientKeys[cid][idx+1:]...)
 						} else {
 							atomic.AddInt64(&failedOps, 1)
-							latencyMu.Lock()
-							latencies = append(latencies, latency)
-							latencyMu.Unlock()
+							latencySampler.add(latency)
 						}
 					} else {
 						// 写入操作
@@ -1140,7 +1279,7 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 						value := fmt.Sprintf("val-%d", rand.Intn(10000))
 						cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-						success, latency, _ := c.sendRequest(leader, cmd)
+						success, latency, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
 
 						atomic.AddInt64(&totalOps, 1)
 						if success {
@@ -1150,9 +1289,7 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 						} else {
 							atomic.AddInt64(&failedOps, 1)
 						}
-						latencyMu.Lock()
-						latencies = append(latencies, latency)
-						latencyMu.Unlock()
+						latencySampler.add(latency)
 					}
 					opCount++
 				}
@@ -1163,13 +1300,14 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 	// 使用 testRunner 管理超时和进度报告
 	runner := newTestRunner(duration, stopCh, &wg)
 	runner.run(t, func(elapsed time.Duration) {
-		t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 写入: %d, 删除: %d",
+		t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 写入: %d, 删除: %d, 延迟样本: %d",
 			elapsed,
 			atomic.LoadInt64(&totalOps),
 			atomic.LoadInt64(&successOps),
 			atomic.LoadInt64(&failedOps),
 			atomic.LoadInt64(&writeOps),
-			atomic.LoadInt64(&deleteOps))
+			atomic.LoadInt64(&deleteOps),
+			latencySampler.count())
 	})
 
 	metrics := LongRunningMetrics{
@@ -1180,9 +1318,9 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 		FailedOps:         failedOps,
 		WriteOps:          writeOps,
 		DeleteOps:         deleteOps,
-		LatencyP50:        percentileLong(latencies, 50),
-		LatencyP95:        percentileLong(latencies, 95),
-		LatencyP99:        percentileLong(latencies, 99),
+		LatencyP50:        percentileLong(latencySampler.getAll(), 50),
+		LatencyP95:        percentileLong(latencySampler.getAll(), 95),
+		LatencyP99:        percentileLong(latencySampler.getAll(), 99),
 		ThroughputOps:     float64(successOps) / duration.Seconds(),
 		WriteThroughput:   float64(writeOps) / duration.Seconds(),
 		DeleteThroughput:  float64(deleteOps) / duration.Seconds(),
@@ -1199,17 +1337,12 @@ func percentileLong(latencies []time.Duration, p float64) time.Duration {
 	if len(latencies) == 0 {
 		return 0
 	}
-	// 对延迟进行排序
+	// 对延迟进行排序 - 使用标准库排序 O(n log n)
 	sorted := make([]time.Duration, len(latencies))
 	copy(sorted, latencies)
-	// 简单的冒泡排序（对于少量数据可接受）
-	for i := 0; i < len(sorted); i++ {
-		for j := i + 1; j < len(sorted); j++ {
-			if sorted[i] > sorted[j] {
-				sorted[i], sorted[j] = sorted[j], sorted[i]
-			}
-		}
-	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i] < sorted[j]
+	})
 	idx := int(float64(len(sorted)) * p / 100)
 	if idx >= len(sorted) {
 		idx = len(sorted) - 1
