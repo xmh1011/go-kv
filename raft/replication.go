@@ -521,11 +521,6 @@ func (r *Raft) dispatchEntries(entries []param.LogEntry) {
 
 			// 发送到 commitChan（不持有锁）
 			r.applyStateMachineCommand(entry)
-
-			if !ok {
-				// 调试日志：只在没有找到通知 channel 时打印
-				log.Infof("[Client] dispatchEntries: No notify channel found for index %d", entry.Index)
-			}
 		}
 
 		// 通知客户端（不持有锁）
