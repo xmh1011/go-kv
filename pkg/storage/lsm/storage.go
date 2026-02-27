@@ -129,6 +129,7 @@ func (s *StorageAdapter) GetState() (param.HardState, error) {
 }
 
 // AppendEntries 追加一批日志条目。
+// 优化：只在批量结束时更新元数据，减少写入次数
 func (s *StorageAdapter) AppendEntries(entries []param.LogEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -153,8 +154,12 @@ func (s *StorageAdapter) AppendEntries(entries []param.LogEntry) error {
 		}
 	}
 
-	// 持久化 LastIndex 和 LogSize
-	if err := s.saveMetadata(); err != nil {
+	// 批量写入完成后，只更新 LastIndex 和 LogSize
+	// FirstIndex 通常不变，无需每次更新
+	if err := s.saveLastIndex(); err != nil {
+		return err
+	}
+	if err := s.saveLogSize(); err != nil {
 		return err
 	}
 
