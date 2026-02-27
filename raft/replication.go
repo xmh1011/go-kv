@@ -102,6 +102,10 @@ func (r *Raft) replicateLogsToPeer(peerID int) {
 	}()
 }
 
+// MaxEntriesPerAppendEntries 限制单次 AppendEntries 发送的日志数量
+// 避免一次性发送过多日志导致超时和性能问题
+const MaxEntriesPerAppendEntries = 32
+
 // prepareAppendEntriesArgs 负责构建发送给对等节点的 AppendEntries RPC 参数。
 func (r *Raft) prepareAppendEntriesArgs(peerID int) (*param.AppendEntriesArgs, error) {
 	prevLogIndex := r.nextIndex[peerID] - 1
@@ -117,8 +121,13 @@ func (r *Raft) prepareAppendEntriesArgs(peerID int) (*param.AppendEntriesArgs, e
 		return nil, err
 	}
 	if r.nextIndex[peerID] <= lastLogIndex {
-		// 在生产环境中，存储层应提供一个高效的范围查询方法来代替循环。
-		for i := r.nextIndex[peerID]; i <= lastLogIndex; i++ {
+		// 限制单次发送的日志数量，避免一次性发送过多导致超时
+		endIndex := r.nextIndex[peerID] + uint64(MaxEntriesPerAppendEntries) - 1
+		if endIndex > lastLogIndex {
+			endIndex = lastLogIndex
+		}
+
+		for i := r.nextIndex[peerID]; i <= endIndex; i++ {
 			entry, err := r.store.GetEntry(i)
 			if err != nil || entry == nil {
 				log.Errorf("[Replication] Node %d failed to get entry %d from store: %v", r.id, i, err)
