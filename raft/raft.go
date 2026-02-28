@@ -404,29 +404,46 @@ func (r *Raft) performReadAfterApply(cmd param.KVCommand, reply *param.ClientRep
 
 // confirmLeadership 辅助方法：向所有节点发送轻量级心跳，并等待多数派确认。
 // 返回 true 表示确认成功（自己仍是 Leader）。
+//
+// 优化：将磁盘 I/O 操作（getLogTerm）移到锁外执行，减少锁持有时间。
 func (r *Raft) confirmLeadership() bool {
+	// 1. 快速路径检查（短锁）
 	r.mu.Lock()
+	now := time.Now()
+
+	// 检查是否为 Leader
+	if r.state != Leader {
+		r.mu.Unlock()
+		return false
+	}
 
 	// 优化1：使用缓存机制，避免短时间内频繁确认 Leadership
-	// 如果距离上次确认的时间小于缓存时间，直接返回 true
-	now := time.Now()
-	if r.state == Leader && !r.lastLeadershipConfirm.IsZero() && now.Sub(r.lastLeadershipConfirm) < r.leadershipCacheTime {
+	if !r.lastLeadershipConfirm.IsZero() && now.Sub(r.lastLeadershipConfirm) < r.leadershipCacheTime {
 		r.mu.Unlock()
 		return true
 	}
 
-	// 优化2：检查 lastAck 时间，如果在选举超时内有足够的最近确认，则跳过心跳发送
-	// 这可以减少在读取密集型场景下的网络和锁竞争
+	// 优化2：检查 Lease Read 租约是否有效
+	if r.readIndexMode == config.ReadIndexModeLease && now.Before(r.leaseUntil) {
+		r.mu.Unlock()
+		return true
+	}
+
+	// 获取需要的信息
 	term := r.currentTerm
 	leaderID := r.id
 	peerIDs := r.getAllPeerIDs()
+	electionTimeout := r.electionTimeout
+	leaseDuration := r.leaseDuration
+
+	// 检查 lastAck 时间
 	recentAcks := 0
 	for _, pid := range peerIDs {
 		if pid == r.id {
 			recentAcks++
 			continue
 		}
-		if lastAck, ok := r.lastAck[pid]; ok && now.Sub(lastAck) < r.electionTimeout {
+		if lastAck, ok := r.lastAck[pid]; ok && now.Sub(lastAck) < electionTimeout {
 			recentAcks++
 		}
 	}
@@ -434,72 +451,77 @@ func (r *Raft) confirmLeadership() bool {
 	if recentAcks >= majority {
 		// 已经有足够的最近确认，不需要发送心跳
 		log.Debugf("[ReadIndex] Node %d has enough recent acks (%d/%d), skipping heartbeat.", leaderID, recentAcks, majority)
-		// 更新缓存时间和租约
 		r.lastLeadershipConfirm = now
 		if r.readIndexMode == config.ReadIndexModeLease {
-			r.leaseUntil = now.Add(r.leaseDuration)
+			r.leaseUntil = now.Add(leaseDuration)
 			log.Debugf("[Lease Read] Node %d renewed lease until %v", r.id, r.leaseUntil)
 		}
 		r.mu.Unlock()
 		return true
 	}
 
-	// 构造心跳请求列表
-	// 我们需要为每个 Peer 构造 args，为了避免在循环网络发送时持有锁，
-	// 我们先在锁内准备好所有数据。
-	type hbRequest struct {
-		peerID int
-		args   *param.AppendEntriesArgs
+	// 收集需要发送心跳的 peer 和它们的 nextIndex
+	type peerInfo struct {
+		peerID    int
+		nextIndex uint64
 	}
-	var requests []hbRequest
+	var peersToSend []peerInfo
 
 	for _, pid := range peerIDs {
 		if pid == r.id {
 			continue
 		}
 
-		// 如果这个节点最近确认过，跳过它以减少网络负载
-		if lastAck, ok := r.lastAck[pid]; ok && now.Sub(lastAck) < r.electionTimeout {
-			recentAcks++
+		// 如果这个节点最近确认过，跳过它
+		if lastAck, ok := r.lastAck[pid]; ok && now.Sub(lastAck) < electionTimeout {
 			continue
 		}
 
-		// 尽量构造合法的 PrevLogIndex，虽然对于 Leadership 确认来说，
-		// 只要对方认可 Term 即可（即使 Log 不一致返回 false，只要 Term 没变也算确认）。
-		nextIDx, ok := r.nextIndex[pid]
-		if !ok || nextIDx == 0 {
-			// 防御性编程：如果 nextIndex 未初始化或为 0，避免下溢。
-			// 正常情况下 nextIndex 至少为 1 (FirstLogIndex)。
-			// 在测试中，如果手动构造 Raft 对象且未初始化 nextIndex，可能会触发此情况。
-			log.Warnf("[WARNING] Node %d found invalid nextIndex for peer %d: %d. Defaulting to 1.", r.id, pid, nextIDx)
-			nextIDx = 1
+		nextIdx := r.nextIndex[pid]
+		if nextIdx == 0 {
+			nextIdx = 1
 		}
-		prevLogIndex := nextIDx - 1
-		prevLogTerm, _ := r.getLogTerm(prevLogIndex) // 如果获取失败，默认为 0 也可以
-
-		// 构造空日志的 AppendEntries 作为心跳
-		args := param.NewAppendEntriesArgs(term, leaderID, prevLogIndex, prevLogTerm, r.commitIndex, nil)
-		requests = append(requests, hbRequest{pid, args})
+		peersToSend = append(peersToSend, peerInfo{pid, nextIdx})
 	}
+
+	commitIdx := r.commitIndex
 	r.mu.Unlock()
 
-	// 如果已经满足多数派，直接返回
-	if recentAcks >= majority {
+	// 2. 如果没有需要发送的 peer，直接返回成功
+	if len(peersToSend) == 0 {
+		r.mu.Lock()
+		r.lastLeadershipConfirm = time.Now()
+		r.mu.Unlock()
 		return true
 	}
 
-	// 用于收集确认结果的通道
+	// 3. 在锁外获取 prevLogTerm（磁盘 I/O）
+	type hbRequest struct {
+		peerID int
+		args   *param.AppendEntriesArgs
+	}
+	var requests []hbRequest
+
+	for _, pi := range peersToSend {
+		prevLogIndex := pi.nextIndex - 1
+		prevLogTerm, _ := r.getLogTerm(prevLogIndex) // 锁外执行磁盘 I/O
+
+		args := param.NewAppendEntriesArgs(term, leaderID, prevLogIndex, prevLogTerm, commitIdx, nil)
+		requests = append(requests, hbRequest{pi.peerID, args})
+	}
+
+	// 4. 并行发送心跳（网络 I/O，无锁）
 	ackChan := make(chan bool, len(requests))
 
-	// 并行发送心跳
 	for _, req := range requests {
 		go func(target int, args *param.AppendEntriesArgs) {
 			reply := param.NewAppendEntriesReply()
-			// 发送 RPC
 			if err := r.trans.SendAppendEntries(strconv.Itoa(target), args, reply); err == nil {
-				// 关键判断：如果对方返回的 Term 与我们一致，说明对方认可我们的 Leadership。
-				// 即使 reply.Success 为 false (日志冲突)，也不影响 Leadership 的确认。
 				if reply.Term == term {
+					// 更新 lastAck
+					r.mu.Lock()
+					r.lastAck[target] = time.Now()
+					r.mu.Unlock()
 					ackChan <- true
 				} else {
 					ackChan <- false
@@ -510,12 +532,9 @@ func (r *Raft) confirmLeadership() bool {
 		}(req.peerID, req.args)
 	}
 
-	// 统计票数
-	votes := recentAcks // 包括最近的确认
-
-	// 设置一个较短的超时时间，避免读请求无限阻塞
-	// 增加超时时间以应对高负载场景
-	timeout := time.After(r.electionTimeout * 2)
+	// 5. 统计票数
+	votes := recentAcks
+	timeout := time.After(electionTimeout * 2)
 
 	for i := 0; i < len(requests); i++ {
 		select {
@@ -524,7 +543,6 @@ func (r *Raft) confirmLeadership() bool {
 				votes++
 			}
 		case <-timeout:
-			// 超时未集齐多数派
 			log.Warnf("[ReadIndex] Node %d timed out waiting for heartbeat quorum.", leaderID)
 			return false
 		}
@@ -534,12 +552,12 @@ func (r *Raft) confirmLeadership() bool {
 		}
 	}
 
-	// 更新缓存时间和租约
+	// 6. 更新缓存时间和租约
 	r.mu.Lock()
 	now = time.Now()
 	r.lastLeadershipConfirm = now
 	if r.readIndexMode == config.ReadIndexModeLease && votes >= majority {
-		r.leaseUntil = now.Add(r.leaseDuration)
+		r.leaseUntil = now.Add(leaseDuration)
 		log.Debugf("[Lease Read] Node %d renewed lease until %v after heartbeat quorum", r.id, r.leaseUntil)
 	}
 	r.mu.Unlock()

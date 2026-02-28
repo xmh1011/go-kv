@@ -185,8 +185,8 @@ func TestInstallSnapshot(t *testing.T) {
 			setupMocks: func(s *storage.MockStorage, sm *storage.MockStateMachine) {
 				gomock.InOrder(
 					s.EXPECT().SaveSnapshot(gomock.Any()).Return(nil),
-					s.EXPECT().CompactLog(uint64(200)).Return(nil),
 					sm.EXPECT().ApplySnapshot([]byte("data")).Return(nil),
+					s.EXPECT().CompactLog(uint64(200)).Return(nil),
 				)
 			},
 			expectedError: nil,
@@ -218,7 +218,6 @@ func TestInstallSnapshot(t *testing.T) {
 			setupMocks: func(s *storage.MockStorage, sm *storage.MockStateMachine) {
 				gomock.InOrder(
 					s.EXPECT().SaveSnapshot(gomock.Any()).Return(nil),
-					s.EXPECT().CompactLog(uint64(200)).Return(nil),
 					sm.EXPECT().ApplySnapshot([]byte("corrupted")).Return(errors.New("failed")),
 				)
 			},
