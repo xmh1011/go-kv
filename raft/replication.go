@@ -73,9 +73,11 @@ func (r *Raft) determineReplicationAction(peerID int) replicationAction {
 
 // replicateLogsToPeer 封装了向单个 Peer 发送 AppendEntries RPC 的流程。
 // 为了实现流水线，这个函数会异步地发起 RPC，而不是阻塞等待。
+//
+// 优化：最小化锁持有时间，日志读取在持锁状态下执行（保证一致性），网络发送在锁外执行。
 func (r *Raft) replicateLogsToPeer(peerID int) {
 	r.mu.Lock()
-	// 准备 RPC 请求参数。
+	// 准备 RPC 请求参数（日志读取在锁内执行以保证一致性）
 	args, err := r.prepareAppendEntriesArgs(peerID)
 	if err != nil {
 		log.Errorf("[Replication] Node %d failed to prepare AppendEntries args for peer %d: %v", r.id, peerID, err)

@@ -731,30 +731,35 @@ func TestRun_FollowerStartsElectionOnTimeout(t *testing.T) {
 	// 1. 将状态设为 Follower
 	r.state = Follower
 	r.currentTerm = 1
-	// 2. 设置一个极短的、可预测的超时时间
+	// 2. 设置极短的超时时间，以便快速触发选举
+	r.heartbeatTimeout = 5 * time.Millisecond
 	r.currentElectionTimeout = 5 * time.Millisecond
 	r.electionResetEvent = time.Now()
 
 	// 3. 期望：当选举超时时，Run() 循环会调用 startElection()。
 	electionStartedChan := make(chan struct{})
 
+	// 使用 InOrder 确保调用顺序正确
 	// --- Pre-Vote 阶段 ---
-	// 1. 获取日志
-	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil)
-	// (日志为空，不需要 GetEntry)
-
+	// 1. 获取日志信息
+	// 2. 广播 Pre-Vote 请求（通过 SendRequestVote mock）
 	// --- Real Vote 阶段 ---
+	// 3. 成为 Candidate，持久化状态
+	// 4. 获取日志信息
+
 	gomock.InOrder(
-		// 2. 成为 Candidate，持久化状态
+		// Pre-Vote 阶段: 获取日志
+		mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil),
+		// Real Vote 阶段: 持久化状态
 		mockStore.EXPECT().SetState(param.HardState{CurrentTerm: 2, VotedFor: 1}).Return(nil).
 			Do(func(any) {
 				close(electionStartedChan) // 收到调用，发出信号
 			}),
-		// 3. startRealElection 还会获取日志信息
+		// Real Vote 阶段: 获取日志信息
 		mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil),
 	)
 
-	// 4. 选举启动后会广播投票请求 (Pre-Vote 和 Real Vote)
+	// 选举启动后会广播投票请求 (Pre-Vote 和 Real Vote)
 	mockTrans.EXPECT().SendRequestVote(gomock.Any(), gomock.Any(), gomock.Any()).
 		DoAndReturn(func(id string, args *param.RequestVoteArgs, reply *param.RequestVoteReply) error {
 			if args.PreVote {

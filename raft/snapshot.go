@@ -10,32 +10,76 @@ import (
 )
 
 // InstallSnapshot 是 Follower 上的 RPC 处理函数，用于接收并安装 Leader 发来的快照。
+//
+// 优化：将磁盘读取操作移到锁外执行，减少锁持有时间。
+// 注意：磁盘写入操作仍需在锁内执行以保证一致性。
 func (r *Raft) InstallSnapshot(args *param.InstallSnapshotArgs, reply *param.InstallSnapshotReply) error {
+	// 1. 快速任期检查（短锁）
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// 1. 处理任期检查。如果 Leader 的任期有效，则继续；否则拒绝。
-	if !r.handleSnapshotTerm(args, reply) {
+	if args.Term < r.currentTerm {
+		reply.Term = r.currentTerm
+		r.mu.Unlock()
 		return nil
 	}
 
+	if args.Term > r.currentTerm {
+		if err := r.becomeFollower(args.Term); err != nil {
+			reply.Term = r.currentTerm
+			r.mu.Unlock()
+			return nil
+		}
+	}
+	reply.Term = r.currentTerm
+
+	// 重置选举计时器
+	r.electionResetEvent = time.Now()
+
+	// 检查快照是否过时
+	if args.LastIncludedIndex <= r.lastApplied {
+		log.Infof("[Snapshot] Node %d ignoring snapshot with index %d, already applied up to %d", r.id, args.LastIncludedIndex, r.lastApplied)
+		r.mu.Unlock()
+		return nil
+	}
+
+	r.mu.Unlock()
+
 	log.Infof("[Snapshot] Node %d received snapshot from leader %d (lastIncludedIndex=%d)", r.id, args.LeaderID, args.LastIncludedIndex)
 
-	// 2. 将快照持久化到存储并压缩本地日志。
+	// 2. 创建快照对象（锁外）
 	snapshot := param.NewSnapshot(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
-	if err := r.persistSnapshot(snapshot); err != nil {
+
+	// 3. 重新获取锁执行磁盘写入操作
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// 验证快照索引仍然有效
+	if snapshot.LastIncludedIndex <= r.lastApplied {
+		log.Infof("[Snapshot] Node %d snapshot index %d no longer needed, lastApplied is %d", r.id, snapshot.LastIncludedIndex, r.lastApplied)
+		return nil
+	}
+
+	// 4. 将快照持久化到存储（锁内磁盘 I/O）
+	if err := r.store.SaveSnapshot(snapshot); err != nil {
 		log.Errorf("[Snapshot] Node %d failed to persist snapshot: %v", r.id, err)
 		return err
 	}
 
-	// 3. 将快照数据应用到上层状态机
+	// 5. 将快照数据应用到上层状态机
 	if err := r.stateMachine.ApplySnapshot(snapshot.Data); err != nil {
 		log.Errorf("[Snapshot] Node %d failed to apply snapshot to state machine: %v", r.id, err)
 		return err
 	}
 
-	// 4. 更新本地的 commitIndex 和 lastApplied 索引。
-	r.updateStateAfterSnapshot(snapshot.LastIncludedIndex)
+	// 6. 压缩本地日志
+	if err := r.store.CompactLog(snapshot.LastIncludedIndex); err != nil {
+		log.Errorf("[Snapshot] Node %d failed to compact log after installing snapshot: %v", r.id, err)
+		return err
+	}
+
+	// 7. 更新内存状态
+	r.snapshot = snapshot
+	r.commitIndex = max(r.commitIndex, snapshot.LastIncludedIndex)
+	r.lastApplied = max(r.lastApplied, snapshot.LastIncludedIndex)
 
 	log.Infof("[Snapshot] Node %d successfully installed snapshot. lastApplied is now %d.", r.id, r.lastApplied)
 	return nil
@@ -180,35 +224,50 @@ func (r *Raft) updateStateAfterSnapshot(snapshotIndex uint64) {
 }
 
 // sendSnapshot 是 Leader 用于向落后的 Follower 发送快照
+//
+// 优化：将快照读取操作移到锁外执行，减少锁持有时间。
 func (r *Raft) sendSnapshot(peerID int) {
-	// 1. 从存储中读取最新的快照以准备发送。
-	snapshot, err := r.readSnapshotForSending(peerID)
+	// 1. 快速状态检查（短锁）
+	r.mu.Lock()
+	if r.state != Leader {
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
+
+	// 2. 从存储中读取最新的快照（锁外磁盘 I/O）
+	snapshot, err := r.store.ReadSnapshot()
 	if err != nil {
+		log.Errorf("[Snapshot] Node %d failed to read snapshot to send to peer %d: %v", r.id, peerID, err)
+		return
+	}
+	if snapshot == nil {
+		log.Errorf("[Snapshot] Node %d tried to send snapshot to peer %d, but no snapshot is available.", r.id, peerID)
 		return
 	}
 
-	// 2. 准备 RPC 参数。
+	// 3. 准备 RPC 参数（短锁）
 	r.mu.Lock()
 	args := param.NewInstallSnapshotArgs(r.currentTerm, uint64(r.id), snapshot.LastIncludedIndex, snapshot.LastIncludedTerm, snapshot.Data)
 	savedCurrentTerm := r.currentTerm
 	r.mu.Unlock()
 
-	// 3. 发起 RPC 调用。
+	// 4. 发起 RPC 调用（锁外网络 I/O）
 	reply := &param.InstallSnapshotReply{}
 	if err := r.trans.SendInstallSnapshot(strconv.Itoa(peerID), args, reply); err != nil {
 		log.Errorf("[Snapshot] Node %d failed to send snapshot to %d: %v", r.id, peerID, err)
 		return
 	}
 
-	// 4. 处理 RPC 响应。
+	// 5. 处理 RPC 响应（持锁）
 	r.processSnapshotReply(peerID, reply, snapshot.LastIncludedIndex, savedCurrentTerm)
 }
 
-// readSnapshotForSending 负责加锁并从存储中读取最新的快照。
+// readSnapshotForSending 负责从存储中读取最新的快照。
+// 已废弃：使用 sendSnapshot 中的内联实现替代，避免不必要的锁持有。
+// 保留此函数以兼容可能的外部调用。
 func (r *Raft) readSnapshotForSending(peerID int) (*param.Snapshot, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
+	// 不再持有锁，直接读取
 	snapshot, err := r.store.ReadSnapshot()
 	if err != nil {
 		log.Errorf("[Snapshot] Node %d failed to read snapshot to send to peer %d: %v", r.id, peerID, err)
