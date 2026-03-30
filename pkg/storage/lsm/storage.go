@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/gob"
 	"fmt"
+	"strconv"
 	"sync"
 
 	"github.com/xmh1011/go-kv/engine/lsm/database"
@@ -17,6 +18,7 @@ const (
 	keyFirstIndex = "meta:first_index"
 	keyLastIndex  = "meta:last_index"
 	keyLogSize    = "meta:log_size"
+	keyLogMeta    = "meta:log_meta" // 合并 firstIndex + lastIndex + logSize
 	keySnapshot   = "meta:snapshot"
 	logKeyPrefix  = "log:"
 )
@@ -43,8 +45,21 @@ func NewStorageAdapter(db *database.Database) (*StorageAdapter, error) {
 }
 
 func (s *StorageAdapter) init() error {
-	// 恢复 FirstIndex
-	val, err := s.db.Get(keyFirstIndex)
+	// 优先从合并 key 读取 (firstIndex + lastIndex + logSize)
+	val, err := s.db.Get(keyLogMeta)
+	if err != nil {
+		return fmt.Errorf("get log meta failed: %w", err)
+	}
+	if val != nil && len(val) == 24 {
+		s.firstIndex = binary.BigEndian.Uint64(val[0:8])
+		s.lastIndex = binary.BigEndian.Uint64(val[8:16])
+		s.logSize = int(binary.BigEndian.Uint64(val[16:24]))
+		log.Infof("[LSMStorage] Initialized. FirstIndex: %d, LastIndex: %d, LogSize: %d", s.firstIndex, s.lastIndex, s.logSize)
+		return nil
+	}
+
+	// 兼容旧格式：分别从三个 key 读取
+	val, err = s.db.Get(keyFirstIndex)
 	if err != nil {
 		return fmt.Errorf("get first index failed: %w", err)
 	}
@@ -57,7 +72,6 @@ func (s *StorageAdapter) init() error {
 		s.firstIndex = 1 // 默认为 1
 	}
 
-	// 恢复 LastIndex
 	val, err = s.db.Get(keyLastIndex)
 	if err != nil {
 		return fmt.Errorf("get last index failed: %w", err)
@@ -71,7 +85,6 @@ func (s *StorageAdapter) init() error {
 		s.lastIndex = 0
 	}
 
-	// 恢复 LogSize
 	val, err = s.db.Get(keyLogSize)
 	if err != nil {
 		return fmt.Errorf("get log size failed: %w", err)
@@ -90,7 +103,17 @@ func (s *StorageAdapter) init() error {
 }
 
 func (s *StorageAdapter) getLogKey(index uint64) string {
-	return fmt.Sprintf("%s%020d", logKeyPrefix, index)
+	// 手动零填充，避免 fmt.Sprintf 的解析和分配开销
+	num := strconv.FormatUint(index, 10)
+	var buf [24]byte // "log:" (4) + 20 digits
+	copy(buf[:4], logKeyPrefix)
+	// 零填充
+	padLen := 20 - len(num)
+	for i := 0; i < padLen; i++ {
+		buf[4+i] = '0'
+	}
+	copy(buf[4+padLen:], num)
+	return string(buf[:24])
 }
 
 // SetState 原子地设置 HardState (currentTerm, votedFor)。
@@ -128,6 +151,47 @@ func (s *StorageAdapter) GetState() (param.HardState, error) {
 	return state, nil
 }
 
+// encodeLogEntry 使用自定义二进制编码: Term(8) + Index(8) + CmdLen(4) + CmdBytes
+// 其中 CmdBytes 仍使用 gob 编码 Command 字段（因为 Command 是 any 类型）
+func encodeLogEntry(entry *param.LogEntry) ([]byte, error) {
+	// gob 编码 Command
+	var cmdBuf bytes.Buffer
+	if err := gob.NewEncoder(&cmdBuf).Encode(&entry.Command); err != nil {
+		return nil, err
+	}
+	cmdBytes := cmdBuf.Bytes()
+
+	// 二进制编码: Term(8) + Index(8) + CmdLen(4) + CmdBytes
+	buf := make([]byte, 8+8+4+len(cmdBytes))
+	binary.BigEndian.PutUint64(buf[0:8], entry.Term)
+	binary.BigEndian.PutUint64(buf[8:16], entry.Index)
+	binary.BigEndian.PutUint32(buf[16:20], uint32(len(cmdBytes)))
+	copy(buf[20:], cmdBytes)
+	return buf, nil
+}
+
+// decodeLogEntry 解码自定义二进制格式的 LogEntry
+func decodeLogEntry(data []byte) (*param.LogEntry, error) {
+	if len(data) < 20 {
+		return nil, fmt.Errorf("invalid log entry data: too short (%d bytes)", len(data))
+	}
+
+	entry := &param.LogEntry{
+		Term:  binary.BigEndian.Uint64(data[0:8]),
+		Index: binary.BigEndian.Uint64(data[8:16]),
+	}
+	cmdLen := binary.BigEndian.Uint32(data[16:20])
+	if uint32(len(data)-20) < cmdLen {
+		return nil, fmt.Errorf("invalid log entry data: command truncated")
+	}
+
+	// gob 解码 Command
+	if err := gob.NewDecoder(bytes.NewReader(data[20:20+cmdLen])).Decode(&entry.Command); err != nil {
+		return nil, err
+	}
+	return entry, nil
+}
+
 // AppendEntries 追加一批日志条目。
 // 优化：只在批量结束时更新元数据，减少写入次数
 func (s *StorageAdapter) AppendEntries(entries []param.LogEntry) error {
@@ -135,11 +199,10 @@ func (s *StorageAdapter) AppendEntries(entries []param.LogEntry) error {
 	defer s.mu.Unlock()
 
 	for _, entry := range entries {
-		var buf bytes.Buffer
-		if err := gob.NewEncoder(&buf).Encode(entry); err != nil {
+		data, err := encodeLogEntry(&entry)
+		if err != nil {
 			return err
 		}
-		data := buf.Bytes()
 
 		key := s.getLogKey(entry.Index)
 		if err := s.db.Put(key, data); err != nil {
@@ -154,12 +217,8 @@ func (s *StorageAdapter) AppendEntries(entries []param.LogEntry) error {
 		}
 	}
 
-	// 批量写入完成后，只更新 LastIndex 和 LogSize
-	// FirstIndex 通常不变，无需每次更新
-	if err := s.saveLastIndex(); err != nil {
-		return err
-	}
-	if err := s.saveLogSize(); err != nil {
+	// 批量写入完成后，一次性保存所有 metadata
+	if err := s.saveLogMeta(); err != nil {
 		return err
 	}
 
@@ -175,11 +234,7 @@ func (s *StorageAdapter) GetEntry(index uint64) (*param.LogEntry, error) {
 	if val == nil {
 		return nil, nil
 	}
-	var entry param.LogEntry
-	if err := gob.NewDecoder(bytes.NewReader(val)).Decode(&entry); err != nil {
-		return nil, err
-	}
-	return &entry, nil
+	return decodeLogEntry(val)
 }
 
 // TruncateLog 删除从 fromIndex (包含) 到日志末尾的所有条目。
@@ -297,35 +352,13 @@ func (s *StorageAdapter) Close() error {
 }
 
 func (s *StorageAdapter) saveMetadata() error {
-	// 保存 FirstIndex
-	if err := s.saveFirstIndex(); err != nil {
-		return err
-	}
-	// 保存 LastIndex
-	if err := s.saveLastIndex(); err != nil {
-		return err
-	}
-	// 保存 LogSize
-	if err := s.saveLogSize(); err != nil {
-		return err
-	}
-	return nil
+	return s.saveLogMeta()
 }
 
-func (s *StorageAdapter) saveFirstIndex() error {
-	data := make([]byte, 8)
-	binary.BigEndian.PutUint64(data, s.firstIndex)
-	return s.db.Put(keyFirstIndex, data)
-}
-
-func (s *StorageAdapter) saveLastIndex() error {
-	data := make([]byte, 8)
-	binary.BigEndian.PutUint64(data, s.lastIndex)
-	return s.db.Put(keyLastIndex, data)
-}
-
-func (s *StorageAdapter) saveLogSize() error {
-	data := make([]byte, 8)
-	binary.BigEndian.PutUint64(data, uint64(s.logSize))
-	return s.db.Put(keyLogSize, data)
+func (s *StorageAdapter) saveLogMeta() error {
+	data := make([]byte, 24)
+	binary.BigEndian.PutUint64(data[0:8], s.firstIndex)
+	binary.BigEndian.PutUint64(data[8:16], s.lastIndex)
+	binary.BigEndian.PutUint64(data[16:24], uint64(s.logSize))
+	return s.db.Put(keyLogMeta, data)
 }

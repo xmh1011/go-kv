@@ -125,10 +125,8 @@ func (d *Database) createNewSSTable(imem *memtable.IMemTable) {
 		return
 	}
 	log.Info("[Database] MemTable full, flushing to SSTable")
-	err := d.SSTables.CreateNewSSTable(imem)
-	if err != nil {
+	if err := d.SSTables.CreateNewSSTable(imem); err != nil {
 		log.Errorf("[Database] Create new sstable error: %s", err.Error())
-		return
 	}
 }
 

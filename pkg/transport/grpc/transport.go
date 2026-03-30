@@ -690,7 +690,17 @@ func (t *Transport) ClientRequest(ctx context.Context, req *pb.ClientRequestRequ
 // ==================== Helper functions for encoding/decoding ====================
 
 func encode(v any) ([]byte, error) {
+	// 快速路径：如果 Command 已经是 []byte，直接返回带标记前缀
+	if b, ok := v.([]byte); ok {
+		// 前缀 0x01 表示原始 bytes
+		result := make([]byte, 1+len(b))
+		result[0] = 0x01
+		copy(result[1:], b)
+		return result, nil
+	}
+	// 慢路径：gob 编码，前缀 0x00 表示 gob
 	var buf bytes.Buffer
+	buf.WriteByte(0x00)
 	if err := gob.NewEncoder(&buf).Encode(&v); err != nil {
 		return nil, err
 	}
@@ -698,12 +708,28 @@ func encode(v any) ([]byte, error) {
 }
 
 func decode(data []byte) (any, error) {
-	var v any
 	if len(data) == 0 {
 		return nil, nil
 	}
-	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&v); err != nil {
-		return nil, err
+	switch data[0] {
+	case 0x01:
+		// 原始 bytes
+		b := make([]byte, len(data)-1)
+		copy(b, data[1:])
+		return b, nil
+	case 0x00:
+		// gob 编码
+		var v any
+		if err := gob.NewDecoder(bytes.NewReader(data[1:])).Decode(&v); err != nil {
+			return nil, err
+		}
+		return v, nil
+	default:
+		// 兼容旧格式（无前缀的 gob 编码）
+		var v any
+		if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&v); err != nil {
+			return nil, err
+		}
+		return v, nil
 	}
-	return v, nil
 }
