@@ -13,6 +13,7 @@
 package wal
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -33,6 +34,7 @@ const (
 // 如果WAL是单实例、全局持久化日志文件（common to all MemTables），多个协程可能同时写入或重放数据，必须加锁。
 type WAL struct {
 	file *os.File
+	buf  *bufio.Writer
 	path string
 }
 
@@ -56,6 +58,7 @@ func NewWAL(id uint64, dirPath string) (*WAL, error) {
 		log.Errorf("[WAL] Failed to open WAL file: %s", err.Error())
 		return nil, err
 	}
+	wal.buf = bufio.NewWriterSize(wal.file, 32*1024) // 32KB buffer
 	log.Debugf("[WAL] Created new WAL file: %s", wal.path)
 	return wal, nil
 }
@@ -65,20 +68,31 @@ func CreateWalPath(id uint64, walDirectoryPath string) string {
 	return filepath.Join(walDirectoryPath, fmt.Sprintf("%v.%s", id, defaultWALFileSuffix))
 }
 
-// Sync flushes the file to disk.
+// Sync flushes the buffer and file to disk.
 func (w *WAL) Sync() error {
 	if w.file == nil {
 		return nil
 	}
+	if w.buf != nil {
+		if err := w.buf.Flush(); err != nil {
+			return err
+		}
+	}
 	return w.file.Sync()
 }
 
-// Close closes the WAL file.
+// Close flushes the buffer and closes the WAL file.
 func (w *WAL) Close() error {
 	if w.file == nil {
 		return nil
 	}
 	log.Debugf("[WAL] Closing WAL file: %s", w.path)
+	if w.buf != nil {
+		if err := w.buf.Flush(); err != nil {
+			return err
+		}
+		w.buf = nil
+	}
 	err := w.file.Close()
 	w.file = nil
 	return err
@@ -91,14 +105,20 @@ func (w *WAL) DeleteFile() error {
 	return os.Remove(w.path)
 }
 
-// Append writes a KeyValuePair in JSON format to the WAL file.
+// Append writes a KeyValuePair in binary format to the WAL buffer and flushes to disk.
 func (w *WAL) Append(pair kv.KeyValuePair) error {
 	if w.file == nil {
 		return fmt.Errorf("wal file is closed")
 	}
-	if err := pair.EncodeTo(w.file); err != nil {
+	if err := pair.EncodeTo(w.buf); err != nil {
 		log.Errorf("[WAL] Failed to write wal, key: %s, error: %s", pair.Key, err.Error())
 		return fmt.Errorf("failed to write wal, key: %s: %w", pair.Key, err)
+	}
+
+	// Flush buffer to ensure data is written to OS file for crash recovery
+	if err := w.buf.Flush(); err != nil {
+		log.Errorf("[WAL] Failed to flush wal buffer: %s", err.Error())
+		return fmt.Errorf("failed to flush wal: %w", err)
 	}
 
 	return nil
@@ -134,5 +154,5 @@ func Recover(path string, callback func(pair kv.KeyValuePair)) (*WAL, error) {
 	}
 
 	log.Infof("[WAL] Recovered %d entries from %s", count, path)
-	return &WAL{file: file, path: path}, nil
+	return &WAL{file: file, buf: bufio.NewWriterSize(file, 32*1024), path: path}, nil
 }

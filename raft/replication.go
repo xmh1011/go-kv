@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"strconv"
 	"time"
 
@@ -131,9 +132,13 @@ func (r *Raft) prepareAppendEntriesArgs(peerID int) (*param.AppendEntriesArgs, e
 
 		for i := r.nextIndex[peerID]; i <= endIndex; i++ {
 			entry, err := r.store.GetEntry(i)
-			if err != nil || entry == nil {
+			if err != nil {
 				log.Errorf("[Replication] Node %d failed to get entry %d from store: %v", r.id, i, err)
 				return nil, err
+			}
+			if entry == nil {
+				log.Errorf("[Raft] Log entry at index %d not found", i)
+				return nil, fmt.Errorf("log entry at index %d not found", i)
 			}
 			entries = append(entries, *entry)
 		}
@@ -278,32 +283,33 @@ func (r *Raft) isReplicatedByMajority(index uint64) bool {
 }
 
 // AppendEntries 是 Follower 节点上的 RPC 处理函数，用于接收 Leader 的心跳和日志。
-// 任期检查: 如果请求的任期号小于自己的当前任期，则拒绝。如果大于，则更新自己的任期并转为 Follower。
-// 一致性检查: 检查 PrevLogIndex 和 PrevLogTerm 是否与自己的日志匹配。如果不匹配，则拒绝请求并返回冲突信息，帮助 Leader 快速定位不一致点。
-// 日志追加: 如果一致性检查通过，则将新的日志条目追加到自己的日志中。
-// 更新 CommitIndex: 根据 Leader 发来的 LeaderCommit 来更新自己的 commitIndex。
 func (r *Raft) AppendEntries(args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// 1. 处理任期检查和心跳。如果 Leader 的任期小于自己，直接拒绝。
-	// 如果大于，则转为 Follower。无论哪种情况，只要是合法的 Leader，就重置选举计时器。
+	// 1. 处理任期检查和心跳。
 	if !r.handleTermAndHeartbeat(args, reply) {
 		return nil
 	}
 
 	// 2. 进行日志一致性检查。
-	// 验证本地日志在 prevLogIndex 处是否与 Leader 发来的信息匹配。
 	if ok := r.checkLogConsistency(args, reply); !ok {
 		return nil
 	}
 
 	// 3. 追加并存储新的日志条目。
-	// 如果 Leader 发来了新的日志，则截断本地可能存在的冲突日志，并追加新日志。
-	if err := r.appendAndStoreEntries(args); err != nil {
-		reply.Success = false
-		log.Errorf("[Replication] Node %d failed to append entries: %v", r.id, err)
-		return err
+	if len(args.Entries) > 0 {
+		if err := r.store.TruncateLog(args.PrevLogIndex + 1); err != nil {
+			log.Errorf("[Replication] Node %d failed to truncate log: %v", r.id, err)
+			reply.Success = false
+			return err
+		}
+		if err := r.store.AppendEntries(args.Entries); err != nil {
+			log.Errorf("[Replication] Node %d failed to append entries to store: %v", r.id, err)
+			reply.Success = false
+			return err
+		}
+		log.Infof("[Log Replication] Node %d accepted and stored %d new entries from leader %d", r.id, len(args.Entries), args.LeaderID)
 	}
 
 	// 4. 根据 Leader 的进度更新本地的 commitIndex。
@@ -384,45 +390,21 @@ func (r *Raft) checkLogConsistency(args *param.AppendEntriesArgs, reply *param.A
 	return true
 }
 
-// appendAndStoreEntries 负责将 Leader 发来的新日志条目追加到本地存储中。
-// 它会先截断任何可能存在的冲突日志。
-func (r *Raft) appendAndStoreEntries(args *param.AppendEntriesArgs) error {
-	// 仅当 Leader 发来了新的日志条目时才执行操作。
-	if len(args.Entries) > 0 {
-		// 1. 截断从 prevLogIndex + 1 开始的所有本地日志，以解决任何潜在的冲突。
-		if err := r.store.TruncateLog(args.PrevLogIndex + 1); err != nil {
-			log.Errorf("[Replication] Node %d failed to truncate log: %v", r.id, err)
-			return err
-		}
-		// 2. 将 Leader 发来的新日志原子性地追加到存储中。
-		if err := r.store.AppendEntries(args.Entries); err != nil {
-			log.Errorf("[Replication] Node %d failed to append entries to store: %v", r.id, err)
-			return err
-		}
-		log.Infof("[Log Replication] Node %d accepted and stored %d new entries from leader %d", r.id, len(args.Entries), args.LeaderID)
-	}
-	return nil
-}
-
 // updateFollowerCommitIndex 根据 Leader 发来的 leaderCommit 更新 Follower 的 commitIndex。
 func (r *Raft) updateFollowerCommitIndex(args *param.AppendEntriesArgs) {
-	// 如果 Leader 的 commitIndex 大于 Follower 的 commitIndex，说明有新的日志可以被提交。
 	if args.LeaderCommit > r.commitIndex {
-		// Follower 的 commitIndex 不能超过其本地日志的最大索引。
 		newLastLogIndex, err := r.store.LastLogIndex()
 		if err != nil {
 			log.Errorf("[Replication] Node %d failed to get last log index: %v", r.id, err)
 			return
 		}
 		oldCommitIndex := r.commitIndex
-		// 只更新到确实存在的日志索引
 		if args.LeaderCommit <= newLastLogIndex {
 			r.commitIndex = args.LeaderCommit
 		} else {
 			r.commitIndex = newLastLogIndex
 		}
 
-		// 如果 commitIndex 确实被推进了，则在后台启动一个 goroutine 应用这些新提交的日志。
 		if r.commitIndex > oldCommitIndex {
 			log.Infof("[Log Replication] Node %d advances commitIndex to %d", r.id, r.commitIndex)
 			go r.applyLogs()
@@ -455,27 +437,21 @@ func (r *Raft) fetchEntriesToApply() ([]param.LogEntry, uint64) {
 	defer r.mu.Unlock()
 
 	var entries []param.LogEntry
-	// 检查是否有需要应用的日志。
 	if r.commitIndex > r.lastApplied {
-		// 先获取最后一个日志索引作为边界检查
 		lastLogIndex, err := r.store.LastLogIndex()
 		if err != nil {
 			log.Errorf("[Replication] Node %d failed to get last log index while applying: %v", r.id, err)
 			return entries, r.lastApplied
 		}
 
-		// 确保 commitIndex 不超过存储中的最大索引
 		if r.commitIndex > lastLogIndex {
 			log.Warnf("[Replication] Node %d commitIndex %d exceeds lastLogIndex %d, clamping", r.id, r.commitIndex, lastLogIndex)
 			r.commitIndex = lastLogIndex
 		}
 
-		// 循环从存储中逐条读取已提交的日志。
 		for i := r.lastApplied + 1; i <= r.commitIndex; i++ {
 			entry, err := r.store.GetEntry(i)
 			if err != nil || entry == nil {
-				// 这是一个严重错误：如果一个日志被标记为已提交，它必须存在于存储中。
-				// 在生产环境中，这可能需要让节点 panic 或安全地关闭。
 				log.Fatalf("[FATAL] Node %d could not retrieve committed log entry %d to apply it. Error: %v", r.id, i, err)
 				return nil, 0
 			}
@@ -483,13 +459,9 @@ func (r *Raft) fetchEntriesToApply() ([]param.LogEntry, uint64) {
 		}
 	}
 
-	// 记录应用前的 lastApplied 索引，用于日志输出。
 	lastAppliedBeforeUpdate := r.lastApplied
-	// 如果成功获取了日志，则原子性地更新 lastApplied 索引。
 	if len(entries) > 0 {
 		r.lastApplied = entries[len(entries)-1].Index
-		// 唤醒所有在 handleLinearizableRead 中
-		// 等待 lastApplied 追赶的 goroutine。
 		r.lastAppliedCond.Broadcast()
 	}
 

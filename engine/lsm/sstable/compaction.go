@@ -144,10 +144,10 @@ func (m *Manager) compactLevel(level int) error {
 
 // waitCompaction 等待指定层级的压缩完成
 func (m *Manager) waitCompaction(level int) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	for m.isLevelCompacting(level) {
+	for m.compactingLevels[level] {
 		log.Debugf("[Compaction] Level %d is compacting, waiting...", level)
 		m.compactionCond.Wait()
 	}
@@ -169,14 +169,6 @@ func (m *Manager) endCompaction(level int) {
 
 	delete(m.compactingLevels, level)
 	m.compactionCond.Broadcast()
-}
-
-// isLevelCompacting 检查层级是否正在压缩
-func (m *Manager) isLevelCompacting(level int) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	return m.compactingLevels[level]
 }
 
 // loadLevelData 加载指定层级的所有键值对

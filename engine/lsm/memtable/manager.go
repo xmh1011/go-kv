@@ -83,13 +83,8 @@ func (m *Manager) Delete(key kv.Key) (*IMemTable, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if err := m.Mem.Delete(key); err != nil {
-		log.Errorf("[MemTableManager] Delete memtable error: %s", err.Error())
-		return nil, fmt.Errorf("delete memtable error: %w", err)
-	}
-
-	// 如果 memtable 中没有这个 key，但是说明有可能存在于内存中的 imemtable
-	// 而 imemtable 是不可变的，所以这时候需要在 memtable 中插入一条 deleted 记录
+	// 直接插入 tombstone 标记即可，无需先调用 m.Mem.Delete(key)
+	// m.Mem.Delete 会写一次 WAL，然后 Insert 又会写一次，造成双写
 	pair := kv.KeyValuePair{
 		Key:   key,
 		Value: kv.DeletedValue,

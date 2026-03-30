@@ -343,41 +343,36 @@ func (r *Raft) performReadAfterApply(cmd param.KVCommand, reply *param.ClientRep
 
 	// 设置超时：使用选举超时的 2 倍作为读请求超时
 	timeout := r.electionTimeout * 2
-	timeoutCh := make(chan struct{})
+	timedOut := false
 
-	// 启动一个 goroutine 在超时后广播条件变量
-	go func() {
-		time.Sleep(timeout)
-		close(timeoutCh)
+	// 使用 time.AfterFunc 替代 goroutine+time.Sleep，避免 goroutine 泄漏
+	timer := time.AfterFunc(timeout, func() {
 		r.lastAppliedCond.Broadcast() // 超时时广播，唤醒等待者
-	}()
+	})
+	defer timer.Stop() // 确保读完成后取消定时器
 
 	// 等待状态机追赶上 ReadIndex，同时在每次唤醒时检查 Leader 状态和超时
+	deadline := time.Now().Add(timeout)
 	for r.lastApplied < readIndex && r.state == Leader {
-		// 检查是否超时
-		select {
-		case <-timeoutCh:
-			log.Warnf("[ReadIndex] Node %d timed out waiting for lastApplied to reach %d (current: %d)", r.id, readIndex, r.lastApplied)
-			reply.Success = false
-			reply.Result = "read timeout"
-			return nil
-		default:
-			// 继续等待
+		if time.Now().After(deadline) {
+			timedOut = true
+			break
 		}
 
 		// sync.Cond.Wait() 会释放锁并等待，被唤醒后重新获取锁
 		r.lastAppliedCond.Wait()
 
-		// 被唤醒后再次检查超时
-		select {
-		case <-timeoutCh:
-			log.Warnf("[ReadIndex] Node %d timed out waiting for lastApplied to reach %d (current: %d)", r.id, readIndex, r.lastApplied)
-			reply.Success = false
-			reply.Result = "read timeout"
-			return nil
-		default:
-			// 继续检查条件
+		if time.Now().After(deadline) {
+			timedOut = true
+			break
 		}
+	}
+
+	if timedOut {
+		log.Warnf("[ReadIndex] Node %d timed out waiting for lastApplied to reach %d (current: %d)", r.id, readIndex, r.lastApplied)
+		reply.Success = false
+		reply.Result = "read timeout"
+		return nil
 	}
 
 	// 检查是否因为 Leader 被降级或节点停止而退出循环
