@@ -160,7 +160,7 @@ func (r *Raft) TakeSnapshot() {
 		r.mu.Lock()
 
 		// 再次检查状态（防止在 IO 期间节点关闭或状态剧烈变化）
-		if r.state == Dead {
+		if r.getState() == Dead {
 			r.mu.Unlock()
 			return
 		}
@@ -229,7 +229,7 @@ func (r *Raft) updateStateAfterSnapshot(snapshotIndex uint64) {
 func (r *Raft) sendSnapshot(peerID int) {
 	// 1. 快速状态检查（短锁）
 	r.mu.Lock()
-	if r.state != Leader {
+	if r.getState() != Leader {
 		r.mu.Unlock()
 		return
 	}
@@ -286,7 +286,7 @@ func (r *Raft) processSnapshotReply(peerID int, reply *param.InstallSnapshotRepl
 	defer r.mu.Unlock()
 
 	// 检查响应是否已过期（例如，在 RPC 通信期间，Leader 身份或任期已发生变化）。
-	if r.currentTerm != savedCurrentTerm || r.state != Leader {
+	if r.currentTerm != savedCurrentTerm || r.getState() != Leader {
 		return
 	}
 

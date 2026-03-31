@@ -23,6 +23,7 @@ func TestNewRaft_RecoveryState(t *testing.T) {
 	mockStore := storage.NewMockStorage(ctrl)
 	persistedState := param.HardState{CurrentTerm: 5, VotedFor: 2}
 	mockStore.EXPECT().GetState().Return(persistedState, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 	r := NewRaft(1, []int{2, 3}, mockStore, nil, nil, nil)
 	assert.Equal(t, persistedState.CurrentTerm, r.currentTerm, "recovered term should match")
 	assert.Equal(t, int(persistedState.VotedFor), r.votedFor, "recovered votedFor should match")
@@ -115,17 +116,22 @@ func TestSubmit(t *testing.T) {
 			// but using NewRaft is safer to ensure consistent initialization.
 			var r *Raft
 			if tt.initialState.state == Follower && tt.setupMocks == nil {
-				r = &Raft{state: Follower}
+				r = &Raft{
+					shutdownChan: make(chan struct{}),
+					proposalCh:   make(chan proposalRequest, proposalChSize),
+				}
+				r.setState(Follower)
 			} else {
 				r = NewRaft(1, peerIDs, mockStore, mockSM, mockTrans, nil)
 				r.currentTerm = tt.initialState.term
-				r.state = tt.initialState.state
-				if r.state == Leader {
+				r.setState(tt.initialState.state)
+				if r.getState() == Leader {
 					lastLogIndex := uint64(5)
 					for _, peerID := range peerIDs {
 						r.nextIndex[peerID] = lastLogIndex + 1
 						r.matchIndex[peerID] = 0
 					}
+					go r.proposalBatcher()
 				}
 			}
 
@@ -229,11 +235,12 @@ func TestChangeConfig(t *testing.T) {
 
 			var r *Raft
 			if tt.initialState.inJointConsensus {
-				r = &Raft{state: Leader, inJointConsensus: true}
+				r = &Raft{inJointConsensus: true}
+				r.setState(Leader)
 			} else {
 				r = NewRaft(1, currentPeers, mockStore, mockSM, mockTrans, nil)
 				r.currentTerm = tt.initialState.term
-				r.state = tt.initialState.state
+				r.setState(tt.initialState.state)
 				lastLogIndex := uint64(10)
 				for _, peerID := range currentPeers {
 					r.nextIndex[peerID] = lastLogIndex + 1
@@ -284,14 +291,11 @@ func TestClientRequest(t *testing.T) {
 			},
 			args: &param.ClientArgs{ClientID: 123, SequenceNum: 1, Command: "test-command"},
 			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine, r *Raft) {
-				gomock.InOrder(
-					s.EXPECT().LastLogIndex().Return(uint64(5), nil).Times(1),
-					s.EXPECT().AppendEntries(gomock.Any()).Return(nil).Times(1),
-				)
+				// proposalBatcher calls store.AppendEntries
+				s.EXPECT().AppendEntries(gomock.Any()).Return(nil).Times(1)
 
 				s.EXPECT().FirstLogIndex().Return(uint64(1), nil).AnyTimes()
 				s.EXPECT().GetEntry(gomock.Any()).Return(&param.LogEntry{}, nil).AnyTimes()
-				s.EXPECT().LastLogIndex().Return(uint64(6), nil).AnyTimes()
 
 				tr.EXPECT().SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).
 					DoAndReturn(func(id string, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
@@ -342,20 +346,25 @@ func TestClientRequest(t *testing.T) {
 			var r *Raft
 			if tt.initialState.state == Leader && tt.setupMocks != nil {
 				mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+				mockStore.EXPECT().LastLogIndex().Return(uint64(5), nil).Times(1)
 				r = NewRaft(1, []int{2, 3}, mockStore, mockSM, mockTrans, commitChan)
 				r.currentTerm = tt.initialState.term
-				r.state = tt.initialState.state
+				r.setState(tt.initialState.state)
 				r.nextIndex[2] = 6
 				r.nextIndex[3] = 6
+				go r.proposalBatcher()
 			} else {
 				r = &Raft{
 					id:             1,
-					state:          tt.initialState.state,
 					knownLeaderID:  tt.initialState.knownLeaderID,
 					clientSessions: tt.initialState.clientSessions,
 					store:          mockStore,
 					mu:             sync.Mutex{},
+					proposalCh:     make(chan proposalRequest, proposalChSize),
+					shutdownChan:   make(chan struct{}),
 				}
+				r.setState(tt.initialState.state)
+				r.lastAppliedCond = sync.NewCond(&r.mu)
 			}
 
 			if tt.setupMocks != nil {
@@ -510,9 +519,10 @@ func TestHandleLinearizableRead(t *testing.T) {
 			var r *Raft
 			if tt.initialState.state == Leader {
 				mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+				mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 				r = NewRaft(1, []int{2, 3, 4, 5}, mockStore, mockSM, mockTrans, nil)
 				r.currentTerm = tt.initialState.term
-				r.state = tt.initialState.state
+				r.setState(tt.initialState.state)
 				r.commitIndex = tt.initialState.commitIndex
 				r.lastApplied = tt.initialState.lastApplied
 				// Initialize nextIndex to avoid panics
@@ -521,10 +531,10 @@ func TestHandleLinearizableRead(t *testing.T) {
 				}
 			} else {
 				r = &Raft{
-					state:         tt.initialState.state,
 					knownLeaderID: tt.initialState.knownLeader,
 					mu:            sync.Mutex{},
 				}
+				r.setState(tt.initialState.state)
 			}
 
 			if tt.setupMocks != nil {
@@ -580,10 +590,11 @@ func TestClientRequest_ReadWriteBranching(t *testing.T) {
 	commitChan := make(chan param.CommitEntry, 10)
 
 	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(1), nil).Times(1)
 	r := NewRaft(1, []int{2, 3}, mockStore, mockSM, mockTrans, commitChan)
 	defer r.Stop()
 
-	r.state = Leader
+	r.setState(Leader)
 	r.currentTerm = 1
 	r.commitIndex = 1
 	r.lastApplied = 1
@@ -595,6 +606,9 @@ func TestClientRequest_ReadWriteBranching(t *testing.T) {
 		r.nextIndex[peerID] = lastLogIndex + 1
 		r.matchIndex[peerID] = 0
 	}
+
+	// Start proposalBatcher for handling Submit() calls
+	go r.proposalBatcher()
 
 	// 1. 测试“读”请求 (get)
 	t.Run("ReadRequest", func(t *testing.T) {
@@ -629,12 +643,9 @@ func TestClientRequest_ReadWriteBranching(t *testing.T) {
 		args := &param.ClientArgs{ClientID: 123, SequenceNum: 1, Command: setCmd}
 		reply := &param.ClientReply{}
 
-		// 1. 期望同步调用
-		callLastLog1 := mockStore.EXPECT().LastLogIndex().Return(uint64(1), nil).Times(1)
-		callAppend := mockStore.EXPECT().AppendEntries(gomock.Any()).Return(nil).Times(1).After(callLastLog1)
+		// proposalBatcher calls store.AppendEntries (uses cachedLastLogIndex, not store.LastLogIndex)
+		mockStore.EXPECT().AppendEntries(gomock.Any()).Return(nil).Times(1)
 
-		// 2. 期望异步调用
-		mockStore.EXPECT().LastLogIndex().Return(uint64(2), nil).AnyTimes().After(callAppend)
 		mockStore.EXPECT().FirstLogIndex().Return(uint64(1), nil).AnyTimes()
 
 		// 这里的期望现在可以正确匹配了，因为之前的 GetEntry(1) 不会拦截 GetEntry(2)
@@ -725,11 +736,12 @@ func TestRun_FollowerStartsElectionOnTimeout(t *testing.T) {
 	mockTrans := transport.NewMockTransport(ctrl)
 	// 期望初始化调用
 	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 
 	r := NewRaft(1, []int{2, 3}, mockStore, nil, mockTrans, nil)
 
 	// 1. 将状态设为 Follower
-	r.state = Follower
+	r.setState(Follower)
 	r.currentTerm = 1
 	// 2. 设置极短的超时时间，以便快速触发选举
 	r.heartbeatTimeout = 5 * time.Millisecond
@@ -747,17 +759,12 @@ func TestRun_FollowerStartsElectionOnTimeout(t *testing.T) {
 	// 3. 成为 Candidate，持久化状态
 	// 4. 获取日志信息
 
-	gomock.InOrder(
-		// Pre-Vote 阶段: 获取日志
-		mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil),
-		// Real Vote 阶段: 持久化状态
-		mockStore.EXPECT().SetState(param.HardState{CurrentTerm: 2, VotedFor: 1}).Return(nil).
-			Do(func(any) {
-				close(electionStartedChan) // 收到调用，发出信号
-			}),
-		// Real Vote 阶段: 获取日志信息
-		mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil),
-	)
+	// Election uses r.cachedLastLogIndex (not store.LastLogIndex)
+	// Only expect SetState for Real Vote phase
+	mockStore.EXPECT().SetState(param.HardState{CurrentTerm: 2, VotedFor: 1}).Return(nil).
+		Do(func(any) {
+			close(electionStartedChan) // 收到调用，发出信号
+		})
 
 	// 选举启动后会广播投票请求 (Pre-Vote 和 Real Vote)
 	mockTrans.EXPECT().SendRequestVote(gomock.Any(), gomock.Any(), gomock.Any()).
@@ -789,10 +796,11 @@ func TestRun_LeaderDoesNotStartElection(t *testing.T) {
 
 	mockStore := storage.NewMockStorage(ctrl)
 	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 
 	r := NewRaft(1, []int{2, 3}, mockStore, nil, nil, nil)
 	// 1. 将状态设为 Leader
-	r.state = Leader
+	r.setState(Leader)
 	// 2. 设置一个极短的超时
 	r.currentElectionTimeout = 5 * time.Millisecond
 	r.electionResetEvent = time.Now()
@@ -810,7 +818,7 @@ func TestRun_LeaderDoesNotStartElection(t *testing.T) {
 
 	// 6. 验证状态仍然是 Leader
 	r.mu.Lock()
-	state := r.state
+	state := r.getState()
 	r.mu.Unlock()
 	assert.Equal(t, Leader, state, "Leader state should not have changed")
 }
@@ -822,6 +830,7 @@ func TestRun_StopShutsDownLoop(t *testing.T) {
 
 	mockStore := storage.NewMockStorage(ctrl)
 	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 
 	r := NewRaft(1, []int{2, 3}, mockStore, nil, nil, nil)
 
@@ -833,7 +842,7 @@ func TestRun_StopShutsDownLoop(t *testing.T) {
 
 	// 验证状态
 	r.mu.Lock()
-	assert.Equal(t, Dead, r.state, "State should be Dead after Stop()")
+	assert.Equal(t, Dead, r.getState(), "State should be Dead after Stop()")
 	r.mu.Unlock()
 
 	// 验证 channel 是否关闭 (从已关闭的 channel 读取会立即返回)
@@ -855,6 +864,7 @@ func TestTimeoutResets(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		mockStore := storage.NewMockStorage(ctrl)
 		mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+		mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 		r := NewRaft(1, []int{2, 3}, mockStore, nil, nil, nil)
 		return ctrl, mockStore, r
 	}
@@ -864,7 +874,7 @@ func TestTimeoutResets(t *testing.T) {
 		ctrl, _, r := newRaftForTest(t)
 		defer ctrl.Finish()
 
-		r.state = Follower
+		r.setState(Follower)
 		r.currentTerm = 5
 		r.currentElectionTimeout = 12345 // 设置一个已知的哨兵值
 
@@ -885,11 +895,10 @@ func TestTimeoutResets(t *testing.T) {
 		ctrl, mockStore, r := newRaftForTest(t)
 		defer ctrl.Finish()
 
-		// 模拟 grantVote 所需的调用
-		mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil)
+		// 模拟 grantVote 所需的调用 (election uses cachedLastLogIndex, not store.LastLogIndex)
 		mockStore.EXPECT().SetState(param.HardState{CurrentTerm: 5, VotedFor: 2}).Return(nil)
 
-		r.state = Follower
+		r.setState(Follower)
 		r.currentTerm = 5
 		r.votedFor = -1                  // 确保可以投票
 		r.currentElectionTimeout = 12345 // 哨兵值
@@ -912,7 +921,7 @@ func TestTimeoutResets(t *testing.T) {
 		// 模拟 becomeFollower 时的 SetState
 		mockStore.EXPECT().SetState(param.HardState{CurrentTerm: 6, VotedFor: math.MaxUint64}).Return(nil)
 
-		r.state = Candidate
+		r.setState(Candidate)
 		r.currentTerm = 5
 		r.currentElectionTimeout = 12345 // 哨兵值
 
@@ -922,7 +931,7 @@ func TestTimeoutResets(t *testing.T) {
 		assert.NoError(t, err)
 		r.mu.Unlock()
 
-		assert.Equal(t, Follower, r.state)
+		assert.Equal(t, Follower, r.getState())
 		assert.Equal(t, uint64(6), r.currentTerm)
 		assert.NotEqual(t, 12345, r.currentElectionTimeout, "Timeout should be reset on becomeFollower")
 	})
@@ -954,10 +963,11 @@ func TestLeaseRead_LeaseValid(t *testing.T) {
 	mockSM := storage.NewMockStateMachine(ctrl)
 
 	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 
 	r := NewRaft(1, []int{2, 3}, mockStore, mockSM, mockTrans, nil)
 	r.currentTerm = 2
-	r.state = Leader
+	r.setState(Leader)
 	r.readIndexMode = config.ReadIndexModeLease
 	r.leaseDuration = 200 * time.Millisecond
 
@@ -990,11 +1000,12 @@ func TestLeaseRead_LeaseExpired(t *testing.T) {
 	mockSM := storage.NewMockStateMachine(ctrl)
 
 	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 
 	peerIDs := []int{2, 3}
 	r := NewRaft(1, peerIDs, mockStore, mockSM, mockTrans, nil)
 	r.currentTerm = 2
-	r.state = Leader
+	r.setState(Leader)
 	r.readIndexMode = config.ReadIndexModeLease
 	r.leaseDuration = 200 * time.Millisecond
 	r.electionTimeout = 200 * time.Millisecond
@@ -1054,11 +1065,12 @@ func TestLeaseRead_HeartbeatMode(t *testing.T) {
 	mockSM := storage.NewMockStateMachine(ctrl)
 
 	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 
 	peerIDs := []int{2, 3}
 	r := NewRaft(1, peerIDs, mockStore, mockSM, mockTrans, nil)
 	r.currentTerm = 2
-	r.state = Leader
+	r.setState(Leader)
 	r.readIndexMode = config.ReadIndexModeHeartbeat // 使用心跳模式
 	r.electionTimeout = 200 * time.Millisecond
 
@@ -1112,10 +1124,11 @@ func TestTryRenewLease(t *testing.T) {
 	mockSM := storage.NewMockStateMachine(ctrl)
 
 	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 
 	r := NewRaft(1, []int{2, 3}, mockStore, mockSM, mockTrans, nil)
 	r.currentTerm = 2
-	r.state = Leader
+	r.setState(Leader)
 	r.readIndexMode = config.ReadIndexModeLease
 	r.leaseDuration = 200 * time.Millisecond
 
@@ -1146,10 +1159,11 @@ func TestLeaseRead_NotLeader(t *testing.T) {
 	mockSM := storage.NewMockStateMachine(ctrl)
 
 	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 
 	r := NewRaft(1, []int{2, 3}, mockStore, mockSM, mockTrans, nil)
 	r.currentTerm = 2
-	r.state = Follower // 非 Leader
+	r.setState(Follower) // 非 Leader
 	r.knownLeaderID = 2
 	r.readIndexMode = config.ReadIndexModeLease
 
@@ -1174,11 +1188,12 @@ func TestLeaseRead_RenewOnHeartbeatResponse(t *testing.T) {
 	mockSM := storage.NewMockStateMachine(ctrl)
 
 	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 
 	peerIDs := []int{2, 3}
 	r := NewRaft(1, peerIDs, mockStore, mockSM, mockTrans, nil)
 	r.currentTerm = 2
-	r.state = Leader
+	r.setState(Leader)
 	r.readIndexMode = config.ReadIndexModeLease
 	r.leaseDuration = 200 * time.Millisecond
 	r.electionTimeout = 200 * time.Millisecond

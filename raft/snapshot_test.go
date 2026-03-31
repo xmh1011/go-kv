@@ -139,6 +139,7 @@ func TestTakeSnapshot(t *testing.T) {
 			mockStore := storage.NewMockStorage(ctrl)
 			mockSM := storage.NewMockStateMachine(ctrl)
 			mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+			mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 
 			r := NewRaft(1, []int{2, 3}, mockStore, mockSM, nil, nil)
 			r.lastApplied = tt.initialState.lastApplied
@@ -255,6 +256,7 @@ func TestInstallSnapshot(t *testing.T) {
 			mockStore := storage.NewMockStorage(ctrl)
 			mockSM := storage.NewMockStateMachine(ctrl)
 			mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+			mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 
 			r := NewRaft(2, []int{1, 3}, mockStore, mockSM, nil, nil)
 			r.currentTerm = tt.initialState.term
@@ -366,10 +368,11 @@ func TestSendSnapshot(t *testing.T) {
 			mockStore := storage.NewMockStorage(ctrl)
 			mockTrans := transport.NewMockTransport(ctrl)
 			mockStore.EXPECT().GetState().Return(param.HardState{CurrentTerm: tt.initialState.term}, nil).Times(1)
+			mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 
 			r := NewRaft(1, []int{2, 3}, mockStore, nil, mockTrans, nil)
 			r.currentTerm = tt.initialState.term
-			r.state = tt.initialState.state
+			r.setState(tt.initialState.state)
 
 			if tt.setupMocks != nil {
 				tt.setupMocks(mockStore, mockTrans)
@@ -379,7 +382,7 @@ func TestSendSnapshot(t *testing.T) {
 
 			r.mu.Lock()
 			defer r.mu.Unlock()
-			assert.Equal(t, tt.expectedState.state, r.state)
+			assert.Equal(t, tt.expectedState.state, r.getState())
 			assert.Equal(t, tt.expectedState.term, r.currentTerm)
 			if tt.expectedNext > 0 {
 				assert.Equal(t, tt.expectedNext, r.nextIndex[2])
@@ -449,10 +452,11 @@ func TestProcessSnapshotReply(t *testing.T) {
 			mockStore := storage.NewMockStorage(ctrl)
 			mockTrans := transport.NewMockTransport(ctrl)
 			mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+			mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 			commitChan := make(chan param.CommitEntry, 1)
 
 			r := NewRaft(1, []int{2}, mockStore, nil, mockTrans, commitChan)
-			r.state = tt.initialState.state
+			r.setState(tt.initialState.state)
 			r.currentTerm = tt.initialState.term
 
 			pastTime := time.Now().Add(-1 * time.Second)

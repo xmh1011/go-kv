@@ -133,7 +133,7 @@ func (s *Storage) GetEntry(index uint64) (*param.LogEntry, error) {
 	defer s.mu.RUnlock()
 
 	if index < s.logOffset+1 || index >= s.logOffset+uint64(len(s.log)) {
-		return nil, ErrLogNotFound
+		return nil, nil
 	}
 
 	return &s.log[index-s.logOffset], nil

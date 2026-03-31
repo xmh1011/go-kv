@@ -1,7 +1,6 @@
 package inmemory
 
 import (
-	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -32,7 +31,7 @@ func TestStorage(t *testing.T) {
 		assert.Equal(t, uint64(1), firstIDx, "initial first index should be 1")
 
 		_, err = s.GetEntry(1)
-		assert.ErrorIs(t, err, ErrLogNotFound, "should return ErrLogNotFound for initial empty log")
+		assert.NoError(t, err, "GetEntry(1) on empty log should not return error")
 	})
 	t.Run("HardState", func(t *testing.T) {
 		s := NewStorage()
@@ -67,11 +66,9 @@ func TestStorage(t *testing.T) {
 
 		// Test getting an entry out of bounds
 		_, err = s.GetEntry(6)
-		assert.ErrorIs(t, err, ErrLogNotFound, "should return ErrLogNotFound for index 6")
+		assert.Nil(t, err, "GetEntry(6) should return nil error for out-of-bounds")
 		_, err = s.GetEntry(0) // Before logOffset
-		if !errors.Is(err, ErrLogNotFound) {
-			t.Errorf("expected ErrLogNotFound for index 0, but got %v", err)
-		}
+		assert.Nil(t, err, "GetEntry(0) should return nil error for out-of-bounds")
 
 		// Truncate from index 4 onwards (removes entries 4 and 5)
 		err = s.TruncateLog(4)
@@ -82,7 +79,7 @@ func TestStorage(t *testing.T) {
 		assert.Equal(t, uint64(3), lastIDx, "last index should be 3 after truncation")
 
 		_, err = s.GetEntry(4)
-		assert.ErrorIs(t, err, ErrLogNotFound, "should return ErrLogNotFound for truncated index 4")
+		assert.Nil(t, err, "GetEntry(4) should return nil for truncated index")
 
 		// Truncating with an out-of-bounds index should be a no-op
 		err = s.TruncateLog(10)
@@ -115,7 +112,7 @@ func TestStorage(t *testing.T) {
 
 		// The entry at index 5 should now be GONE (it's in the snapshot)
 		_, err = s.GetEntry(5)
-		assert.ErrorIs(t, err, ErrLogNotFound, "GetEntry(5) should fail after compaction")
+		assert.NoError(t, err, "GetEntry(5) should not return error after compaction")
 
 		// The first available entry in the log should be at index 6
 		entry6, err := s.GetEntry(6)

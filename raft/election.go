@@ -54,7 +54,7 @@ func newElectionContext(r *Raft) *electionContext {
 func (r *Raft) startElection() {
 	r.mu.Lock()
 	// 检查状态，只有 Follower 或 Candidate 可以发起选举
-	if r.state != Follower && r.state != Candidate {
+	if r.getState() != Follower && r.getState() != Candidate {
 		r.mu.Unlock()
 		return
 	}
@@ -177,14 +177,14 @@ func (r *Raft) leaderHasLease() bool {
 func (r *Raft) initializeCandidateState() error {
 	// 如果我们不是 Follower 或 Candidate（例如，Stop() 被调用且状态为 Dead），
 	// 则中止选举，防止 Goroutine 泄露。
-	if r.state != Follower && r.state != Candidate {
-		log.Infof("[Election] Node %d aborting election start; state is %d", r.id, r.state)
+	if r.getState() != Follower && r.getState() != Candidate {
+		log.Infof("[Election] Node %d aborting election start; state is %d", r.id, r.getState())
 		// 返回一个错误，以便 startElection 协程能安全退出
 		return errors.New("cannot start election in non-follower/candidate state")
 	}
 
 	// 将状态更新为 Candidate，增加当前任期号，并给自己投票。
-	r.state = Candidate
+	r.setState(Candidate)
 	r.currentTerm++
 	r.votedFor = r.id
 	// 重置选举计时器，为本轮选举设定新的超时时间。
@@ -207,11 +207,7 @@ func (r *Raft) initializeCandidateState() error {
 // 这些信息将用于填充 RequestVote RPC 参数，以供其他节点进行日志新旧检查。
 func (r *Raft) getLastLogInfoForElection() (lastLogIndex uint64, lastLogTerm uint64, err error) {
 	// 从存储中获取自己最后一条日志的索引。
-	lastLogIndex, err = r.store.LastLogIndex()
-	if err != nil {
-		log.Errorf("[Election] Node %d failed to get last log index for election: %v", r.id, err)
-		return 0, 0, err
-	}
+	lastLogIndex = r.cachedLastLogIndex
 
 	// 如果日志不为空，则获取最后一条日志的任期。
 	if lastLogIndex > 0 {
@@ -336,11 +332,13 @@ func (r *Raft) transitionToLeader(electionTerm uint64) {
 	defer r.mu.Unlock()
 
 	// 再次确认自己仍然是本轮选举的候选人，防止因状态变更导致的问题。
-	if r.state == Candidate && r.currentTerm == electionTerm {
+	if r.getState() == Candidate && r.currentTerm == electionTerm {
 		log.Infof("[Election] Node %d elected as Leader for term %d", r.id, r.currentTerm)
-		r.state = Leader
+		r.setState(Leader)
 		r.initLeaderState()
 		r.startHeartbeat()
+		// 启动 proposal 批处理 goroutine
+		go r.proposalBatcher()
 		// 初始化租约：新当选的 Leader 需要通过心跳确认后才能获得租约
 		// 这里将租约设为过去时间，强制第一次读操作时进行心跳确认
 		r.leaseUntil = time.Time{} // 零值，表示租约无效
@@ -354,7 +352,7 @@ func (r *Raft) handleElectionTimeout(electionTerm uint64) {
 	defer r.mu.Unlock()
 
 	// 确认自己仍然是本轮选举的候选人，然后退回为 Follower 状态。
-	if r.state == Candidate && r.currentTerm == electionTerm {
+	if r.getState() == Candidate && r.currentTerm == electionTerm {
 		log.Infof("[Election] Node %d election failed, reverting to Follower", r.id)
 		// 调用 becomeFollower 会更新 term, state, votedFor 并持久化
 		// 因为任期没有变，所以传入 r.currentTerm 即可
@@ -463,7 +461,7 @@ func (r *Raft) decideVote(args *param.RequestVoteArgs, reply *param.RequestVoteR
 func (r *Raft) isLeader() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.state == Leader
+	return r.getState() == Leader
 }
 
 // isDuplicateRequest 检查一个客户端请求是否是重复的。
@@ -483,11 +481,7 @@ func (r *Raft) isDuplicateRequest(clientID int64, sequenceNum int64) bool {
 // 这是 Raft 选举安全规则的核心实现。此函数必须在持有锁的情况下被调用。
 func (r *Raft) isLogUpToDate(candidateLastLogIndex, candidateLastLogTerm uint64) (bool, error) {
 	// 从存储中获取本节点的最后一条日志信息。
-	localLastLogIndex, err := r.store.LastLogIndex()
-	if err != nil {
-		log.Errorf("[Election] Node %d failed to get last log index from store: %v", r.id, err)
-		return false, err
-	}
+	localLastLogIndex := r.cachedLastLogIndex
 
 	localLastLogTerm, err := r.getLogTerm(localLastLogIndex)
 	if err != nil { // 检查 err 是否为 nil

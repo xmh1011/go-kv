@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xmh1011/go-kv/pkg/config"
@@ -25,9 +26,32 @@ const (
 	Dead // 可选：表示节点已终止（用于优雅关闭）
 )
 
+// proposalRequest 表示一个待批处理的 Submit 请求
+type proposalRequest struct {
+	command any
+	result  chan proposalResult
+}
+
+// proposalResult 表示批处理后的结果
+type proposalResult struct {
+	index uint64
+	term  uint64
+	ok    bool
+}
+
+// proposal 批处理常量
+const (
+	proposalChSize   = 256 // proposalCh 缓冲大小
+	maxBatchSize     = 64  // 单批最大 proposal 数量
+)
+
 type Raft struct {
 	// mu 保护对 Raft 状态的并发访问
 	mu sync.Mutex
+
+	// appendEntriesMu 串行化 AppendEntries RPC 处理
+	// 确保 TruncateLog 和 AppendEntries 不会并发执行
+	appendEntriesMu sync.Mutex
 
 	// id 是当前节点的服务器ID
 	id int
@@ -48,13 +72,14 @@ type Raft struct {
 	// --- Raft 核心状态 ---
 	currentTerm uint64
 	votedFor    int
-	state       State
+	state       atomic.Int32 // 使用 atomic 实现无锁状态检查
 
 	// --- 日志与状态机相关 ---
-	commitIndex     uint64
-	lastApplied     uint64
-	commitChan      chan param.CommitEntry
-	lastAppliedCond *sync.Cond // 用于等待 lastApplied 赶上 commitIndex
+	commitIndex        uint64
+	lastApplied        uint64
+	cachedLastLogIndex uint64 // 缓存 lastLogIndex 避免重复存储调用
+	commitChan         chan param.CommitEntry
+	lastAppliedCond    *sync.Cond // 用于等待 lastApplied 赶上 commitIndex
 
 	// --- 快照相关 ---
 	// snapshot 在内存中持有当前最新的快照，避免频繁从存储中读取
@@ -80,6 +105,9 @@ type Raft struct {
 	// --- 内部控制 ---
 	shutdownChan chan struct{} // 用于关闭 Run 循环
 
+	// --- Proposal 批处理 ---
+	proposalCh chan proposalRequest // 用于 Submit 批处理的 channel
+
 	// --- ReadIndex 优化 ---
 	lastLeadershipConfirm time.Time     // 上次确认 Leadership 的时间
 	leadershipCacheTime   time.Duration // Leadership 确认缓存时间
@@ -94,20 +122,20 @@ type Raft struct {
 // 注意：store 参数的类型现在是 storage.KVStorage。
 func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.StateMachine, trans transport.Transport, commitChan chan param.CommitEntry) *Raft {
 	r := &Raft{
-		id:                id,
-		peerIDs:           peerIDs,
-		store:             store,
-		stateMachine:      stateMachine,
-		trans:             trans,
-		inJointConsensus:  false,
-		state:             Follower,
-		votedFor:          -1, // -1 表示未投票
+		id:               id,
+		peerIDs:          peerIDs,
+		store:            store,
+		stateMachine:     stateMachine,
+		trans:            trans,
+		inJointConsensus: false,
+		votedFor:         -1, // -1 表示未投票
 		commitChan:        commitChan,
 		nextIndex:         make(map[int]uint64),
 		matchIndex:        make(map[int]uint64),
 		clientSessions:    make(map[int64]int64),
 		notifyApply:       make(map[uint64]chan any),
 		shutdownChan:      make(chan struct{}),
+		proposalCh:        make(chan proposalRequest, proposalChSize),
 		lastAck:           make(map[int]time.Time),
 		snapshotThreshold: -1, // 默认禁用自动快照
 		electionTimeout:   config.Conf.Raft.ElectionTimeout,
@@ -118,6 +146,7 @@ func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.
 		leaseDuration: config.Conf.Raft.ElectionTimeout,
 		readIndexMode: config.Conf.Raft.ReadIndexMode,
 	}
+	r.setState(Follower)
 	// 从稳定存储中恢复状态。
 	if store != nil {
 		hardState, err := store.GetState()
@@ -127,6 +156,14 @@ func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.
 		}
 		r.currentTerm = hardState.CurrentTerm
 		r.votedFor = int(hardState.VotedFor)
+
+		// 初始化缓存的 lastLogIndex
+		lastIdx, err := store.LastLogIndex()
+		if err != nil {
+			log.Errorf("[Raft] Failed to get last log index from storage: %v", err)
+		} else {
+			r.cachedLastLogIndex = lastIdx
+		}
 	}
 
 	r.electionResetEvent = time.Now()
@@ -162,17 +199,23 @@ func (r *Raft) CommitChan() <-chan param.CommitEntry {
 	return r.commitChan
 }
 
+// getState 返回当前节点的状态（无锁原子读取）。
+func (r *Raft) getState() State {
+	return State(r.state.Load())
+}
+
+// setState 设置节点状态（必须在持有 r.mu 的情况下调用）。
+func (r *Raft) setState(s State) {
+	r.state.Store(int32(s))
+}
+
 // State 返回当前节点的状态。
 func (r *Raft) State() State {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.state
+	return r.getState()
 }
 
 func (r *Raft) IsStopped() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.state == Dead
+	return r.getState() == Dead
 }
 
 // SetSnapshotThreshold 设置自动快照的阈值。
@@ -202,7 +245,7 @@ func (r *Raft) Run() {
 			// Leader 和 Dead 状态都应该忽略 ticker。
 			// (Dead 状态最终会被 shutdownChan 捕获，但在这里检查
 			// 可以防止 Stop() 和 ticker 之间的竞态条件)
-			if r.state != Follower && r.state != Candidate {
+			if r.getState() != Follower && r.getState() != Candidate {
 				r.mu.Unlock()
 				continue
 			}
@@ -235,7 +278,7 @@ func (r *Raft) Stop() {
 	}
 
 	log.Infof("[Core] Node %d received stop signal.", r.id)
-	r.state = Dead
+	r.setState(Dead)
 
 	// 广播 lastAppliedCond，唤醒可能在等待的读请求
 	// 这样它们可以检测到节点已停止并退出
@@ -283,7 +326,7 @@ func (r *Raft) handleLinearizableRead(cmd param.KVCommand, reply *param.ClientRe
 	r.mu.Lock()
 
 	// 1. 检查是否为 Leader
-	if r.state != Leader {
+	if r.getState() != Leader {
 		r.mu.Unlock()
 		reply.NotLeader = true
 		reply.LeaderHint = r.knownLeaderID
@@ -328,14 +371,17 @@ func (r *Raft) handleLinearizableRead(cmd param.KVCommand, reply *param.ClientRe
 
 // performReadAfterApply 等待状态机应用到 ReadIndex 后执行读操作
 // 带有超时机制，防止无限阻塞
+//
+// 优化：stateMachine.Get() 在锁外执行，因为 LSM Database.Get() 内部线程安全
 func (r *Raft) performReadAfterApply(cmd param.KVCommand, reply *param.ClientReply, readIndex uint64) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	// 重新加锁后再次检查状态，防止在确认期间被降级或停止
-	if r.state != Leader {
+	if r.getState() != Leader {
+		leaderHint := r.knownLeaderID
+		r.mu.Unlock()
 		reply.NotLeader = true
-		reply.LeaderHint = r.knownLeaderID
+		reply.LeaderHint = leaderHint
 		return nil
 	}
 
@@ -353,7 +399,7 @@ func (r *Raft) performReadAfterApply(cmd param.KVCommand, reply *param.ClientRep
 
 	// 等待状态机追赶上 ReadIndex，同时在每次唤醒时检查 Leader 状态和超时
 	deadline := time.Now().Add(timeout)
-	for r.lastApplied < readIndex && r.state == Leader {
+	for r.lastApplied < readIndex && r.getState() == Leader {
 		if time.Now().After(deadline) {
 			timedOut = true
 			break
@@ -370,20 +416,26 @@ func (r *Raft) performReadAfterApply(cmd param.KVCommand, reply *param.ClientRep
 
 	if timedOut {
 		log.Warnf("[ReadIndex] Node %d timed out waiting for lastApplied to reach %d (current: %d)", r.id, readIndex, r.lastApplied)
+		r.mu.Unlock()
 		reply.Success = false
 		reply.Result = "read timeout"
 		return nil
 	}
 
 	// 检查是否因为 Leader 被降级或节点停止而退出循环
-	if r.state != Leader {
+	if r.getState() != Leader {
+		leaderHint := r.knownLeaderID
+		r.mu.Unlock()
 		reply.NotLeader = true
-		reply.LeaderHint = r.knownLeaderID
+		reply.LeaderHint = leaderHint
 		return nil
 	}
 
-	// 执行本地读取
+	// 释放锁，在锁外执行本地读取
+	// 安全性：lastApplied >= readIndex 已确认，状态机已应用所有需要的条目
+	// LSM Database.Get() 内部线程安全（MemTable 使用跳表，有 RWMutex 保护）
 	log.Debugf("[ReadIndex] Node %d state machine ready (lastApplied=%d). performing read.", r.id, r.lastApplied)
+	r.mu.Unlock()
 
 	value, err := r.stateMachine.Get(cmd.Key)
 	if err != nil {
@@ -407,7 +459,7 @@ func (r *Raft) confirmLeadership() bool {
 	now := time.Now()
 
 	// 检查是否为 Leader
-	if r.state != Leader {
+	if r.getState() != Leader {
 		r.mu.Unlock()
 		return false
 	}
@@ -563,7 +615,7 @@ func (r *Raft) confirmLeadership() bool {
 // tryRenewLease 检查是否有足够的多数派确认，如果有则更新租约。
 // 此函数必须在持有锁的情况下被调用。
 func (r *Raft) tryRenewLease() {
-	if r.state != Leader {
+	if r.getState() != Leader {
 		return
 	}
 
@@ -640,13 +692,8 @@ func (r *Raft) getFirstLogIndex() (uint64, error) {
 
 // proposeToLog 在【持有锁】的情况下，将命令写入本地日志。
 func (r *Raft) proposeToLog(command any) (param.LogEntry, error) {
-	// 1. 从存储中获取最后一条日志的索引，以确定新日志的索引。
-	lastIndex, err := r.store.LastLogIndex()
-	if err != nil {
-		log.Errorf("[Raft] Leader %d failed to get last log index to propose new entry: %v", r.id, err)
-		return param.LogEntry{}, err
-	}
-	newIndex := lastIndex + 1
+	// 1. 使用缓存的 lastLogIndex 确定新日志的索引。
+	newIndex := r.cachedLastLogIndex + 1
 
 	// 2. 将新条目原子性地追加并持久化到 Leader 的本地存储中。
 	newLogEntry := param.NewLogEntry(command, r.currentTerm, newIndex)
@@ -655,6 +702,9 @@ func (r *Raft) proposeToLog(command any) (param.LogEntry, error) {
 		return param.LogEntry{}, err
 	}
 	log.Infof("[Raft] Leader %d proposed new log entry at index %d", r.id, newIndex)
+
+	// 3. 更新缓存的 lastLogIndex
+	r.cachedLastLogIndex = newLogEntry.Index
 
 	return newLogEntry, nil
 }
@@ -710,35 +760,141 @@ func (r *Raft) finalizeClientReply(args *param.ClientArgs, reply *param.ClientRe
 }
 
 // Submit 将一个普通的客户端命令追加到 Raft 日志中。
+// 优化：通过 proposalCh 发送到批处理 goroutine，多个并发 Submit 可合并为单次磁盘写入。
 func (r *Raft) Submit(command any) (uint64, uint64, bool) {
+	// 快速检查：无锁原子读取，避免非 Leader 时的 channel 操作
+	if r.getState() != Leader {
+		return 0, 0, false
+	}
+
+	req := proposalRequest{
+		command: command,
+		result:  make(chan proposalResult, 1),
+	}
+
+	// 发送到 proposalCh，如果 channel 满了说明系统过载
+	select {
+	case r.proposalCh <- req:
+	case <-r.shutdownChan:
+		return 0, 0, false
+	}
+
+	// 等待批处理结果
+	select {
+	case res := <-req.result:
+		return res.index, res.term, res.ok
+	case <-r.shutdownChan:
+		return 0, 0, false
+	}
+}
+
+// proposalBatcher 是专用的 proposal 批处理 goroutine。
+// 从 proposalCh 批量取出请求，单次加锁 + 单次 store.AppendEntries 完成。
+// 在 transitionToLeader 时启动，非 Leader 时自动退出。
+func (r *Raft) proposalBatcher() {
+	for {
+		// 等待第一个请求（阻塞）
+		var firstReq proposalRequest
+		select {
+		case firstReq = <-r.proposalCh:
+		case <-r.shutdownChan:
+			return
+		}
+
+		// 收集更多请求（非阻塞），最多 maxBatchSize 个
+		batch := []proposalRequest{firstReq}
+	drain:
+		for len(batch) < maxBatchSize {
+			select {
+			case req := <-r.proposalCh:
+				batch = append(batch, req)
+			default:
+				break drain
+			}
+		}
+
+		// 批量处理
+		r.processBatch(batch)
+
+		// 检查是否仍然是 Leader
+		if r.getState() != Leader {
+			// 排空 proposalCh 中剩余的请求，通知它们失败
+			r.drainProposalCh()
+			return
+		}
+	}
+}
+
+// processBatch 批量处理一组 proposal 请求。
+func (r *Raft) processBatch(batch []proposalRequest) {
 	r.mu.Lock()
 
-	// 1. 检查当前节点是否为 Leader。
-	if r.state != Leader {
+	// 检查是否仍然是 Leader
+	if r.getState() != Leader {
 		r.mu.Unlock()
-		return 0, 0, false
+		// 通知所有请求失败
+		for _, req := range batch {
+			req.result <- proposalResult{ok: false}
+		}
+		return
 	}
 
-	// 2. 将命令写入本地日志（此过程在持有锁的情况下完成）。
-	newLogEntry, err := r.proposeToLog(command)
-	if err != nil {
-		r.mu.Unlock()
-		return 0, 0, false
+	// 构建批量日志条目
+	entries := make([]param.LogEntry, 0, len(batch))
+	startIndex := r.cachedLastLogIndex + 1
+	currentTerm := r.currentTerm
+
+	for i, req := range batch {
+		idx := startIndex + uint64(i)
+		entries = append(entries, param.NewLogEntry(req.command, currentTerm, idx))
 	}
 
-	// 3. 在启动 goroutine 之前，我们先获取需要通知的 peer 列表，然后立即解锁。
+	// 单次磁盘写入
+	if err := r.store.AppendEntries(entries); err != nil {
+		log.Errorf("[Raft] Leader %d failed to append batch of %d entries: %v", r.id, len(entries), err)
+		r.mu.Unlock()
+		for _, req := range batch {
+			req.result <- proposalResult{ok: false}
+		}
+		return
+	}
+
+	// 更新缓存
+	r.cachedLastLogIndex = entries[len(entries)-1].Index
+	log.Infof("[Raft] Leader %d proposed batch of %d entries (index %d-%d)", r.id, len(entries), startIndex, r.cachedLastLogIndex)
+
+	// 获取需要通知的 peer 列表
 	peersToNotify := r.getAllPeerIDs()
 	r.mu.Unlock()
 
-	// 4. 在没有持有锁的情况下，安全地启动广播 goroutine。
+	// 通知所有请求完成
+	for i, req := range batch {
+		req.result <- proposalResult{
+			index: entries[i].Index,
+			term:  entries[i].Term,
+			ok:    true,
+		}
+	}
+
+	// 在没有持有锁的情况下广播
 	for _, peerID := range peersToNotify {
 		if peerID == r.id {
 			continue
 		}
 		go r.sendAppendEntries(peerID)
 	}
+}
 
-	return newLogEntry.Index, newLogEntry.Term, true
+// drainProposalCh 排空 proposalCh 中的请求，通知它们失败。
+func (r *Raft) drainProposalCh() {
+	for {
+		select {
+		case req := <-r.proposalCh:
+			req.result <- proposalResult{ok: false}
+		default:
+			return
+		}
+	}
 }
 
 // ChangeConfig 发起一次集群成员变更。
@@ -748,7 +904,7 @@ func (r *Raft) ChangeConfig(newPeerIDs []int) (uint64, uint64, bool) {
 	r.mu.Lock()
 
 	// 1. 前置检查：确保当前是 Leader 并且没有正在进行的成员变更。
-	if r.inJointConsensus || r.state != Leader {
+	if r.inJointConsensus || r.getState() != Leader {
 		r.mu.Unlock()
 		return 0, 0, false // 变更已在进行中
 	}
@@ -813,7 +969,7 @@ func (r *Raft) getAllPeerIDs() []int {
 func (r *Raft) becomeFollower(newTerm uint64) error {
 	log.Infof("[State Change] Node %d received higher term %d. Updating term and becoming follower.", r.id, newTerm)
 	r.currentTerm = newTerm
-	r.state = Follower
+	r.setState(Follower)
 	r.votedFor = -1 // 进入新任期时，重置投票记录。
 
 	// 每当我们成为 Follower（无论何种原因），
@@ -878,13 +1034,7 @@ func (r *Raft) waitForAppliedLog(index uint64, timeout time.Duration) (any, bool
 // initLeaderState initializes leader state after election
 func (r *Raft) initLeaderState() {
 	// This method is called with the lock held.
-	lastLogIndex, err := r.store.LastLogIndex()
-	if err != nil {
-		log.Errorf("[Raft] Node %d (new leader) failed to get last log index to initialize state: %v", r.id, err)
-		// This is a critical error, might need to step down.
-		r.state = Follower
-		return
-	}
+	lastLogIndex := r.cachedLastLogIndex
 
 	r.nextIndex = make(map[int]uint64)
 	r.matchIndex = make(map[int]uint64)
@@ -913,7 +1063,7 @@ func (r *Raft) startHeartbeat() {
 			select {
 			case <-ticker.C:
 				r.mu.Lock()
-				if r.state != Leader {
+				if r.getState() != Leader {
 					r.mu.Unlock()
 					return
 				}

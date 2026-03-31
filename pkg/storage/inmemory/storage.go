@@ -68,7 +68,7 @@ func (s *Storage) GetEntry(index uint64) (*param.LogEntry, error) {
 
 	// 检查索引是否在当前日志范围内
 	if index < s.logOffset+1 || index >= s.logOffset+uint64(len(s.log)) {
-		return nil, ErrLogNotFound
+		return nil, nil
 	}
 
 	// index 对应的切片位置是 index - logOffset

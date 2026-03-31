@@ -41,7 +41,7 @@ func TestStorage(t *testing.T) {
 		assert.Equal(t, uint64(1), firstIDx)
 
 		_, err = s.GetEntry(1)
-		assert.ErrorIs(t, err, ErrLogNotFound)
+		assert.NoError(t, err, "GetEntry(1) on empty log should not return error")
 	})
 
 	t.Run("Persistence", func(t *testing.T) {
@@ -90,7 +90,7 @@ func TestStorage(t *testing.T) {
 		assert.Equal(t, uint64(3), lastIDx)
 
 		_, err = s.GetEntry(4)
-		assert.ErrorIs(t, err, ErrLogNotFound)
+		assert.Nil(t, err, "GetEntry(4) should return nil for truncated index")
 	})
 
 	t.Run("Snapshot and Compaction", func(t *testing.T) {
@@ -106,7 +106,7 @@ func TestStorage(t *testing.T) {
 		// Verify in memory
 		assert.Equal(t, uint64(5), s.logOffset)
 		_, err := s.GetEntry(5)
-		assert.ErrorIs(t, err, ErrLogNotFound)
+		assert.NoError(t, err, "GetEntry(5) should not return error after compaction")
 		entry6, err := s.GetEntry(6)
 		assert.NoError(t, err)
 		assert.Equal(t, uint64(6), entry6.Index)

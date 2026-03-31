@@ -83,10 +83,10 @@ func TestDetermineReplicationAction(t *testing.T) {
 
 			r := &Raft{
 				id:        1,
-				state:     tt.initialState.state,
 				store:     mockStore,
 				nextIndex: map[int]uint64{2: tt.initialState.nextIndex},
 			}
+			r.setState(tt.initialState.state)
 
 			action := r.determineReplicationAction(2)
 			assert.Equal(t, tt.expectedAction, action)
@@ -116,7 +116,7 @@ func TestPrepareAppendEntriesArgs(t *testing.T) {
 			},
 			setupMocks: func(s *storage.MockStorage) {
 				s.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 5, Index: 10}, nil)
-				s.EXPECT().LastLogIndex().Return(uint64(12), nil)
+				// prepareAppendEntriesArgs now uses r.cachedLastLogIndex (set in struct)
 				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11}, nil)
 				s.EXPECT().GetEntry(uint64(12)).Return(&param.LogEntry{Term: 5, Index: 12}, nil)
 			},
@@ -148,7 +148,7 @@ func TestPrepareAppendEntriesArgs(t *testing.T) {
 			},
 			setupMocks: func(s *storage.MockStorage) {
 				s.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 5, Index: 10}, nil)
-				s.EXPECT().LastLogIndex().Return(uint64(12), nil)
+				// prepareAppendEntriesArgs now uses r.cachedLastLogIndex (set in struct)
 				s.EXPECT().GetEntry(uint64(11)).Return(nil, errors.New("read error"))
 			},
 			expectedError: true,
@@ -166,11 +166,12 @@ func TestPrepareAppendEntriesArgs(t *testing.T) {
 			}
 
 			r := &Raft{
-				id:          1,
-				currentTerm: tt.initialState.term,
-				commitIndex: tt.initialState.commitIndex,
-				store:       mockStore,
-				nextIndex:   map[int]uint64{2: tt.initialState.nextIndex},
+				id:                 1,
+				currentTerm:        tt.initialState.term,
+				commitIndex:        tt.initialState.commitIndex,
+				cachedLastLogIndex: 12,
+				store:              mockStore,
+				nextIndex:          map[int]uint64{2: tt.initialState.nextIndex},
 			}
 
 			args, err := r.prepareAppendEntriesArgs(2)
@@ -204,7 +205,7 @@ func TestUpdateCommitIndex(t *testing.T) {
 				matchIndex:  map[int]uint64{1: 12, 2: 12, 3: 12}, // Majority at 12
 			},
 			setupMocks: func(s *storage.MockStorage, sm *storage.MockStateMachine) {
-				s.EXPECT().LastLogIndex().Return(uint64(12), nil).AnyTimes()
+				// findMajorityCommitIndex now uses r.cachedLastLogIndex (set in struct)
 				s.EXPECT().GetEntry(uint64(12)).Return(&param.LogEntry{Term: 5, Index: 12}, nil).AnyTimes()
 				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11}, nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
@@ -219,7 +220,7 @@ func TestUpdateCommitIndex(t *testing.T) {
 				matchIndex:  map[int]uint64{1: 12, 2: 10, 3: 10}, // Only 1 at 12
 			},
 			setupMocks: func(s *storage.MockStorage, sm *storage.MockStateMachine) {
-				s.EXPECT().LastLogIndex().Return(uint64(12), nil)
+				// findMajorityCommitIndex uses r.cachedLastLogIndex (set in struct)
 			},
 			expectedIndex: 10,
 		},
@@ -231,7 +232,7 @@ func TestUpdateCommitIndex(t *testing.T) {
 				matchIndex:  map[int]uint64{1: 12, 2: 12, 3: 12},
 			},
 			setupMocks: func(s *storage.MockStorage, sm *storage.MockStateMachine) {
-				s.EXPECT().LastLogIndex().Return(uint64(12), nil)
+				// findMajorityCommitIndex uses r.cachedLastLogIndex (set in struct)
 				s.EXPECT().GetEntry(uint64(12)).Return(&param.LogEntry{Term: 5, Index: 12}, nil)
 			},
 			expectedIndex: 10,
@@ -250,16 +251,17 @@ func TestUpdateCommitIndex(t *testing.T) {
 			}
 
 			r := &Raft{
-				id:           1,
-				peerIDs:      []int{2, 3},
-				currentTerm:  tt.initialState.term,
-				commitIndex:  tt.initialState.commitIndex,
-				matchIndex:   tt.initialState.matchIndex,
-				store:        mockStore,
-				lastApplied:  tt.initialState.commitIndex,
-				stateMachine: mockSM,
-				notifyApply:  make(map[uint64]chan any),
-				mu:           sync.Mutex{},
+				id:                 1,
+				peerIDs:            []int{2, 3},
+				currentTerm:        tt.initialState.term,
+				commitIndex:        tt.initialState.commitIndex,
+				cachedLastLogIndex: 12,
+				matchIndex:         tt.initialState.matchIndex,
+				store:              mockStore,
+				lastApplied:        tt.initialState.commitIndex,
+				stateMachine:       mockSM,
+				notifyApply:        make(map[uint64]chan any),
+				mu:                 sync.Mutex{},
 			}
 			r.lastAppliedCond = sync.NewCond(&r.mu)
 
@@ -289,7 +291,7 @@ func TestApplyLogs(t *testing.T) {
 			setupMocks: func(s *storage.MockStorage, sm *storage.MockStateMachine, done chan struct{}) {
 				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11, Command: "cmd1"}, nil).AnyTimes()
 				s.EXPECT().GetEntry(uint64(12)).Return(&param.LogEntry{Term: 5, Index: 12, Command: "cmd2"}, nil).AnyTimes()
-				s.EXPECT().LastLogIndex().Return(uint64(12), nil).AnyTimes()
+				// fetchEntriesToApply now uses r.cachedLastLogIndex (set in struct)
 				sm.EXPECT().Apply(gomock.Any()).Return("res1").Times(1)
 				sm.EXPECT().Apply(gomock.Any()).Return("res2").Times(1)
 			},
@@ -303,7 +305,7 @@ func TestApplyLogs(t *testing.T) {
 			snapshotThresh: 100,
 			setupMocks: func(s *storage.MockStorage, sm *storage.MockStateMachine, done chan struct{}) {
 				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11, Command: "cmd1"}, nil).AnyTimes()
-				s.EXPECT().LastLogIndex().Return(uint64(11), nil).AnyTimes()
+				// fetchEntriesToApply now uses r.cachedLastLogIndex (set in struct)
 				sm.EXPECT().Apply(gomock.Any()).Return("res1").AnyTimes()
 				s.EXPECT().LogSize().Return(101, nil).AnyTimes()
 				sm.EXPECT().GetSnapshot().Return([]byte("snap"), nil).AnyTimes()
@@ -335,14 +337,15 @@ func TestApplyLogs(t *testing.T) {
 			}
 
 			r := &Raft{
-				id:                1,
-				commitIndex:       tt.commitIndex,
-				lastApplied:       tt.lastApplied,
-				snapshotThreshold: tt.snapshotThresh,
-				store:             mockStore,
-				stateMachine:      mockSM,
-				notifyApply:       make(map[uint64]chan any),
-				mu:                sync.Mutex{},
+				id:                 1,
+				commitIndex:        tt.commitIndex,
+				lastApplied:        tt.lastApplied,
+				cachedLastLogIndex: tt.commitIndex,
+				snapshotThreshold:  tt.snapshotThresh,
+				store:              mockStore,
+				stateMachine:       mockSM,
+				notifyApply:        make(map[uint64]chan any),
+				mu:                 sync.Mutex{},
 			}
 			r.lastAppliedCond = sync.NewCond(&r.mu)
 
@@ -388,7 +391,7 @@ func TestApplyConfigChange(t *testing.T) {
 			},
 			cmd: param.ConfigChangeCommand{NewPeerIDs: []int{1, 2, 3}},
 			setupMocks: func(s *storage.MockStorage) {
-				s.EXPECT().LastLogIndex().Return(uint64(10), nil).Times(2)
+				// proposeNewConfigEntry uses r.cachedLastLogIndex (set in struct)
 				s.EXPECT().AppendEntries(gomock.Any()).Return(nil)
 			},
 			verify: func(t *testing.T, r *Raft) {
@@ -410,7 +413,7 @@ func TestApplyConfigChange(t *testing.T) {
 				assert.False(t, r.inJointConsensus)
 				assert.Equal(t, []int{1, 2, 3}, r.peerIDs)
 				assert.Nil(t, r.newPeerIDs)
-				assert.Equal(t, Leader, r.state)
+				assert.Equal(t, Leader, r.getState())
 			},
 		},
 		{
@@ -428,7 +431,7 @@ func TestApplyConfigChange(t *testing.T) {
 			},
 			verify: func(t *testing.T, r *Raft) {
 				assert.False(t, r.inJointConsensus)
-				assert.Equal(t, Follower, r.state)
+				assert.Equal(t, Follower, r.getState())
 			},
 		},
 	}
@@ -444,19 +447,20 @@ func TestApplyConfigChange(t *testing.T) {
 			}
 
 			r := &Raft{
-				id:               1,
-				state:            tt.initialState.state,
-				inJointConsensus: tt.initialState.inJoint,
-				peerIDs:          tt.initialState.peerIDs,
-				newPeerIDs:       tt.initialState.newPeerIDs,
-				currentTerm:      tt.initialState.currentTerm,
-				store:            mockStore,
-				nextIndex:        make(map[int]uint64),
-				matchIndex:       make(map[int]uint64),
-				mu:               sync.Mutex{},
-				electionTimeout:  config.Conf.Raft.ElectionTimeout,
-				heartbeatTimeout: config.Conf.Raft.HeartbeatTimeout,
+				id:                 1,
+				inJointConsensus:   tt.initialState.inJoint,
+				peerIDs:            tt.initialState.peerIDs,
+				newPeerIDs:         tt.initialState.newPeerIDs,
+				currentTerm:        tt.initialState.currentTerm,
+				cachedLastLogIndex: 10,
+				store:              mockStore,
+				nextIndex:          make(map[int]uint64),
+				matchIndex:         make(map[int]uint64),
+				mu:                 sync.Mutex{},
+				electionTimeout:    config.Conf.Raft.ElectionTimeout,
+				heartbeatTimeout:   config.Conf.Raft.HeartbeatTimeout,
 			}
+			r.setState(tt.initialState.state)
 			r.lastAppliedCond = sync.NewCond(&r.mu)
 
 			r.applyConfigChange(tt.cmd, 10)
@@ -483,9 +487,11 @@ func TestReplicateLogsToPeer(t *testing.T) {
 				r.commitIndex = 10
 				r.lastApplied = 10
 
+				// Set cachedLastLogIndex for prepareAppendEntriesArgs
+				r.cachedLastLogIndex = 11
 				gomock.InOrder(
 					s.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 5, Index: 10}, nil).Times(1),
-					s.EXPECT().LastLogIndex().Return(uint64(11), nil).Times(1),
+					// prepareAppendEntriesArgs uses r.cachedLastLogIndex now
 					s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Command: "test", Term: 5, Index: 11}, nil).Times(1),
 					tr.EXPECT().SendAppendEntries(strconv.Itoa(peerID), gomock.Any(), gomock.Any()).
 						DoAndReturn(func(id string, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
@@ -495,7 +501,6 @@ func TestReplicateLogsToPeer(t *testing.T) {
 						}).Times(1),
 				)
 
-				s.EXPECT().LastLogIndex().Return(uint64(11), nil).AnyTimes()
 				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11}, nil).AnyTimes()
 				s.EXPECT().FirstLogIndex().Return(uint64(1), nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
@@ -521,7 +526,8 @@ func TestReplicateLogsToPeer(t *testing.T) {
 				peerID := 2
 				r.nextIndex[peerID] = 11
 
-				s.EXPECT().LastLogIndex().Return(uint64(11), nil).AnyTimes()
+				// Set cachedLastLogIndex for prepareAppendEntriesArgs
+				r.cachedLastLogIndex = 11
 				s.EXPECT().GetEntry(gomock.Any()).
 					DoAndReturn(func(index uint64) (*param.LogEntry, error) {
 						return &param.LogEntry{Term: 5, Index: index}, nil
@@ -565,9 +571,10 @@ func TestReplicateLogsToPeer(t *testing.T) {
 			commitChan := make(chan param.CommitEntry, 1)
 
 			mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+			mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 			r := NewRaft(1, []int{2, 3, 4}, mockStore, mockSM, mockTrans, commitChan) // Use 4 nodes to prevent accidental majority
 			defer r.Stop()
-			r.state = Leader
+			r.setState(Leader)
 			r.currentTerm = 5
 
 			if tt.setupMocks != nil {
@@ -631,13 +638,15 @@ func TestAppendEntries(t *testing.T) {
 			},
 			setupMocks: func(s *storage.MockStorage, sm *storage.MockStateMachine, r *Raft) {
 				gomock.InOrder(
+					// checkLogConsistencyLockFree: 检查 PrevLogIndex=10
 					s.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 5, Index: 10}, nil),
-					s.EXPECT().TruncateLog(uint64(11)).Return(nil),
+					// findConflictAndPrepare: 检查 entry 11 是否已存在 → nil → 新条目
+					s.EXPECT().GetEntry(uint64(11)).Return(nil, nil),
+					// 无 TruncateLog（无冲突），直接 AppendEntries
 					s.EXPECT().AppendEntries(gomock.Any()).Return(nil),
-					s.EXPECT().LastLogIndex().Return(uint64(11), nil),
 				)
+				// fetchEntriesToApply 读取条目以应用
 				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Command: "cmd1", Term: 5, Index: 11}, nil).AnyTimes()
-				s.EXPECT().LastLogIndex().Return(uint64(11), nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return("success").AnyTimes()
 			},
 			verify: func(t *testing.T, r *Raft, reply *param.AppendEntriesReply, commitChan chan param.CommitEntry) {
@@ -663,10 +672,12 @@ func TestAppendEntries(t *testing.T) {
 			},
 			setupMocks: func(s *storage.MockStorage, sm *storage.MockStateMachine, r *Raft) {
 				gomock.InOrder(
+					// checkLogConsistencyLockFree: 检查 PrevLogIndex=10
 					s.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 5, Index: 10}, nil),
-					s.EXPECT().TruncateLog(uint64(11)).Return(nil),
+					// findConflictAndPrepare: 检查 entry 11 是否已存在 → nil → 新条目
+					s.EXPECT().GetEntry(uint64(11)).Return(nil, nil),
+					// 无 TruncateLog（无冲突），直接 AppendEntries
 					s.EXPECT().AppendEntries(gomock.Any()).Return(nil),
-					s.EXPECT().LastLogIndex().Return(uint64(11), nil).AnyTimes(),
 				)
 			},
 			verify: func(t *testing.T, r *Raft, reply *param.AppendEntriesReply, _ chan param.CommitEntry) {
@@ -704,15 +715,16 @@ func TestAppendEntries(t *testing.T) {
 			commitChan := make(chan param.CommitEntry, 1)
 
 			r := &Raft{
-				id:               2,
-				currentTerm:      tt.initialState.term,
-				store:            mockStore,
-				stateMachine:     mockSM,
-				commitChan:       commitChan,
-				lastApplied:      tt.initialState.lastApplied,
-				mu:               sync.Mutex{},
-				electionTimeout:  config.Conf.Raft.ElectionTimeout,
-				heartbeatTimeout: config.Conf.Raft.HeartbeatTimeout,
+				id:                 2,
+				currentTerm:        tt.initialState.term,
+				store:              mockStore,
+				stateMachine:       mockSM,
+				commitChan:         commitChan,
+				lastApplied:        tt.initialState.lastApplied,
+				cachedLastLogIndex: tt.initialState.lastApplied,
+				mu:                 sync.Mutex{},
+				electionTimeout:    config.Conf.Raft.ElectionTimeout,
+				heartbeatTimeout:   config.Conf.Raft.HeartbeatTimeout,
 			}
 			r.lastAppliedCond = sync.NewCond(&r.mu)
 
@@ -818,12 +830,13 @@ func TestProcessAppendEntriesReply(t *testing.T) {
 			reply:        &param.AppendEntriesReply{Term: 6, Success: false},
 			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine) {
 				s.EXPECT().GetState().Return(param.HardState{CurrentTerm: 5}, nil).Times(1)
+				s.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 				s.EXPECT().SetState(param.HardState{CurrentTerm: 6, VotedFor: math.MaxUint64}).Return(nil).Times(1)
 			},
 			verify: func(t *testing.T, r *Raft, pastTime time.Time) {
 				r.mu.Lock()
 				defer r.mu.Unlock()
-				assert.Equal(t, Follower, r.state)
+				assert.Equal(t, Follower, r.getState())
 				assert.Equal(t, uint64(6), r.currentTerm)
 				assert.Equal(t, -1, r.votedFor)
 				assert.False(t, r.lastAck[2].After(pastTime))
@@ -835,8 +848,8 @@ func TestProcessAppendEntriesReply(t *testing.T) {
 			reply:        &param.AppendEntriesReply{Term: 5, Success: true},
 			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine) {
 				s.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+				s.EXPECT().LastLogIndex().Return(uint64(10), nil).Times(1)
 				s.EXPECT().GetEntry(gomock.Any()).Return(&param.LogEntry{Term: 5}, nil).AnyTimes()
-				s.EXPECT().LastLogIndex().Return(uint64(10), nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
 			},
 			verify: func(t *testing.T, r *Raft, pastTime time.Time) {
@@ -853,7 +866,7 @@ func TestProcessAppendEntriesReply(t *testing.T) {
 			reply:        &param.AppendEntriesReply{Term: 5, Success: false},
 			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine) {
 				s.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
-				s.EXPECT().LastLogIndex().Return(uint64(10), nil).AnyTimes()
+				s.EXPECT().LastLogIndex().Return(uint64(10), nil).Times(1)
 				s.EXPECT().FirstLogIndex().Return(uint64(1), nil).AnyTimes()
 				s.EXPECT().GetEntry(gomock.Any()).Return(&param.LogEntry{Term: 5}, nil).AnyTimes()
 				tr.EXPECT().SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
@@ -879,7 +892,7 @@ func TestProcessAppendEntriesReply(t *testing.T) {
 
 			r := NewRaft(1, []int{2}, mockStore, mockSM, mockTrans, commitChan)
 			defer r.Stop()
-			r.state = tt.initialState.state
+			r.setState(tt.initialState.state)
 			r.currentTerm = tt.initialState.term
 
 			pastTime := time.Now().Add(-1 * time.Second)

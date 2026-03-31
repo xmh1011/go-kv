@@ -50,7 +50,7 @@ func (r *Raft) determineReplicationAction(peerID int) replicationAction {
 	defer r.mu.Unlock()
 
 	// 检查一：如果当前节点不再是 Leader，则不执行任何操作。
-	if r.state != Leader {
+	if r.getState() != Leader {
 		return actionDoNothing
 	}
 
@@ -119,10 +119,7 @@ func (r *Raft) prepareAppendEntriesArgs(peerID int) (*param.AppendEntriesArgs, e
 	}
 
 	var entries []param.LogEntry
-	lastLogIndex, err := r.store.LastLogIndex()
-	if err != nil {
-		return nil, err
-	}
+	lastLogIndex := r.cachedLastLogIndex
 	if r.nextIndex[peerID] <= lastLogIndex {
 		// 限制单次发送的日志数量，避免一次性发送过多导致超时
 		endIndex := r.nextIndex[peerID] + uint64(MaxEntriesPerAppendEntries) - 1
@@ -151,7 +148,7 @@ func (r *Raft) prepareAppendEntriesArgs(peerID int) (*param.AppendEntriesArgs, e
 // processAppendEntriesReply 负责处理从对等节点返回的 AppendEntries 响应。
 // 此函数必须在持有锁的情况下被调用。
 func (r *Raft) processAppendEntriesReply(peerID int, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply, savedCurrentTerm uint64) {
-	if r.currentTerm != savedCurrentTerm || r.state != Leader {
+	if r.currentTerm != savedCurrentTerm || r.getState() != Leader {
 		return
 	}
 
@@ -165,7 +162,7 @@ func (r *Raft) processAppendEntriesReply(peerID int, args *param.AppendEntriesAr
 		return
 	}
 
-	if r.state == Leader {
+	if r.getState() == Leader {
 		// 无论 Success 是 true 还是 false，
 		// 只要任期匹配，就说明 Follower 确认了我们的 Leader 地位。
 		// 这足以用于 ReadIndex 的租约。
@@ -233,14 +230,30 @@ func (r *Raft) updateCommitIndex() {
 }
 
 // findMajorityCommitIndex 计算可以被安全提交的最高日志索引。
+// 优化：从 max(matchIndex[*]) 开始搜索，而非 lastLogIndex，
+// 因为多数时候 majority commit point 接近最高 matchIndex。
 func (r *Raft) findMajorityCommitIndex() uint64 {
-	lastLogIndex, err := r.store.LastLogIndex()
-	if err != nil {
-		return r.commitIndex // Return current commitIndex on error
+	// 找到最大的 matchIndex 作为搜索起点
+	searchStart := r.commitIndex
+	for _, peerID := range r.peerIDs {
+		if mi := r.matchIndex[peerID]; mi > searchStart {
+			searchStart = mi
+		}
+	}
+	if r.inJointConsensus {
+		for _, peerID := range r.newPeerIDs {
+			if mi := r.matchIndex[peerID]; mi > searchStart {
+				searchStart = mi
+			}
+		}
+	}
+	// 不超过 cachedLastLogIndex
+	if searchStart > r.cachedLastLogIndex {
+		searchStart = r.cachedLastLogIndex
 	}
 
 	// 从后往前检查每一个日志索引，看它是否满足多数派提交的条件。
-	for N := lastLogIndex; N > r.commitIndex; N-- {
+	for N := searchStart; N > r.commitIndex; N-- {
 		// 检查索引 N 是否被多数节点复制。
 		if r.isReplicatedByMajority(N) {
 			// 如果满足，这就是可以提交的最高索引，直接返回。
@@ -283,41 +296,183 @@ func (r *Raft) isReplicatedByMajority(index uint64) bool {
 }
 
 // AppendEntries 是 Follower 节点上的 RPC 处理函数，用于接收 Leader 的心跳和日志。
+//
+// 优化：使用三阶段锁模式，将磁盘 I/O 移出 r.mu 锁。
+// Phase 0: appendEntriesMu 串行化所有 AppendEntries 处理
+// Phase 1: r.mu 短锁 — 任期检查 + 心跳 + 收集快照信息
+// Phase 2: 锁外磁盘 I/O — 一致性检查 + TruncateLog + AppendEntries
+// Phase 3: r.mu 短锁 — 验证任期未变 + 更新 commitIndex
 func (r *Raft) AppendEntries(args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
+	// Phase 0: 串行化所有 AppendEntries 处理
+	r.appendEntriesMu.Lock()
+	defer r.appendEntriesMu.Unlock()
+
+	// === Phase 1: 短锁 — 任期检查 + 心跳处理 ===
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	// 1. 处理任期检查和心跳。
 	if !r.handleTermAndHeartbeat(args, reply) {
+		r.mu.Unlock()
 		return nil
 	}
 
-	// 2. 进行日志一致性检查。
-	if ok := r.checkLogConsistency(args, reply); !ok {
+	// 快速路径：心跳（无日志条目）无需磁盘 I/O
+	if len(args.Entries) == 0 {
+		// 直接进行日志一致性检查（短操作）
+		if ok := r.checkLogConsistency(args, reply); !ok {
+			r.mu.Unlock()
+			return nil
+		}
+		r.updateFollowerCommitIndex(args)
+		reply.Success = true
+		r.mu.Unlock()
 		return nil
 	}
 
-	// 3. 追加并存储新的日志条目。
-	if len(args.Entries) > 0 {
-		if err := r.store.TruncateLog(args.PrevLogIndex + 1); err != nil {
-			log.Errorf("[Replication] Node %d failed to truncate log: %v", r.id, err)
+	// 捕获快照引用用于锁外一致性检查
+	snapshot := r.snapshot
+	savedTerm := r.currentTerm
+	r.mu.Unlock()
+
+	// === Phase 2: 锁外磁盘 I/O ===
+	// appendEntriesMu 保证此期间不会有另一个 AppendEntries 执行 TruncateLog
+
+	// 2. 日志一致性检查（锁外）
+	if ok := r.checkLogConsistencyLockFree(args, reply, snapshot); !ok {
+		return nil
+	}
+
+	// 3. Raft 正确的日志追加：仅在发现冲突时截断，保护已提交的条目。
+	//    对比 incoming entries 与 store 中已有的条目，从第一个不匹配处截断。
+	//    这避免了在 truncate 和 append 之间的窗口期内删除已提交的条目，
+	//    从而防止并发 applyLogs goroutine 读到 nil entry 导致 fatal。
+	newEntries, truncateFrom, err := r.findConflictAndPrepare(args)
+	if err != nil {
+		reply.Success = false
+		return err
+	}
+
+	if truncateFrom > 0 {
+		if err := r.store.TruncateLog(truncateFrom); err != nil {
+			log.Errorf("[Replication] Node %d failed to truncate log from %d: %v", r.id, truncateFrom, err)
 			reply.Success = false
 			return err
 		}
-		if err := r.store.AppendEntries(args.Entries); err != nil {
+	}
+
+	if len(newEntries) > 0 {
+		if err := r.store.AppendEntries(newEntries); err != nil {
 			log.Errorf("[Replication] Node %d failed to append entries to store: %v", r.id, err)
 			reply.Success = false
 			return err
 		}
-		log.Infof("[Log Replication] Node %d accepted and stored %d new entries from leader %d", r.id, len(args.Entries), args.LeaderID)
+	}
+	log.Infof("[Log Replication] Node %d accepted and stored %d new entries from leader %d", r.id, len(newEntries), args.LeaderID)
+
+	// === Phase 3: 短锁 — 验证任期 + 更新 commitIndex ===
+	r.mu.Lock()
+
+	// 验证任期未在 Phase 2 期间变化
+	if r.currentTerm != savedTerm {
+		// 任期已变，放弃更新（但日志已写入磁盘，无害）
+		r.mu.Unlock()
+		reply.Success = true
+		return nil
+	}
+
+	// 更新缓存的 lastLogIndex：使用 args.Entries 中的最后一个 entry 的 Index，
+	// 因为无论是否有冲突截断，最终结果都是 store 中包含了所有 args.Entries。
+	newLastIndex := args.Entries[len(args.Entries)-1].Index
+	if newLastIndex > r.cachedLastLogIndex {
+		r.cachedLastLogIndex = newLastIndex
+	} else if truncateFrom > 0 {
+		// 如果发生了截断，lastLogIndex 可能减小了
+		r.cachedLastLogIndex = newLastIndex
 	}
 
 	// 4. 根据 Leader 的进度更新本地的 commitIndex。
 	r.updateFollowerCommitIndex(args)
 
-	// 所有步骤都成功完成。
 	reply.Success = true
+	r.mu.Unlock()
 	return nil
+}
+
+// checkLogConsistencyLockFree 在锁外执行日志一致性检查。
+// 使用传入的 snapshot 引用代替 r.snapshot，直接调用 store 方法。
+// 安全性：appendEntriesMu 保证此期间无并发日志修改。
+func (r *Raft) checkLogConsistencyLockFree(args *param.AppendEntriesArgs, reply *param.AppendEntriesReply, snapshot *param.Snapshot) bool {
+	if args.PrevLogIndex == 0 {
+		return true
+	}
+
+	// 先检查快照
+	if snapshot != nil && args.PrevLogIndex == snapshot.LastIncludedIndex {
+		if snapshot.LastIncludedTerm == args.PrevLogTerm {
+			return true
+		}
+		reply.Success = false
+		reply.ConflictTerm = snapshot.LastIncludedTerm
+		reply.ConflictIndex = args.PrevLogIndex
+		return false
+	}
+
+	prevEntry, err := r.store.GetEntry(args.PrevLogIndex)
+	if err != nil {
+		log.Errorf("[Replication] Node %d failed to get entry %d from store: %v", r.id, args.PrevLogIndex, err)
+		reply.Success = false
+		lastLogIndex, _ := r.store.LastLogIndex()
+		reply.ConflictIndex = lastLogIndex + 1
+		reply.ConflictTerm = 0
+		return false
+	}
+	if prevEntry == nil || prevEntry.Term != args.PrevLogTerm {
+		if prevEntry == nil {
+			lastLogIndex, _ := r.store.LastLogIndex()
+			reply.ConflictIndex = lastLogIndex + 1
+			reply.ConflictTerm = 0
+		} else {
+			reply.ConflictTerm = prevEntry.Term
+			reply.ConflictIndex = args.PrevLogIndex
+		}
+		reply.Success = false
+		return false
+	}
+
+	return true
+}
+
+// findConflictAndPrepare 对比 incoming entries 与 store 中已有的条目，
+// 找到第一个冲突点，返回需要追加的新条目和需要截断的起始索引。
+// 这是 Raft 论文 Section 5.3 的正确实现：
+// "If an existing entry conflicts with a new one (same index but different terms),
+//  delete the existing entry and all that follow it."
+//
+// 返回值:
+//   - newEntries: 需要追加到 store 的条目（跳过已存在且一致的条目）
+//   - truncateFrom: 如果 > 0，表示需要从此索引开始截断
+//   - err: 错误
+func (r *Raft) findConflictAndPrepare(args *param.AppendEntriesArgs) (newEntries []param.LogEntry, truncateFrom uint64, err error) {
+	for i, entry := range args.Entries {
+		existing, err := r.store.GetEntry(entry.Index)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to get entry %d: %w", entry.Index, err)
+		}
+
+		if existing == nil {
+			// 此索引不存在条目，从这里开始都是新的
+			return args.Entries[i:], 0, nil
+		}
+
+		if existing.Term != entry.Term {
+			// 冲突：同一索引但不同任期，从这里截断并追加
+			return args.Entries[i:], entry.Index, nil
+		}
+		// 条目一致，跳过
+	}
+
+	// 所有条目都已存在且一致，无需任何操作
+	return nil, 0, nil
 }
 
 // handleTermAndHeartbeat 负责处理任期检查和重置选举计时器。
@@ -366,8 +521,7 @@ func (r *Raft) checkLogConsistency(args *param.AppendEntriesArgs, reply *param.A
 		reply.Success = false
 		// 如果获取日志失败（例如被压缩了），我们应该给 Leader 一个提示。
 		// 最好的方式是告诉 Leader 我们当前的最后一条日志索引，让它从那里开始尝试。
-		lastLogIndex, _ := r.store.LastLogIndex()
-		reply.ConflictIndex = lastLogIndex + 1
+		reply.ConflictIndex = r.cachedLastLogIndex + 1
 		reply.ConflictTerm = 0
 		return false
 	}
@@ -375,8 +529,7 @@ func (r *Raft) checkLogConsistency(args *param.AppendEntriesArgs, reply *param.A
 	if prevEntry == nil || prevEntry.Term != args.PrevLogTerm {
 		// 如果 prevEntry 为 nil，说明本地日志在 prevLogIndex 处没有条目，即日志过短。
 		if prevEntry == nil {
-			lastLogIndex, _ := r.store.LastLogIndex()
-			reply.ConflictIndex = lastLogIndex + 1
+			reply.ConflictIndex = r.cachedLastLogIndex + 1
 			reply.ConflictTerm = 0 // 用 0 表示此处没有日志
 		} else {
 			// 如果 prevEntry 不为 nil 但任期不匹配，则记录冲突的任期和索引。
@@ -393,11 +546,7 @@ func (r *Raft) checkLogConsistency(args *param.AppendEntriesArgs, reply *param.A
 // updateFollowerCommitIndex 根据 Leader 发来的 leaderCommit 更新 Follower 的 commitIndex。
 func (r *Raft) updateFollowerCommitIndex(args *param.AppendEntriesArgs) {
 	if args.LeaderCommit > r.commitIndex {
-		newLastLogIndex, err := r.store.LastLogIndex()
-		if err != nil {
-			log.Errorf("[Replication] Node %d failed to get last log index: %v", r.id, err)
-			return
-		}
+		newLastLogIndex := r.cachedLastLogIndex
 		oldCommitIndex := r.commitIndex
 		if args.LeaderCommit <= newLastLogIndex {
 			r.commitIndex = args.LeaderCommit
@@ -432,17 +581,17 @@ func (r *Raft) applyLogs() {
 
 // fetchEntriesToApply 负责从存储中获取所有已提交但尚未应用的日志条目。
 // 在获取数据后安全地更新 r.lastApplied 索引。
+//
+// 并发安全：先获取 appendEntriesMu 再获取 r.mu，确保读取 store 期间
+// 不会有并发的 TruncateLog + AppendEntries（来自三阶段 AppendEntries 的 Phase 2）。
+// 这防止了 Leader 切换时合法的日志截断导致已提交条目短暂不可见的问题。
 func (r *Raft) fetchEntriesToApply() ([]param.LogEntry, uint64) {
+	r.appendEntriesMu.Lock()
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	var entries []param.LogEntry
 	if r.commitIndex > r.lastApplied {
-		lastLogIndex, err := r.store.LastLogIndex()
-		if err != nil {
-			log.Errorf("[Replication] Node %d failed to get last log index while applying: %v", r.id, err)
-			return entries, r.lastApplied
-		}
+		lastLogIndex := r.cachedLastLogIndex
 
 		if r.commitIndex > lastLogIndex {
 			log.Warnf("[Replication] Node %d commitIndex %d exceeds lastLogIndex %d, clamping", r.id, r.commitIndex, lastLogIndex)
@@ -453,6 +602,8 @@ func (r *Raft) fetchEntriesToApply() ([]param.LogEntry, uint64) {
 			entry, err := r.store.GetEntry(i)
 			if err != nil || entry == nil {
 				log.Fatalf("[FATAL] Node %d could not retrieve committed log entry %d to apply it. Error: %v", r.id, i, err)
+				r.mu.Unlock()
+				r.appendEntriesMu.Unlock()
 				return nil, 0
 			}
 			entries = append(entries, *entry)
@@ -464,6 +615,9 @@ func (r *Raft) fetchEntriesToApply() ([]param.LogEntry, uint64) {
 		r.lastApplied = entries[len(entries)-1].Index
 		r.lastAppliedCond.Broadcast()
 	}
+
+	r.mu.Unlock()
+	r.appendEntriesMu.Unlock()
 
 	return entries, lastAppliedBeforeUpdate
 }
@@ -526,12 +680,11 @@ func (r *Raft) applyConfigChange(cmd param.ConfigChangeCommand, entryIndex uint6
 		log.Infof("[Config Change] Node %d entering joint consensus at index %d.", r.id, entryIndex)
 
 		// 如果当前节点是 Leader，它有责任立即提交第二阶段的配置日志 (C_new)，以完成变更。
-		if r.state == Leader {
+		if r.getState() == Leader {
 			// 初始化新加入节点的 nextIndex 和 matchIndex
-			lastLogIndex, _ := r.store.LastLogIndex()
 			for _, peerID := range r.newPeerIDs {
 				if _, ok := r.nextIndex[peerID]; !ok {
-					r.nextIndex[peerID] = lastLogIndex + 1
+					r.nextIndex[peerID] = r.cachedLastLogIndex + 1
 					r.matchIndex[peerID] = 0
 				}
 			}
@@ -548,7 +701,7 @@ func (r *Raft) applyConfigChange(cmd param.ConfigChangeCommand, entryIndex uint6
 		// 检查自己是否还属于新配置。
 		// 如果 Leader 发现自己被移除了，必须立即“退位” (Step Down)。
 		_, exists := findPeer(r.id, r.peerIDs)
-		if !exists && r.state == Leader {
+		if !exists && r.getState() == Leader {
 			log.Infof("[Config Change] Leader %d detected it is NOT in the new configuration. Stepping down.", r.id)
 
 			// 自动降级为 Follower。
@@ -601,18 +754,14 @@ func (r *Raft) applyStateMachineCommand(entry param.LogEntry) {
 // proposeNewConfigEntry 是 Leader 用于提交 C_new（最终配置）日志条目的辅助函数。
 func (r *Raft) proposeNewConfigEntry() {
 	configCmd := param.NewConfigChangeCommand(r.newPeerIDs)
-	lastIndex, err := r.store.LastLogIndex()
-	if err != nil {
-		log.Errorf("[Replication] Leader %d failed to get last log index for C_new entry: %v", r.id, err)
-		return
-	}
-
-	newIndex := lastIndex + 1
+	newIndex := r.cachedLastLogIndex + 1
 	newLogEntry := param.NewLogEntry(configCmd, r.currentTerm, newIndex)
 	if err := r.store.AppendEntries([]param.LogEntry{newLogEntry}); err != nil {
 		log.Errorf("[Replication] leader %d failed to append C_new config entry: %s", r.id, err.Error())
 		return
 	}
+	// 更新缓存
+	r.cachedLastLogIndex = newIndex
 	log.Infof("[Replication] leader %d proposed final C_new config entry at index %d", r.id, newIndex)
 }
 

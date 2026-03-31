@@ -6,7 +6,7 @@ go-kv 是一个基于 Raft 共识协议的分布式 KV 存储系统，使用 LSM
 
 ---
 
-## 测试总览 (2026-03-30)
+## 测试总览 (2026-03-31)
 
 **测试环境**: macOS Darwin 25.3.0, Apple Silicon, Go 1.24+
 
@@ -14,7 +14,7 @@ go-kv 是一个基于 Raft 共识协议的分布式 KV 存储系统，使用 LSM
 |---------|------|------|
 | 单元测试 | 16 packages | **全部通过** |
 | 竞态检测 (race) | 16 packages | **全部通过，零 race** |
-| Benchmark 测试 | 30 benchmarks | **全部通过** |
+| Benchmark 测试 | 31 benchmarks | **全部通过** |
 | E2E 性能测试 (30s) | 6 tests | **全部通过** |
 | 长时间 E2E 测试 (10min) | 5 tests | **全部通过** |
 
@@ -26,52 +26,56 @@ go-kv 是一个基于 Raft 共识协议的分布式 KV 存储系统，使用 LSM
 
 ### 综合测试 (Comprehensive)
 
-混合负载：60% 写入 + 25% 读取 + 15% 删除，含故障注入和 Leader 切换。
+混合负载：60% 写入 + 25% 读取 + 15% 删除，10 个并发客户端。
 
 | 指标 | 数值 |
 |------|------|
-| 总操作数 | 1,077,504 |
-| 成功率 | **100.00%** |
-| 总吞吐量 | **1,795 ops/sec** |
-| 写入吞吐 | 1,078 ops/sec |
-| 读取吞吐 | 448 ops/sec |
-| 删除吞吐 | 269 ops/sec |
-| P50 延迟 | 2.22ms |
-| P99 延迟 | 48.42ms |
-| Leader 切换 | 3 次 |
+| 总操作数 | 1,630,986 |
+| 成功操作 | 1,343,140 |
+| 成功率 | 82.35%（详见下方分析） |
+| 总吞吐量 | **2,239 ops/sec** |
+| 写入吞吐 | 1,630 ops/sec |
+| 读取吞吐 | 680 ops/sec |
+| 删除吞吐 | 409 ops/sec |
+| P50 延迟 | 1.36ms |
+| P99 延迟 | 36.28ms |
+| Leader 切换 | 46 次 |
 
 ### 写入密集型 (WriteHeavy)
 
 | 指标 | 数值 |
 |------|------|
-| 总操作数 | 797,002 |
+| 总操作数 | 967,222 |
 | 成功率 | **100.00%** |
-| 写入吞吐 | **1,328 ops/sec** |
-| P50 延迟 | 2.34ms |
-| P99 延迟 | 46.26ms |
+| 写入吞吐 | **1,612 ops/sec** |
+| P50 延迟 | 1.52ms |
+| P99 延迟 | 28.49ms |
+| Leader 切换 | 44 次 |
 
 ### 故障恢复混合测试 (MixedWithFailures)
 
-含节点宕机和恢复模拟。
+含节点宕机和恢复模拟（每 2 分钟触发一次 Follower 节点停止，30 秒后恢复，最多 2 次）。
 
 | 指标 | 数值 |
 |------|------|
-| 总操作数 | 1,468,905 |
-| 成功率 | **100.00%** |
-| 总吞吐量 | **2,448 ops/sec** |
-| P50 延迟 | 894µs |
-| P99 延迟 | 13.40ms |
+| 总操作数 | 2,314,291 |
+| 成功操作 | 1,936,645 |
+| 成功率 | 83.68%（详见下方分析） |
+| 总吞吐量 | **3,228 ops/sec** |
+| P50 延迟 | 578µs |
+| P99 延迟 | 8.50ms |
+| Leader 切换 | 42 次 |
 
 ### 读取密集型 (ReadHeavy)
 
 | 指标 | 数值 |
 |------|------|
-| 总操作数 | **206,803,532** |
+| 总操作数 | **472,519,981** |
 | 成功率 | **100.00%** |
-| 读取吞吐 | **344,672 ops/sec** |
-| 读取流量 | 13.08 MB/s |
+| 读取吞吐 | **787,533 ops/sec** |
+| 读取流量 | 29.88 MB/s |
 | P50 延迟 | 1.58µs |
-| P99 延迟 | 308µs |
+| P99 延迟 | 104µs |
 
 ### 删除压力测试 (DeleteStress)
 
@@ -79,13 +83,39 @@ go-kv 是一个基于 Raft 共识协议的分布式 KV 存储系统，使用 LSM
 
 | 指标 | 数值 |
 |------|------|
-| 总操作数 | 823,894 |
+| 总操作数 | 1,687,774 |
 | 成功率 | **100.00%** |
-| 总吞吐量 | **1,373 ops/sec** |
-| 写入吞吐 | 823 ops/sec |
-| 删除吞吐 | 549 ops/sec |
-| P50 延迟 | 2.27ms |
-| P99 延迟 | 41.58ms |
+| 总吞吐量 | **2,813 ops/sec** |
+| 写入吞吐 | 1,686 ops/sec |
+| 删除吞吐 | 1,127 ops/sec |
+| P50 延迟 | 1.07ms |
+| P99 延迟 | 11.60ms |
+| Leader 切换 | 65 次 |
+
+### 长时测试成功率分析
+
+三阶段锁优化后，Comprehensive（82.35%）和 MixedWithFailures（83.68%）的成功率低于 100%。根因分析如下：
+
+**直接原因：`appendEntriesMu` 导致心跳被阻塞，触发频繁选举**
+
+三阶段锁引入了 `appendEntriesMu` 互斥锁，用于串行化 Follower 侧的 AppendEntries Phase 2（磁盘 I/O）。但 `fetchEntriesToApply`（日志应用）也需要先获取 `appendEntriesMu` 再获取 `r.mu`，以防止读取到正在被截断的日志。这导致以下阻塞链：
+
+```
+心跳 AppendEntries → 等待 appendEntriesMu → 被 fetchEntriesToApply 或正在进行的日志追加阻塞
+→ 心跳超时 → Follower 发起选举 → Leader 切换 → 客户端请求失败
+```
+
+**证据**：
+- 优化前 Comprehensive 仅 3 次 Leader 切换，现在 46 次（10 个并发客户端持续高负载放大了锁争用）
+- WriteHeavy 也有 44 次 Leader 切换，但因为只有写入（无读取），客户端可以快速切换到新 Leader，成功率仍为 100%
+- ReadHeavy 0 次 Leader 切换（纯读取不经过 `appendEntriesMu`）
+- MixedWithFailures 有显式故障注入（节点宕机），42 次切换中部分是注入造成的
+
+**本质**：这是吞吐量 vs 稳定性的 trade-off。三阶段锁将写入吞吐量从 1,795 提升到 2,239 ops/sec（+25%），但 `appendEntriesMu` 的锁争用在高并发混合负载下导致心跳延迟，引发不必要的选举。
+
+**后续优化方向**：
+- 为心跳 AppendEntries（`len(args.Entries) == 0`）设置高优先级，跳过 `appendEntriesMu` 排队
+- 或增大选举超时（当前 500ms），给高负载下的心跳更多余量
 
 ---
 
@@ -104,17 +134,50 @@ go-kv 是一个基于 Raft 共识协议的分布式 KV 存储系统，使用 LSM
 
 ## Benchmark 测试结果
 
-**配置**: 3 节点 Raft, 1000 次迭代, InMemory 传输（除 TCP 和 LSM 测试外）
+**配置**: 3 节点 Raft, 100 次迭代, InMemory 传输（除 TCP/LSM/gRPC 测试外）
+
+### 集群端到端 Benchmark
 
 | Benchmark | ns/op | 等效 ops/sec |
 |-----------|-------|-------------|
-| 3NodesInmemory | 239,208 | ~4,180 |
-| 3NodesTcp | 120,779 | ~8,280 |
-| ConcurrentWrites | 41,650 | ~24,010 |
-| SmallKeys | 46,290 | ~21,600 |
-| MediumKeys (256B) | 104,760 | ~9,546 |
-| LargeKeys (4KB) | 312,951 | ~3,195 |
-| 3NodesLSM | 177,507 | ~5,634 |
+| 3NodesInmemory | 87,954 | ~11,370 |
+| 3NodesTcp | 180,378 | ~5,544 |
+| ConcurrentWrites | 44,231 | ~22,610 |
+| SmallKeys | 49,409 | ~20,240 |
+| MediumKeys (256B) | 55,010 | ~18,180 |
+| LargeKeys (4KB) | 531,370 | ~1,882 |
+| 3NodesLSM | 144,943 | ~6,899 |
+
+### 生产环境 Benchmark (gRPC + LSM)
+
+| Benchmark | ns/op | 等效 ops/sec | allocs/op |
+|-----------|-------|-------------|-----------|
+| GrpcLsm_3Nodes | 15,451 | ~64,720 | 33 |
+| GrpcLsm_ConcurrentWrites | 377,756 | ~2,647 | 1,890 |
+| GrpcLsm_SmallKeys | 335,771 | ~2,978 | 1,128 |
+| GrpcLsm_MediumKeys (256B) | 275,988 | ~3,623 | 1,134 |
+| GrpcLsm_LargeKeys (4KB) | 1,036,177 | ~965 | 1,162 |
+| GrpcLsm_MixedWorkload | 544,493 | ~1,837 | 2,118 |
+| GrpcLsm_ReadAfterWrite | 988,680 | ~1,011 | 1,244 |
+| GrpcLsm_5Nodes | 329,823 | ~3,032 | 60 |
+
+### 微基准测试
+
+| Benchmark | ns/op | 等效 ops/sec |
+|-----------|-------|-------------|
+| AppendEntries RPC | 3,486 | ~286,860 |
+| RequestVote RPC | 2,435 | ~410,680 |
+| LogEntry 序列化 | 438 | ~2,285,000 |
+| LogEntry 反序列化 | 2,018 | ~495,540 |
+| KVCommand 序列化 | 152 | ~6,590,000 |
+| ClientRequestProcessing | 1,302 | ~768,050 |
+| StateMachine Apply | 746 | ~1,340,480 |
+| StateMachine Get | 9 | ~109,050,000 |
+| Storage AppendEntries | 7,172 | ~139,430 |
+| Storage GetEntry | 5 | ~200,000,000 |
+| MixedWorkload (单节点) | 94,008 | ~10,638 |
+| SnapshotCreation | 213 | ~4,700,000 |
+| SnapshotApply | 2,667,004 | ~375 |
 
 ---
 
@@ -134,12 +197,56 @@ go-kv 是一个基于 Raft 共识协议的分布式 KV 存储系统，使用 LSM
 1. **WriteHeavy 成功率从 53% 提升到 100%** — 之前近一半写入失败，现在全部成功
 2. **写入吞吐量提升 6.2 倍** — 从 717 ops/sec 到 4,439 ops/sec
 3. **写入延迟降低一个数量级** — P50 从 5.25ms 降到 480µs
-4. **所有场景 100% 成功率** — 零失败
-5. **10 分钟长时稳定性验证通过** — 累计处理 2.1 亿次操作，含故障注入和 Leader 切换
+4. **10 分钟长时稳定性验证通过** — 累计处理 4.8 亿次操作
+5. **ReadHeavy 10min 吞吐提升 2.3x** — 从 344,672 ops/sec 到 787,533 ops/sec
+6. **DeleteStress 吞吐提升 2.0x** — 从 1,373 ops/sec 到 2,813 ops/sec
+7. **Comprehensive/MixedWithFailures 吞吐量提升** — 分别提升 25%/32%，但三阶段锁的 `appendEntriesMu` 争用在高并发混合负载下导致 Leader 频繁切换，成功率从 100% 降至 ~83%（详见长时测试成功率分析章节）
 
 ---
 
-## 已完成的优化 (2026-03-30)
+## 已完成的优化 (2026-03-31)
+
+### Raft 全局锁优化 — 三阶段锁与并发改进
+
+以下 6 项优化是 2026-03-30~31 期间针对 Raft 全局锁瓶颈（PERFORMANCE.md P0 问题）实施的改进。虽然未完全消除全局锁，但通过减少锁持有时间和降低锁竞争，显著改善了写入性能。
+
+#### 11. Follower AppendEntries 三阶段锁 [高收益]
+
+**文件**: `raft/replication.go`
+
+将 Follower 侧 AppendEntries 处理从全程持锁改为三阶段：Phase 1 短锁（任期检查 + 心跳）→ Phase 2 无锁（磁盘 I/O：TruncateLog + AppendEntries）→ Phase 3 短锁（提交推进）。引入 `appendEntriesMu` 串行化多个并发 AppendEntries 的 Phase 2，防止 TruncateLog 竞态。
+
+#### 12. Leader sendSnapshot 磁盘读取移出锁 [中收益]
+
+**文件**: `raft/snapshot.go`
+
+`sendSnapshot` 中的 `store.ReadSnapshot()` 从锁内移到锁外执行。快照文件可能很大（MB 级），磁盘读取在锁内会阻塞所有其他 Raft 操作。
+
+#### 13. Leader replicateLogsToPeer 网络 I/O 移出锁 [高收益]
+
+**文件**: `raft/replication.go`
+
+将日志复制拆分为 `determineReplicationAction`（短锁：读取 nextIndex、准备 args）和 `replicateLogsToPeer`（无锁：网络 I/O + 响应处理）。网络往返通常在毫秒级，将其移出锁显著减少了锁持有时间。
+
+#### 14. InstallSnapshot Follower 侧锁优化 [中收益]
+
+**文件**: `raft/snapshot.go`
+
+Follower 接收快照时，将快照对象创建和部分校验移到锁外。仅在需要修改 Raft 状态（commitIndex、lastApplied）时持锁。
+
+#### 15. Election Pre-Vote/Real-Vote 并行 RPC [低收益]
+
+**文件**: `raft/election.go`
+
+选举 RPC 已经在独立 goroutine 中并行发送（每个 Peer 一个 goroutine），但选举结果处理（`handleElectionResult`）也移到了独立 goroutine 中，不阻塞 `startElection` 调用方。
+
+#### 16. TakeSnapshot 异步化 [中收益]
+
+**文件**: `raft/snapshot.go`
+
+`store.SaveSnapshot` 和 `store.CompactLog` 在独立 goroutine 中异步执行，不阻塞 Raft 主循环。`isSnapshotting` 标志确保串行化。
+
+### 此前已完成的优化（LSM 与编码层）
 
 ### 1. KV 编码优化：消除 binary.Write 反射 [高收益]
 
@@ -201,6 +308,12 @@ go-kv 是一个基于 Raft 共识协议的分布式 KV 存储系统，使用 LSM
 
 `prepareAppendEntriesArgs` 中当 `GetEntry` 返回 `nil, nil`（entry 不存在但无 error）时，原代码将 nil error 传给调用方，导致 nil args 被用于 SendAppendEntries → panic。修复为返回明确的 `fmt.Errorf("log entry at index %d not found")`。
 
+### 17. InMemory Storage GetEntry 接口行为统一 [高收益]
+
+**文件**: `pkg/storage/inmemory/storage.go`
+
+InMemory Storage 的 `GetEntry` 在 index 越界时返回 `(nil, ErrLogNotFound)`，但 LSM Storage 返回 `(nil, nil)`。Raft 层的 `findConflictAndPrepare` 将 non-nil error 视为致命错误，导致所有使用 InMemory Storage 的 benchmark（3NodesInmemory、SmallKeys、MediumKeys、LargeKeys 等）每次操作耗时 ~5 秒（等待 `waitForAppliedLog` 超时）。修复为返回 `(nil, nil)`，统一两种存储后端的接口契约。此修复使 InMemory benchmark 性能恢复正常：3NodesInmemory 从 5s/op 降至 87,954 ns/op（**57,000x 提升**）。
+
 ---
 
 ## 已尝试但回退的优化
@@ -227,12 +340,23 @@ go-kv 是一个基于 Raft 共识协议的分布式 KV 存储系统，使用 LSM
 
 ## 当前存在的问题
 
-### P0: Raft 全局锁是写入性能瓶颈
+### P0: Raft 全局锁仍是写入性能瓶颈（已缓解）
 
-Raft 使用单一 `sync.Mutex` 保护所有状态，80+ 处 Lock/Unlock 调用。写入操作的完整路径 — 提交日志、复制到 Follower、Follower 处理 AppendEntries（包括磁盘 I/O）— 都在持锁状态下执行。
+经过三阶段锁优化后，Follower 侧磁盘 I/O 和 Leader 侧网络 I/O 已移出全局锁，锁持有时间大幅减少。但 Raft 的核心状态（Term、commitIndex、日志索引缓存）仍由单一 `sync.Mutex` 保护。
 
-这是当前写入吞吐量的根本瓶颈。进一步优化需要：
-- **阶段一**: 细化锁粒度（stateMu/logMu/replMu），预期 3-5x 提升
+### P1: `appendEntriesMu` 争用导致心跳阻塞（新发现）
+
+三阶段锁引入的 `appendEntriesMu` 同时被 `AppendEntries`（Phase 0 串行化）和 `fetchEntriesToApply`（日志应用）持有。在高并发写入场景下，心跳 AppendEntries（`len(Entries) == 0`）也需要排队等待 `appendEntriesMu`，导致 Follower 在 500ms 选举超时内未收到心跳，触发不必要的选举。
+
+**影响**: Comprehensive 测试 Leader 切换从 3 次增加到 46 次，成功率从 100% 下降到 82.35%。
+
+**优化方向**:
+- 心跳快速路径：心跳 AppendEntries 跳过 `appendEntriesMu`，仅获取 `r.mu` 短锁
+- 或将 `appendEntriesMu` 改为读写锁，心跳使用读锁、日志追加使用写锁
+
+当前状态和进一步优化路线：
+- **已完成**: 三阶段锁（Phase 2 无锁 I/O）、Leader 网络 I/O 移出锁、异步快照
+- **阶段一**: 修复 `appendEntriesMu` 心跳阻塞问题 + 细化锁粒度（stateMu/logMu/replMu）
 - **阶段二**: 引入 Ready 机制（etcd 风格），预期 5-10x 提升
 - **阶段三**: Multi-Raft 分片，预期 10x+ 提升
 
@@ -262,4 +386,4 @@ go vet ./...
 
 ---
 
-**最后更新**: 2026-03-30
+**最后更新**: 2026-03-31
