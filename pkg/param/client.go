@@ -4,6 +4,7 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 func init() {
@@ -58,7 +59,7 @@ const (
 )
 
 func StringToOpType(s string) OpType {
-	switch s {
+	switch strings.ToLower(s) {
 	case "get":
 		return OpGet
 	case "set":
@@ -76,6 +77,16 @@ func (o *OpType) UnmarshalJSON(data []byte) error {
 	var i int
 	if err := json.Unmarshal(data, &i); err == nil {
 		*o = OpType(i)
+		return nil
+	}
+
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		op := StringToOpType(s)
+		if op == OpUnknown && strings.ToLower(s) != "unknown" {
+			return fmt.Errorf("unknown OpType string: %q", s)
+		}
+		*o = op
 		return nil
 	}
 

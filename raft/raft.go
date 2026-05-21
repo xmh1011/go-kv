@@ -2,6 +2,7 @@ package raft
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"github.com/xmh1011/go-kv/pkg/log"
 	"github.com/xmh1011/go-kv/pkg/param"
 	"github.com/xmh1011/go-kv/pkg/storage"
+	"github.com/xmh1011/go-kv/pkg/storage/kvstore"
 	"github.com/xmh1011/go-kv/pkg/transport"
 )
 
@@ -41,8 +43,8 @@ type proposalResult struct {
 
 // proposal 批处理常量
 const (
-	proposalChSize   = 256 // proposalCh 缓冲大小
-	maxBatchSize     = 64  // 单批最大 proposal 数量
+	proposalChSize = 256 // proposalCh 缓冲大小
+	maxBatchSize   = 64  // 单批最大 proposal 数量
 )
 
 type Raft struct {
@@ -122,13 +124,13 @@ type Raft struct {
 // 注意：store 参数的类型现在是 storage.KVStorage。
 func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.StateMachine, trans transport.Transport, commitChan chan param.CommitEntry) *Raft {
 	r := &Raft{
-		id:               id,
-		peerIDs:          peerIDs,
-		store:            store,
-		stateMachine:     stateMachine,
-		trans:            trans,
-		inJointConsensus: false,
-		votedFor:         -1, // -1 表示未投票
+		id:                id,
+		peerIDs:           peerIDs,
+		store:             store,
+		stateMachine:      stateMachine,
+		trans:             trans,
+		inJointConsensus:  false,
+		votedFor:          -1, // -1 表示未投票
 		commitChan:        commitChan,
 		nextIndex:         make(map[int]uint64),
 		matchIndex:        make(map[int]uint64),
@@ -439,8 +441,12 @@ func (r *Raft) performReadAfterApply(cmd param.KVCommand, reply *param.ClientRep
 
 	value, err := r.stateMachine.Get(cmd.Key)
 	if err != nil {
-		reply.Success = false
 		reply.Result = err.Error()
+		if errors.Is(err, kvstore.ErrKeyNotFound) {
+			reply.Success = true
+		} else {
+			reply.Success = false
+		}
 	} else {
 		reply.Success = true
 		reply.Result = value

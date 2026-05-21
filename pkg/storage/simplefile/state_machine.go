@@ -2,15 +2,15 @@ package simplefile
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"sync"
 
 	"github.com/xmh1011/go-kv/pkg/param"
+	"github.com/xmh1011/go-kv/pkg/storage/kvstore"
 )
 
-var ErrKeyNotFound = errors.New("key not found")
+var ErrKeyNotFound = kvstore.ErrKeyNotFound
 
 // StateMachine implements a simple file-based key-value store.
 // It persists the entire state (map) to a file on every write operation.
