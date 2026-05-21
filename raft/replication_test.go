@@ -367,6 +367,145 @@ func TestApplyLogs(t *testing.T) {
 	}
 }
 
+type blockingApplyStateMachine struct {
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+}
+
+func (sm *blockingApplyStateMachine) Apply(entry param.LogEntry) any {
+	sm.startedOnce.Do(func() {
+		close(sm.started)
+	})
+	<-sm.release
+	return "applied"
+}
+
+func (sm *blockingApplyStateMachine) Get(key string) (string, error) {
+	return "", nil
+}
+
+func (sm *blockingApplyStateMachine) GetSnapshot() ([]byte, error) {
+	return nil, nil
+}
+
+func (sm *blockingApplyStateMachine) ApplySnapshot(snapshot []byte) error {
+	return nil
+}
+
+func TestApplyLogsAdvancesLastAppliedAfterStateMachineApply(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockStore.EXPECT().
+		GetEntry(uint64(1)).
+		Return(&param.LogEntry{Term: 1, Index: 1, Command: "cmd"}, nil).
+		Times(1)
+
+	sm := &blockingApplyStateMachine{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	r := &Raft{
+		id:                 1,
+		commitIndex:        1,
+		lastApplied:        0,
+		cachedLastLogIndex: 1,
+		snapshotThreshold:  -1,
+		store:              mockStore,
+		stateMachine:       sm,
+		notifyApply:        make(map[uint64]chan any),
+	}
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	done := make(chan struct{})
+	go func() {
+		r.applyLogs()
+		close(done)
+	}()
+
+	select {
+	case <-sm.started:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for state machine apply to start")
+	}
+
+	r.mu.Lock()
+	assert.Equal(t, uint64(0), r.lastApplied, "lastApplied must not advance before Apply returns")
+	r.mu.Unlock()
+
+	close(sm.release)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for applyLogs to finish")
+	}
+
+	r.mu.Lock()
+	assert.Equal(t, uint64(1), r.lastApplied)
+	r.mu.Unlock()
+}
+
+func TestProcessBatchCommitsSingleNodeEntry(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+	entry := param.LogEntry{Term: 2, Index: 1, Command: "cmd"}
+	applied := make(chan struct{})
+
+	mockStore.EXPECT().AppendEntries(gomock.Any()).Return(nil).Times(1)
+	mockStore.EXPECT().GetEntry(uint64(1)).Return(&entry, nil).Times(2)
+	mockSM.EXPECT().
+		Apply(entry).
+		DoAndReturn(func(param.LogEntry) any {
+			close(applied)
+			return "ok"
+		}).
+		Times(1)
+
+	r := &Raft{
+		id:                 1,
+		peerIDs:            []int{1},
+		currentTerm:        2,
+		cachedLastLogIndex: 0,
+		snapshotThreshold:  -1,
+		store:              mockStore,
+		stateMachine:       mockSM,
+		notifyApply:        make(map[uint64]chan any),
+		nextIndex:          make(map[int]uint64),
+		matchIndex:         make(map[int]uint64),
+	}
+	r.setState(Leader)
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	resultCh := make(chan proposalResult, 1)
+	r.processBatch([]proposalRequest{{command: "cmd", result: resultCh}})
+
+	result := <-resultCh
+	assert.True(t, result.ok)
+	assert.Equal(t, uint64(1), result.index)
+
+	r.mu.Lock()
+	assert.Equal(t, uint64(1), r.commitIndex)
+	r.mu.Unlock()
+
+	select {
+	case <-applied:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for single-node entry to apply")
+	}
+
+	assert.Eventually(t, func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.lastApplied == 1
+	}, time.Second, 10*time.Millisecond)
+}
+
 func TestApplyConfigChange(t *testing.T) {
 	type state struct {
 		state       State

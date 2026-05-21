@@ -55,6 +55,10 @@ type Raft struct {
 	// 确保 TruncateLog 和 AppendEntries 不会并发执行
 	appendEntriesMu sync.Mutex
 
+	// applyMu serializes apply loops so lastApplied only advances after a
+	// committed entry has been delivered to the state machine.
+	applyMu sync.Mutex
+
 	// id 是当前节点的服务器ID
 	id int
 
@@ -868,6 +872,10 @@ func (r *Raft) processBatch(batch []proposalRequest) {
 	// 更新缓存
 	r.cachedLastLogIndex = entries[len(entries)-1].Index
 	log.Infof("[Raft] Leader %d proposed batch of %d entries (index %d-%d)", r.id, len(entries), startIndex, r.cachedLastLogIndex)
+
+	// A single-node cluster has no follower replies to trigger commit
+	// advancement, so try to commit after the local append as well.
+	r.updateCommitIndex()
 
 	// 获取需要通知的 peer 列表
 	peersToNotify := r.getAllPeerIDs()

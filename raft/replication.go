@@ -230,24 +230,30 @@ func (r *Raft) updateCommitIndex() {
 }
 
 // findMajorityCommitIndex 计算可以被安全提交的最高日志索引。
-// 优化：从 max(matchIndex[*]) 开始搜索，而非 lastLogIndex，
-// 因为多数时候 majority commit point 接近最高 matchIndex。
 func (r *Raft) findMajorityCommitIndex() uint64 {
-	// 找到最大的 matchIndex 作为搜索起点
 	searchStart := r.commitIndex
-	for _, peerID := range r.peerIDs {
-		if mi := r.matchIndex[peerID]; mi > searchStart {
-			searchStart = mi
-		}
-	}
-	if r.inJointConsensus {
-		for _, peerID := range r.newPeerIDs {
+	if r.isReplicatedByMajority(r.cachedLastLogIndex) {
+		searchStart = r.cachedLastLogIndex
+	} else {
+		for _, peerID := range r.peerIDs {
+			if peerID == r.id {
+				continue
+			}
 			if mi := r.matchIndex[peerID]; mi > searchStart {
 				searchStart = mi
 			}
 		}
+		if r.inJointConsensus {
+			for _, peerID := range r.newPeerIDs {
+				if peerID == r.id {
+					continue
+				}
+				if mi := r.matchIndex[peerID]; mi > searchStart {
+					searchStart = mi
+				}
+			}
+		}
 	}
-	// 不超过 cachedLastLogIndex
 	if searchStart > r.cachedLastLogIndex {
 		searchStart = r.cachedLastLogIndex
 	}
@@ -269,6 +275,9 @@ func (r *Raft) isReplicatedByMajority(index uint64) bool {
 	// Leader 自身永远是匹配的。
 	matchCountOld := 1
 	for _, peerID := range r.peerIDs {
+		if peerID == r.id {
+			continue
+		}
 		if r.matchIndex[peerID] >= index {
 			matchCountOld++
 		}
@@ -286,6 +295,9 @@ func (r *Raft) isReplicatedByMajority(index uint64) bool {
 		matchCountNew = 1
 	}
 	for _, peerID := range r.newPeerIDs {
+		if peerID == r.id {
+			continue
+		}
 		if r.matchIndex[peerID] >= index {
 			matchCountNew++
 		}
@@ -444,9 +456,8 @@ func (r *Raft) checkLogConsistencyLockFree(args *param.AppendEntriesArgs, reply 
 
 // findConflictAndPrepare 对比 incoming entries 与 store 中已有的条目，
 // 找到第一个冲突点，返回需要追加的新条目和需要截断的起始索引。
-// 这是 Raft 论文 Section 5.3 的正确实现：
-// "If an existing entry conflicts with a new one (same index but different terms),
-//  delete the existing entry and all that follow it."
+// 这是 Raft 论文 Section 5.3 的正确实现：如果同一索引的新旧日志任期冲突，
+// 删除本地旧条目以及它之后的所有条目。
 //
 // 返回值:
 //   - newEntries: 需要追加到 store 的条目（跳过已存在且一致的条目）
@@ -563,6 +574,9 @@ func (r *Raft) updateFollowerCommitIndex(args *param.AppendEntriesArgs) {
 
 // applyLogs 将已提交的日志应用到状态机。此函数会在后台 goroutine 中运行。
 func (r *Raft) applyLogs() {
+	r.applyMu.Lock()
+	defer r.applyMu.Unlock()
+
 	// 1. 从存储中获取所有需要应用的日志条目。
 	entriesToApply, lastAppliedBefore := r.fetchEntriesToApply()
 	if len(entriesToApply) == 0 {
@@ -580,7 +594,7 @@ func (r *Raft) applyLogs() {
 }
 
 // fetchEntriesToApply 负责从存储中获取所有已提交但尚未应用的日志条目。
-// 在获取数据后安全地更新 r.lastApplied 索引。
+// 调用方必须串行化 apply 流程，并且只在状态机真正应用后推进 r.lastApplied。
 //
 // 并发安全：先获取 appendEntriesMu 再获取 r.mu，确保读取 store 期间
 // 不会有并发的 TruncateLog + AppendEntries（来自三阶段 AppendEntries 的 Phase 2）。
@@ -611,10 +625,6 @@ func (r *Raft) fetchEntriesToApply() ([]param.LogEntry, uint64) {
 	}
 
 	lastAppliedBeforeUpdate := r.lastApplied
-	if len(entries) > 0 {
-		r.lastApplied = entries[len(entries)-1].Index
-		r.lastAppliedCond.Broadcast()
-	}
 
 	r.mu.Unlock()
 	r.appendEntriesMu.Unlock()
@@ -626,8 +636,6 @@ func (r *Raft) fetchEntriesToApply() ([]param.LogEntry, uint64) {
 func (r *Raft) dispatchEntries(entries []param.LogEntry) {
 	for _, entry := range entries {
 		var result any
-		var notifyChan chan any
-		var ok bool
 
 		switch cmd := entry.Command.(type) {
 		case param.ConfigChangeCommand:
@@ -635,36 +643,33 @@ func (r *Raft) dispatchEntries(entries []param.LogEntry) {
 			r.applyConfigChange(cmd, entry.Index)
 			// 配置变更不需要返回结果，客户端只关心 Success
 			result = nil
-
-			// 获取通知 channel（短暂持锁）
-			r.mu.Lock()
-			notifyChan, ok = r.notifyApply[entry.Index]
-			if ok {
-				delete(r.notifyApply, entry.Index)
-			}
-			r.mu.Unlock()
 		default:
 			// 普通命令：先应用状态机（不持有锁）
 			result = r.stateMachine.Apply(entry)
-
-			// 获取通知 channel（短暂持锁）
-			r.mu.Lock()
-			notifyChan, ok = r.notifyApply[entry.Index]
-			if ok {
-				// 在发送通知前，从 map 中删除 channel，防止重复通知或内存泄漏。
-				delete(r.notifyApply, entry.Index)
-			}
-			r.mu.Unlock()
 
 			// 发送到 commitChan（不持有锁）
 			r.applyStateMachineCommand(entry)
 		}
 
-		// 通知客户端（不持有锁）
-		if ok {
-			log.Infof("[Client] dispatchEntries: Notifying for index %d", entry.Index)
-			notifyChan <- result
-		}
+		r.completeAppliedEntry(entry.Index, result)
+	}
+}
+
+func (r *Raft) completeAppliedEntry(index uint64, result any) {
+	r.mu.Lock()
+	notifyChan, ok := r.notifyApply[index]
+	if ok {
+		delete(r.notifyApply, index)
+	}
+	if index > r.lastApplied {
+		r.lastApplied = index
+		r.lastAppliedCond.Broadcast()
+	}
+	r.mu.Unlock()
+
+	if ok {
+		log.Infof("[Client] dispatchEntries: Notifying for index %d", index)
+		notifyChan <- result
 	}
 }
 
