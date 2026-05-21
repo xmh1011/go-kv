@@ -80,6 +80,7 @@ func (r *Raft) InstallSnapshot(args *param.InstallSnapshotArgs, reply *param.Ins
 	r.snapshot = snapshot
 	r.commitIndex = max(r.commitIndex, snapshot.LastIncludedIndex)
 	r.lastApplied = max(r.lastApplied, snapshot.LastIncludedIndex)
+	r.cachedLastLogIndex = max(r.cachedLastLogIndex, snapshot.LastIncludedIndex)
 
 	log.Infof("[Snapshot] Node %d successfully installed snapshot. lastApplied is now %d.", r.id, r.lastApplied)
 	return nil
@@ -221,6 +222,7 @@ func (r *Raft) persistSnapshot(snapshot *param.Snapshot) error {
 func (r *Raft) updateStateAfterSnapshot(snapshotIndex uint64) {
 	r.commitIndex = max(r.commitIndex, snapshotIndex)
 	r.lastApplied = max(r.lastApplied, snapshotIndex)
+	r.cachedLastLogIndex = max(r.cachedLastLogIndex, snapshotIndex)
 }
 
 // sendSnapshot 是 Leader 用于向落后的 Follower 发送快照

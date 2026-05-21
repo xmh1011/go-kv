@@ -440,6 +440,10 @@ func (r *Raft) checkLogConsistencyLockFree(args *param.AppendEntriesArgs, reply 
 	}
 	if prevEntry == nil || prevEntry.Term != args.PrevLogTerm {
 		if prevEntry == nil {
+			if consistent, handled := r.checkStoredSnapshotTerm(args.PrevLogIndex, args.PrevLogTerm, reply); handled {
+				return consistent
+			}
+
 			lastLogIndex, _ := r.store.LastLogIndex()
 			reply.ConflictIndex = lastLogIndex + 1
 			reply.ConflictTerm = 0
@@ -540,6 +544,10 @@ func (r *Raft) checkLogConsistency(args *param.AppendEntriesArgs, reply *param.A
 	if prevEntry == nil || prevEntry.Term != args.PrevLogTerm {
 		// 如果 prevEntry 为 nil，说明本地日志在 prevLogIndex 处没有条目，即日志过短。
 		if prevEntry == nil {
+			if consistent, handled := r.checkStoredSnapshotTerm(args.PrevLogIndex, args.PrevLogTerm, reply); handled {
+				return consistent
+			}
+
 			reply.ConflictIndex = r.cachedLastLogIndex + 1
 			reply.ConflictTerm = 0 // 用 0 表示此处没有日志
 		} else {
@@ -552,6 +560,28 @@ func (r *Raft) checkLogConsistency(args *param.AppendEntriesArgs, reply *param.A
 	}
 
 	return true
+}
+
+func (r *Raft) checkStoredSnapshotTerm(prevLogIndex, prevLogTerm uint64, reply *param.AppendEntriesReply) (bool, bool) {
+	snapshotTerm, ok, err := r.readStoredSnapshotTerm(prevLogIndex)
+	if err != nil {
+		log.Errorf("[Replication] Node %d failed to read snapshot for prevLogIndex %d: %v", r.id, prevLogIndex, err)
+		reply.Success = false
+		lastLogIndex, _ := r.store.LastLogIndex()
+		reply.ConflictIndex = lastLogIndex + 1
+		reply.ConflictTerm = 0
+		return false, true
+	}
+	if !ok {
+		return false, false
+	}
+	if snapshotTerm == prevLogTerm {
+		return true, true
+	}
+	reply.Success = false
+	reply.ConflictTerm = snapshotTerm
+	reply.ConflictIndex = prevLogIndex
+	return false, true
 }
 
 // updateFollowerCommitIndex 根据 Leader 发来的 leaderCommit 更新 Follower 的 commitIndex。
@@ -678,45 +708,68 @@ func (r *Raft) applyConfigChange(cmd param.ConfigChangeCommand, entryIndex uint6
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if !r.inJointConsensus {
-		// --- Phase 1: 进入联合共识 (C_old,new) ---
+	enterJoint := func() {
 		r.inJointConsensus = true
 		r.newPeerIDs = cmd.NewPeerIDs
+		r.jointConfigIndex = entryIndex
 		log.Infof("[Config Change] Node %d entering joint consensus at index %d.", r.id, entryIndex)
 
-		// 如果当前节点是 Leader，它有责任立即提交第二阶段的配置日志 (C_new)，以完成变更。
-		if r.getState() == Leader {
-			// 初始化新加入节点的 nextIndex 和 matchIndex
-			for _, peerID := range r.newPeerIDs {
-				if _, ok := r.nextIndex[peerID]; !ok {
-					r.nextIndex[peerID] = r.cachedLastLogIndex + 1
-					r.matchIndex[peerID] = 0
-				}
+		if r.nextIndex == nil {
+			r.nextIndex = make(map[int]uint64)
+		}
+		if r.matchIndex == nil {
+			r.matchIndex = make(map[int]uint64)
+		}
+		for _, peerID := range r.newPeerIDs {
+			if _, ok := r.nextIndex[peerID]; !ok {
+				r.nextIndex[peerID] = r.cachedLastLogIndex + 1
+				r.matchIndex[peerID] = 0
 			}
+		}
+	}
+
+	proposeFinalConfig := func() {
+		if r.getState() == Leader {
 			r.proposeNewConfigEntry()
 		}
-	} else {
-		// --- Phase 2: 提交新配置 (C_new) ---
-		// 此时联合共识结束，节点切换到仅使用新配置。
-		r.peerIDs = r.newPeerIDs
-		r.newPeerIDs = nil
-		r.inJointConsensus = false
-		log.Infof("[Config Change] Node %d has transitioned to new configuration at index %d.", r.id, entryIndex)
+	}
 
-		// 检查自己是否还属于新配置。
-		// 如果 Leader 发现自己被移除了，必须立即“退位” (Step Down)。
-		_, exists := findPeer(r.id, r.peerIDs)
-		if !exists && r.getState() == Leader {
-			log.Infof("[Config Change] Leader %d detected it is NOT in the new configuration. Stepping down.", r.id)
+	if !r.inJointConsensus {
+		// --- Phase 1: 进入联合共识 (C_old,new) ---
+		enterJoint()
+		proposeFinalConfig()
+		return
+	}
 
-			// 自动降级为 Follower。
-			// 使用 r.currentTerm 即可，因为这不是因为发现了更高任期，而是因为配置变更逻辑。
-			// becomeFollower 会更新状态并重置状态机，这会使 Leader 的心跳协程(startHeartbeat)在下一次循环检测时自动退出。
-			if err := r.becomeFollower(r.currentTerm); err != nil {
-				log.Errorf("[Replication] Node %d failed to step down after removal: %v", r.id, err)
-			}
-			return
+	if r.jointConfigIndex == entryIndex {
+		// Leader enters joint consensus before the C_old,new entry is applied
+		// so it can replicate that entry under joint quorum rules. Applying
+		// that same entry must not be mistaken for the final C_new entry.
+		proposeFinalConfig()
+		return
+	}
+
+	// --- Phase 2: 提交新配置 (C_new) ---
+	// 此时联合共识结束，节点切换到仅使用新配置。
+	r.peerIDs = r.newPeerIDs
+	r.newPeerIDs = nil
+	r.inJointConsensus = false
+	r.jointConfigIndex = 0
+	log.Infof("[Config Change] Node %d has transitioned to new configuration at index %d.", r.id, entryIndex)
+
+	// 检查自己是否还属于新配置。
+	// 如果 Leader 发现自己被移除了，必须立即“退位” (Step Down)。
+	_, exists := findPeer(r.id, r.peerIDs)
+	if !exists && r.getState() == Leader {
+		log.Infof("[Config Change] Leader %d detected it is NOT in the new configuration. Stepping down.", r.id)
+
+		// 自动降级为 Follower。
+		// 使用 r.currentTerm 即可，因为这不是因为发现了更高任期，而是因为配置变更逻辑。
+		// becomeFollower 会更新状态并重置状态机，这会使 Leader 的心跳协程(startHeartbeat)在下一次循环检测时自动退出。
+		if err := r.becomeFollower(r.currentTerm); err != nil {
+			log.Errorf("[Replication] Node %d failed to step down after removal: %v", r.id, err)
 		}
+		return
 	}
 }
 

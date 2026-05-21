@@ -309,6 +309,12 @@ func TestInstallSnapshotCompactsPastLocalLogTail(t *testing.T) {
 	assert.Equal(t, uint64(5), reply.Term)
 	assert.Equal(t, uint64(5), r.lastApplied)
 	assert.Equal(t, uint64(5), r.commitIndex)
+	assert.Equal(t, uint64(5), r.cachedLastLogIndex)
+
+	lastLogIndex, lastLogTerm, err := r.getLastLogInfoForElection()
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(5), lastLogIndex)
+	assert.Equal(t, uint64(2), lastLogTerm)
 
 	first, err := store.FirstLogIndex()
 	assert.NoError(t, err)
@@ -321,6 +327,47 @@ func TestInstallSnapshotCompactsPastLocalLogTail(t *testing.T) {
 	value, err := stateMachine.Get("snap")
 	assert.NoError(t, err)
 	assert.Equal(t, "value", value)
+}
+
+func TestRecoveredSnapshotProvidesLastLogTerm(t *testing.T) {
+	store := memstorage.NewStorage()
+	assert.NoError(t, store.AppendEntries([]param.LogEntry{
+		{Term: 1, Index: 1},
+		{Term: 1, Index: 2},
+		{Term: 1, Index: 3},
+	}))
+	snapshot := param.NewSnapshot(5, 2, []byte(`{"snap":"value"}`))
+	assert.NoError(t, store.SaveSnapshot(snapshot))
+	assert.NoError(t, store.CompactLog(snapshot.LastIncludedIndex))
+
+	r := NewRaft(2, []int{1, 3}, store, memstorage.NewInMemoryStateMachine(), nil, nil)
+
+	lastLogIndex, lastLogTerm, err := r.getLastLogInfoForElection()
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(5), lastLogIndex)
+	assert.Equal(t, uint64(2), lastLogTerm)
+}
+
+func TestRecoveredSnapshotAcceptsAppendEntriesAtSnapshotBoundary(t *testing.T) {
+	store := memstorage.NewStorage()
+	assert.NoError(t, store.AppendEntries([]param.LogEntry{
+		{Term: 1, Index: 1},
+		{Term: 1, Index: 2},
+		{Term: 1, Index: 3},
+	}))
+	snapshot := param.NewSnapshot(5, 2, []byte(`{"snap":"value"}`))
+	assert.NoError(t, store.SaveSnapshot(snapshot))
+	assert.NoError(t, store.CompactLog(snapshot.LastIncludedIndex))
+
+	r := NewRaft(2, []int{1, 3}, store, memstorage.NewInMemoryStateMachine(), nil, nil)
+	args := param.NewAppendEntriesArgs(3, 1, 5, 2, 5, nil)
+	reply := param.NewAppendEntriesReply()
+
+	err := r.AppendEntries(args, reply)
+
+	assert.NoError(t, err)
+	assert.True(t, reply.Success)
+	assert.Equal(t, uint64(5), r.commitIndex)
 }
 
 func TestSendSnapshot(t *testing.T) {

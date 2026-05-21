@@ -611,6 +611,44 @@ func TestApplyConfigChange(t *testing.T) {
 	}
 }
 
+func TestLeaderAppliesInitialConfigChangeAsJointEntry(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockStore.EXPECT().
+		AppendEntries(gomock.Any()).
+		DoAndReturn(func(entries []param.LogEntry) error {
+			assert.Len(t, entries, 1)
+			assert.Equal(t, uint64(11), entries[0].Index)
+			return nil
+		}).
+		Times(1)
+
+	r := &Raft{
+		id:                 1,
+		peerIDs:            []int{1, 2},
+		newPeerIDs:         []int{1, 2, 3},
+		inJointConsensus:   true,
+		jointConfigIndex:   10,
+		currentTerm:        5,
+		cachedLastLogIndex: 10,
+		store:              mockStore,
+		nextIndex:          make(map[int]uint64),
+		matchIndex:         make(map[int]uint64),
+	}
+	r.setState(Leader)
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	r.applyConfigChange(param.ConfigChangeCommand{NewPeerIDs: []int{1, 2, 3}}, 10)
+
+	assert.True(t, r.inJointConsensus)
+	assert.Equal(t, []int{1, 2}, r.peerIDs)
+	assert.Equal(t, []int{1, 2, 3}, r.newPeerIDs)
+	assert.Equal(t, uint64(10), r.jointConfigIndex)
+	assert.Equal(t, uint64(11), r.cachedLastLogIndex)
+}
+
 func TestReplicateLogsToPeer(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -988,6 +1026,7 @@ func TestProcessAppendEntriesReply(t *testing.T) {
 			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine) {
 				s.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
 				s.EXPECT().LastLogIndex().Return(uint64(10), nil).Times(1)
+				s.EXPECT().ReadSnapshot().Return(nil, nil).AnyTimes()
 				s.EXPECT().GetEntry(gomock.Any()).Return(&param.LogEntry{Term: 5}, nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
 			},
@@ -1006,6 +1045,7 @@ func TestProcessAppendEntriesReply(t *testing.T) {
 			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine) {
 				s.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
 				s.EXPECT().LastLogIndex().Return(uint64(10), nil).Times(1)
+				s.EXPECT().ReadSnapshot().Return(nil, nil).AnyTimes()
 				s.EXPECT().FirstLogIndex().Return(uint64(1), nil).AnyTimes()
 				s.EXPECT().GetEntry(gomock.Any()).Return(&param.LogEntry{Term: 5}, nil).AnyTimes()
 				tr.EXPECT().SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
