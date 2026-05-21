@@ -42,3 +42,13 @@ jobs:
           verbose: true
           override_commit: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           override_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+
+      - name: Send Codecov notifications
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          run_command: send-notifications
+          fail_ci_if_error: true
+          verbose: true
+          override_commit: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          override_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
