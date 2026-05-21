@@ -131,7 +131,35 @@ func TestStorage(t *testing.T) {
 		assert.NoError(t, err, "CompactLog(4) should not fail")
 		assert.Equal(t, uint64(5), s.logOffset, "logOffset should not change for already compacted index")
 
-		err = s.CompactLog(11) // Out of bounds
-		assert.ErrorIs(t, err, ErrIndexOutOfBounds, "CompactLog(11) should return ErrIndexOutOfBounds")
+		err = s.CompactLog(11) // Snapshot may be ahead of the local log tail
+		assert.NoError(t, err, "CompactLog(11) should allow snapshot indexes beyond the local log tail")
+		firstIDx, _ = s.FirstLogIndex()
+		assert.Equal(t, uint64(12), firstIDx, "expected first index to advance past the snapshot index")
+		lastIDx, _ = s.LastLogIndex()
+		assert.Equal(t, uint64(11), lastIDx, "expected last index to match the snapshot index when no log entries remain")
+	})
+
+	t.Run("Compact Beyond Last Index From Snapshot", func(t *testing.T) {
+		s := NewStorage()
+		assert.NoError(t, s.AppendEntries(newTestEntries(1, 3)))
+
+		assert.NoError(t, s.CompactLog(5))
+
+		firstIdx, err := s.FirstLogIndex()
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(6), firstIdx)
+
+		lastIdx, err := s.LastLogIndex()
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(5), lastIdx)
+
+		entry, err := s.GetEntry(3)
+		assert.NoError(t, err)
+		assert.Nil(t, entry)
+
+		assert.NoError(t, s.AppendEntries([]param.LogEntry{{Term: 2, Index: 6}}))
+		entry, err = s.GetEntry(6)
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(6), entry.Index)
 	})
 }

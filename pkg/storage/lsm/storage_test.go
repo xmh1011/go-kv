@@ -185,3 +185,42 @@ func TestStorageAdapter_Snapshot(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, entry)
 }
+
+func TestStorageAdapter_CompactBeyondLastIndexFromSnapshot(t *testing.T) {
+	db, dir := setupTestDB(t, "lsm_storage_test_compact_beyond_last")
+	defer cleanupTestDB(t, dir)
+
+	adapter, err := NewStorageAdapter(db)
+	assert.NoError(t, err)
+	defer adapter.Close()
+
+	err = adapter.AppendEntries([]param.LogEntry{
+		{Term: 1, Index: 1},
+		{Term: 1, Index: 2},
+		{Term: 1, Index: 3},
+	})
+	assert.NoError(t, err)
+
+	err = adapter.CompactLog(5)
+	assert.NoError(t, err)
+
+	first, err := adapter.FirstLogIndex()
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(6), first)
+
+	last, err := adapter.LastLogIndex()
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(5), last)
+
+	entry, err := adapter.GetEntry(3)
+	assert.NoError(t, err)
+	assert.Nil(t, entry)
+
+	err = adapter.AppendEntries([]param.LogEntry{{Term: 2, Index: 6}})
+	assert.NoError(t, err)
+
+	entry, err = adapter.GetEntry(6)
+	assert.NoError(t, err)
+	assert.NotNil(t, entry)
+	assert.Equal(t, uint64(6), entry.Index)
+}

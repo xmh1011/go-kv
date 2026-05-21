@@ -198,8 +198,10 @@ func (s *Storage) CompactLog(upToIndex uint64) error {
 	}
 
 	lastIndex := s.logOffset + uint64(len(s.log)) - 1
-	if upToIndex > lastIndex {
-		return ErrIndexOutOfBounds
+	if upToIndex >= lastIndex {
+		s.log = make([]param.LogEntry, 1)
+		s.logOffset = upToIndex
+		return s.persist()
 	}
 
 	sliceIndexToKeep := upToIndex - s.logOffset + 1
