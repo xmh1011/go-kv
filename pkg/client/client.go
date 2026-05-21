@@ -73,7 +73,7 @@ func (c *Client) SendCommand(command any) (any, bool) {
 // attemptOnce 负责执行单次向集群发送命令的尝试。
 func (c *Client) attemptOnce(request *param.ClientArgs) (any, clientAction) {
 	targetNodeID := c.selectTargetNode()
-	log.Infof("[Client] Sending command (seq:%d) to node %d", c.sequenceNum, targetNodeID)
+	log.Debugf("[Client] Sending command (seq:%d) to node %d", c.sequenceNum, targetNodeID)
 
 	reply := &param.ClientReply{}
 	err := c.trans.SendClientRequest(strconv.Itoa(targetNodeID), request, reply)
@@ -102,13 +102,13 @@ func (c *Client) decideNextAction(targetNodeID int, reply *param.ClientReply, er
 	}
 
 	if reply.NotLeader {
-		log.Infof("[Client] Node %d is not leader. New leader hint: %d. Retrying...", targetNodeID, reply.LeaderHint)
+		log.Debugf("[Client] Node %d is not leader. New leader hint: %d. Retrying...", targetNodeID, reply.LeaderHint)
 		c.leaderHint = reply.LeaderHint
 		return nil, actionRetry
 	}
 
 	if reply.Success {
-		log.Infof("[Client] Command (seq:%d) successfully processed.", c.sequenceNum)
+		log.Debugf("[Client] Command (seq:%d) successfully processed.", c.sequenceNum)
 		return reply.Result, actionSuccess
 	}
 

@@ -89,7 +89,7 @@ func (m *Manager) CreateNewSSTable(imem *memtable.IMemTable) error {
 
 	// 添加到内存中
 	m.addTable(sst)
-	log.Infof("[SSTableManager] Created new SSTable %s at level %d", sst.FilePath(), sst.level)
+	log.Debugf("[SSTableManager] Created new SSTable %s at level %d", sst.FilePath(), sst.level)
 
 	// 执行合并逻辑
 	if err := m.Compaction(); err != nil {
@@ -245,7 +245,7 @@ func (m *Manager) Recover() error {
 		files, err := os.ReadDir(dir)
 		if err != nil {
 			if os.IsNotExist(err) {
-				log.Infof("[SSTableManager] Directory %s does not exist, skipping", dir)
+				log.Debugf("[SSTableManager] Directory %s does not exist, skipping", dir)
 				continue
 			}
 			log.Errorf("[SSTableManager] Failed to read directory %s: %s", dir, err.Error())
@@ -289,7 +289,7 @@ func (m *Manager) Recover() error {
 	}
 
 	idGenerator.Add(maxID)
-	log.Infof("[SSTableManager] Recovered SSTables, max ID: %d", maxID)
+	log.Debugf("[SSTableManager] Recovered SSTables, max ID: %d", maxID)
 	return nil
 }
 

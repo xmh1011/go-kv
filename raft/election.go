@@ -70,7 +70,7 @@ func (r *Raft) startElection() {
 	}
 	r.mu.Unlock()
 
-	log.Infof("[PreVote] Node %d starting Pre-Vote for term %d", r.id, preVoteTerm)
+	log.Debugf("[PreVote] Node %d starting Pre-Vote for term %d", r.id, preVoteTerm)
 
 	// 发起 Pre-Vote 广播，注意最后一个参数 isPreVote = true
 	voteChan := r.broadcastVoteRequests(preVoteTerm, lastLogIndex, lastLogTerm, true)
@@ -100,7 +100,7 @@ func (r *Raft) startRealElection() {
 	savedCurrentTerm := r.currentTerm
 	r.mu.Unlock()
 
-	log.Infof("[Election] Node %d starting Real Election for term %d", r.id, savedCurrentTerm)
+	log.Debugf("[Election] Node %d starting Real Election for term %d", r.id, savedCurrentTerm)
 
 	// 3. 广播正式投票请求，isPreVote = false
 	voteChan := r.broadcastVoteRequests(savedCurrentTerm, lastLogIndex, lastLogTerm, false)
@@ -145,7 +145,7 @@ func (r *Raft) handlePreVote(args *param.RequestVoteArgs, reply *param.RequestVo
 	// 2. 【关键】Leader 租约检查 (Sticky Leader)
 	// 如果在 electionTimeout 内收到过 Leader 的消息，说明集群健康，拒绝干扰。
 	if r.leaderHasLease() {
-		log.Infof("[PreVote] Node %d rejected PreVote from %d (Leader lease active)", r.id, args.CandidateID)
+		log.Debugf("[PreVote] Node %d rejected PreVote from %d (Leader lease active)", r.id, args.CandidateID)
 		reply.VoteGranted = false
 		return nil
 	}
@@ -159,7 +159,7 @@ func (r *Raft) handlePreVote(args *param.RequestVoteArgs, reply *param.RequestVo
 	// 4. 授予预投票 (注意：这里不持久化 VotedFor，也不重置选举定时器)
 	if isLogUpToDate {
 		reply.VoteGranted = true
-		log.Infof("[PreVote] Node %d granted PreVote to %d for term %d", r.id, args.CandidateID, args.Term)
+		log.Debugf("[PreVote] Node %d granted PreVote to %d for term %d", r.id, args.CandidateID, args.Term)
 	} else {
 		reply.VoteGranted = false
 	}
@@ -178,7 +178,7 @@ func (r *Raft) initializeCandidateState() error {
 	// 如果我们不是 Follower 或 Candidate（例如，Stop() 被调用且状态为 Dead），
 	// 则中止选举，防止 Goroutine 泄露。
 	if r.getState() != Follower && r.getState() != Candidate {
-		log.Infof("[Election] Node %d aborting election start; state is %d", r.id, r.getState())
+		log.Debugf("[Election] Node %d aborting election start; state is %d", r.id, r.getState())
 		// 返回一个错误，以便 startElection 协程能安全退出
 		return errors.New("cannot start election in non-follower/candidate state")
 	}
@@ -199,7 +199,7 @@ func (r *Raft) initializeCandidateState() error {
 		return err
 	}
 
-	log.Infof("[Election] Node %d starts election for term %d", r.id, r.currentTerm)
+	log.Debugf("[Election] Node %d starts election for term %d", r.id, r.currentTerm)
 	return nil
 }
 
@@ -248,7 +248,7 @@ func (r *Raft) handleElectionResult(voteChan <-chan *param.VoteResult, electionT
 	// 检查是否已经满足获胜条件（例如单节点集群，或者已经有足够的票数）
 	if ctx.checkWinCondition() {
 		if isPreVote {
-			log.Infof("[PreVote] Node %d Pre-Vote passed immediately (single node or majority self) for term %d. Starting Real Election.", r.id, electionTerm)
+			log.Debugf("[PreVote] Node %d Pre-Vote passed immediately (single node or majority self) for term %d. Starting Real Election.", r.id, electionTerm)
 			r.startRealElection()
 		} else {
 			r.transitionToLeader(electionTerm)
@@ -270,7 +270,7 @@ func (r *Raft) handleElectionResult(voteChan <-chan *param.VoteResult, electionT
 			if r.processVote(ctx, result, electionTerm) {
 				// --- 选举获胜 ---
 				if isPreVote {
-					log.Infof("[PreVote] Node %d Pre-Vote passed for term %d. Starting Real Election.", r.id, electionTerm)
+					log.Debugf("[PreVote] Node %d Pre-Vote passed for term %d. Starting Real Election.", r.id, electionTerm)
 					r.startRealElection() // Pre-Vote 成功，进入正式选举
 				} else {
 					r.transitionToLeader(electionTerm) // 正式选举成功，成为 Leader
@@ -283,7 +283,7 @@ func (r *Raft) handleElectionResult(voteChan <-chan *param.VoteResult, electionT
 			if !isPreVote {
 				r.handleElectionTimeout(electionTerm)
 			} else {
-				log.Infof("[PreVote] Node %d Pre-Vote failed/timed out for term %d.", r.id, electionTerm)
+				log.Debugf("[PreVote] Node %d Pre-Vote failed/timed out for term %d.", r.id, electionTerm)
 			}
 			return
 		}
@@ -295,7 +295,7 @@ func (r *Raft) handleElectionResult(voteChan <-chan *param.VoteResult, electionT
 func (r *Raft) processVote(ctx *electionContext, result *param.VoteResult, electionTerm uint64) (won bool) {
 	// 只处理投赞成票的结果。
 	if result.VoteGranted {
-		log.Infof("[Election] Node %d received a vote from node %d for term %d", r.id, result.VoterID, electionTerm)
+		log.Debugf("[Election] Node %d received a vote from node %d for term %d", r.id, result.VoterID, electionTerm)
 		// 检查投票者属于哪个配置，并为相应的计票器加一。
 		if _, isOld := findPeer(result.VoterID, ctx.oldPeers); isOld {
 			ctx.votesOldConfig++
@@ -349,13 +349,13 @@ func (r *Raft) transitionToLeader(electionTerm uint64) {
 
 // handleElectionTimeout 封装了选举超时后的状态转换逻辑。
 func (r *Raft) handleElectionTimeout(electionTerm uint64) {
-	log.Infof("[Election] Node %d election timed out for term %d", r.id, electionTerm)
+	log.Debugf("[Election] Node %d election timed out for term %d", r.id, electionTerm)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	// 确认自己仍然是本轮选举的候选人，然后退回为 Follower 状态。
 	if r.getState() == Candidate && r.currentTerm == electionTerm {
-		log.Infof("[Election] Node %d election failed, reverting to Follower", r.id)
+		log.Debugf("[Election] Node %d election failed, reverting to Follower", r.id)
 		// 调用 becomeFollower 会更新 term, state, votedFor 并持久化
 		// 因为任期没有变，所以传入 r.currentTerm 即可
 		if err := r.becomeFollower(r.currentTerm); err != nil {
@@ -371,7 +371,7 @@ func (r *Raft) sendVoteRequest(peerID int, term uint64, lastLogIndex uint64, las
 	reply := param.NewRequestVoteReply()
 
 	if err := r.trans.SendRequestVote(strconv.Itoa(peerID), args, reply); err != nil {
-		log.Errorf("[Election] Node %d failed to request vote from %d: %v", r.id, peerID, err)
+		log.Debugf("[Election] Node %d failed to request vote from %d: %v", r.id, peerID, err)
 		voteChan <- &param.VoteResult{VoterID: peerID, VoteGranted: false}
 		return
 	}
@@ -452,7 +452,7 @@ func (r *Raft) decideVote(args *param.RequestVoteArgs, reply *param.RequestVoteR
 		reply.VoteGranted = true
 	} else {
 		// 否则，拒绝投票，并记录详细原因。
-		log.Infof("[RequestVote] Node %d denying vote for term %d to candidate %d. (canVote=%t, inConfig=%t, logIsUpToDate=%t)", r.id, r.currentTerm, args.CandidateID, canVote, inConfig, logIsUpToDate)
+		log.Debugf("[RequestVote] Node %d denying vote for term %d to candidate %d. (canVote=%t, inConfig=%t, logIsUpToDate=%t)", r.id, r.currentTerm, args.CandidateID, canVote, inConfig, logIsUpToDate)
 		reply.VoteGranted = false
 	}
 	return nil
@@ -473,7 +473,7 @@ func (r *Raft) isDuplicateRequest(clientID int64, sequenceNum int64) bool {
 	defer r.mu.Unlock()
 	lastSeqNum, exists := r.clientSessions[clientID]
 	if exists && sequenceNum <= lastSeqNum {
-		log.Infof("[Client] Duplicate request detected from client %d (seq: %d)", clientID, sequenceNum)
+		log.Debugf("[Client] Duplicate request detected from client %d (seq: %d)", clientID, sequenceNum)
 		return true
 	}
 	return false
@@ -503,7 +503,7 @@ func (r *Raft) isLogUpToDate(candidateLastLogIndex, candidateLastLogTerm uint64)
 // grantVote 记录为指定候选人投票的动作，并将其持久化。
 // 此函数必须在持有锁的情况下被调用。
 func (r *Raft) grantVote(candidateID int) error {
-	log.Infof("[RequestVote] Node %d granting vote for term %d to candidate %d.", r.id, r.currentTerm, candidateID)
+	log.Debugf("[RequestVote] Node %d granting vote for term %d to candidate %d.", r.id, r.currentTerm, candidateID)
 	r.votedFor = candidateID
 	r.electionResetEvent = time.Now()
 

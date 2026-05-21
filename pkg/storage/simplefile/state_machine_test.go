@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -97,4 +98,52 @@ func TestStateMachine(t *testing.T) {
 		_, err = NewStateMachine(filePath)
 		assert.Error(t, err)
 	})
+}
+
+func TestStateMachineConcurrentPersistAcrossHandles(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "raft_sm.json")
+
+	sm1, err := NewStateMachine(filePath)
+	assert.NoError(t, err)
+	sm2, err := NewStateMachine(filePath)
+	assert.NoError(t, err)
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 200)
+
+	for i := 0; i < 100; i++ {
+		i := i
+		entryA := createLogEntry(t, "set", "key-a", string(rune('a'+i%26)))
+		entryB := createLogEntry(t, "set", "key-b", string(rune('a'+i%26)))
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			result := sm1.Apply(entryA)
+			if err, ok := result.(error); ok {
+				errCh <- err
+				return
+			}
+			errCh <- nil
+		}()
+		go func() {
+			defer wg.Done()
+			result := sm2.Apply(entryB)
+			if err, ok := result.(error); ok {
+				errCh <- err
+				return
+			}
+			errCh <- nil
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		assert.NoError(t, err)
+	}
+
+	_, err = NewStateMachine(filePath)
+	assert.NoError(t, err)
 }

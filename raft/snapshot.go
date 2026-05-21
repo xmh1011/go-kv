@@ -36,14 +36,14 @@ func (r *Raft) InstallSnapshot(args *param.InstallSnapshotArgs, reply *param.Ins
 
 	// 检查快照是否过时
 	if args.LastIncludedIndex <= r.lastApplied {
-		log.Infof("[Snapshot] Node %d ignoring snapshot with index %d, already applied up to %d", r.id, args.LastIncludedIndex, r.lastApplied)
+		log.Debugf("[Snapshot] Node %d ignoring snapshot with index %d, already applied up to %d", r.id, args.LastIncludedIndex, r.lastApplied)
 		r.mu.Unlock()
 		return nil
 	}
 
 	r.mu.Unlock()
 
-	log.Infof("[Snapshot] Node %d received snapshot from leader %d (lastIncludedIndex=%d)", r.id, args.LeaderID, args.LastIncludedIndex)
+	log.Debugf("[Snapshot] Node %d received snapshot from leader %d (lastIncludedIndex=%d)", r.id, args.LeaderID, args.LastIncludedIndex)
 
 	// 2. 创建快照对象（锁外）
 	snapshot := param.NewSnapshot(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
@@ -54,7 +54,7 @@ func (r *Raft) InstallSnapshot(args *param.InstallSnapshotArgs, reply *param.Ins
 
 	// 验证快照索引仍然有效
 	if snapshot.LastIncludedIndex <= r.lastApplied {
-		log.Infof("[Snapshot] Node %d snapshot index %d no longer needed, lastApplied is %d", r.id, snapshot.LastIncludedIndex, r.lastApplied)
+		log.Debugf("[Snapshot] Node %d snapshot index %d no longer needed, lastApplied is %d", r.id, snapshot.LastIncludedIndex, r.lastApplied)
 		return nil
 	}
 
@@ -82,7 +82,7 @@ func (r *Raft) InstallSnapshot(args *param.InstallSnapshotArgs, reply *param.Ins
 	r.lastApplied = max(r.lastApplied, snapshot.LastIncludedIndex)
 	r.cachedLastLogIndex = max(r.cachedLastLogIndex, snapshot.LastIncludedIndex)
 
-	log.Infof("[Snapshot] Node %d successfully installed snapshot. lastApplied is now %d.", r.id, r.lastApplied)
+	log.Debugf("[Snapshot] Node %d successfully installed snapshot. lastApplied is now %d.", r.id, r.lastApplied)
 	return nil
 }
 
@@ -104,7 +104,7 @@ func (r *Raft) TakeSnapshot() {
 		return
 	}
 
-	log.Infof("[Snapshot] Node %d log size %d exceeds threshold %d, preparing snapshot.", r.id, logSize, r.snapshotThreshold)
+	log.Debugf("[Snapshot] Node %d log size %d exceeds threshold %d, preparing snapshot.", r.id, logSize, r.snapshotThreshold)
 
 	// 3. 【同步阶段】捕获快照元数据和状态机数据
 	// 我们必须在持有锁的情况下捕获当前的 lastApplied 及其对应的 Term。
@@ -142,7 +142,7 @@ func (r *Raft) TakeSnapshot() {
 			r.mu.Unlock()
 		}()
 
-		log.Infof("[Snapshot] Node %d starting async persistence for index %d", r.id, index)
+		log.Debugf("[Snapshot] Node %d starting async persistence for index %d", r.id, index)
 
 		snapshot := param.NewSnapshot(index, term, data)
 
@@ -176,7 +176,7 @@ func (r *Raft) TakeSnapshot() {
 		// 更新内存中的快照引用
 		r.snapshot = snapshot
 
-		log.Infof("[Snapshot] Node %d async snapshot finished. Saved and compacted up to index %d.", r.id, index)
+		log.Debugf("[Snapshot] Node %d async snapshot finished. Saved and compacted up to index %d.", r.id, index)
 		r.mu.Unlock()
 
 	}(snapshotIndex, snapshotTerm, snapshotData)
@@ -257,7 +257,7 @@ func (r *Raft) sendSnapshot(peerID int) {
 	// 4. 发起 RPC 调用（锁外网络 I/O）
 	reply := &param.InstallSnapshotReply{}
 	if err := r.trans.SendInstallSnapshot(strconv.Itoa(peerID), args, reply); err != nil {
-		log.Errorf("[Snapshot] Node %d failed to send snapshot to %d: %v", r.id, peerID, err)
+		log.Debugf("[Snapshot] Node %d failed to send snapshot to %d: %v", r.id, peerID, err)
 		return
 	}
 
@@ -307,5 +307,5 @@ func (r *Raft) processSnapshotReply(peerID int, reply *param.InstallSnapshotRepl
 	// 更新该 Follower 的 nextIndex 和 matchIndex，使其指向快照之后的第一个位置。
 	r.nextIndex[peerID] = snapshotLastIndex + 1
 	r.matchIndex[peerID] = snapshotLastIndex
-	log.Infof("[Snapshot] Node %d successfully sent snapshot to peer %d. nextIndex=%d, matchIndex=%d", r.id, peerID, r.nextIndex[peerID], r.matchIndex[peerID])
+	log.Debugf("[Snapshot] Node %d successfully sent snapshot to peer %d. nextIndex=%d, matchIndex=%d", r.id, peerID, r.nextIndex[peerID], r.matchIndex[peerID])
 }

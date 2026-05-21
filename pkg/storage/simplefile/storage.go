@@ -4,6 +4,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/xmh1011/go-kv/pkg/param"
@@ -85,15 +86,26 @@ func (s *Storage) persist() error {
 	}
 
 	// Write to temp file and rename for atomicity
-	tmpPath := s.filePath + ".tmp"
-	f, err := os.Create(tmpPath)
-	if err != nil {
+	dir := filepath.Dir(s.filePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 
+	f, err := os.CreateTemp(dir, filepath.Base(s.filePath)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := f.Name()
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
 	encoder := gob.NewEncoder(f)
 	if err := encoder.Encode(data); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 
@@ -101,7 +113,11 @@ func (s *Storage) persist() error {
 		return err
 	}
 
-	return os.Rename(tmpPath, s.filePath)
+	if err := os.Rename(tmpPath, s.filePath); err != nil {
+		return err
+	}
+	renamed = true
+	return nil
 }
 
 // --- HardState Operations ---

@@ -5,11 +5,11 @@ server:
 
 log:
   filename: "app.log"
-  maxsize: 10
-  maxbackups: 5
-  maxage: 30
+  max_size: 10
+  max_backups: 5
+  max_age: 30
   compress: true
-  level: "debug"
+  level: "warn"
   console: true
 
 # Raft 配置

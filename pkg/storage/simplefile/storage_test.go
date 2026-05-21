@@ -3,6 +3,7 @@ package simplefile
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -164,4 +165,43 @@ func TestStorage(t *testing.T) {
 		_, err = NewStorage(filePath)
 		assert.Error(t, err, "NewStorage should fail with corrupted file")
 	})
+}
+
+func TestStorageConcurrentPersistAcrossHandles(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "raft_storage.gob")
+
+	s1, err := NewStorage(filePath)
+	assert.NoError(t, err)
+	s2, err := NewStorage(filePath)
+	assert.NoError(t, err)
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 200)
+
+	for i := 0; i < 100; i++ {
+		i := i
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			errCh <- s1.SetState(param.HardState{CurrentTerm: uint64(i*2 + 1), VotedFor: 1})
+		}()
+		go func() {
+			defer wg.Done()
+			errCh <- s2.SetState(param.HardState{CurrentTerm: uint64(i*2 + 2), VotedFor: 2})
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		assert.NoError(t, err)
+	}
+
+	reopened, err := NewStorage(filePath)
+	assert.NoError(t, err)
+	state, err := reopened.GetState()
+	assert.NoError(t, err)
+	assert.Greater(t, state.CurrentTerm, uint64(0))
 }

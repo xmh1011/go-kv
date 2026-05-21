@@ -54,7 +54,7 @@ func (m *Manager) Insert(pair kv.KeyValuePair) (*IMemTable, error) {
 		return nil, nil
 	}
 
-	log.Info("[MemTableManager] MemTable full, promoting to Immutable MemTable")
+	log.Debug("[MemTableManager] MemTable full, promoting to Immutable MemTable")
 	evicted := m.promoteLocked()
 	if err := m.Mem.Insert(pair); err != nil {
 		log.Errorf("[MemTableManager] Insert after promote error: %s", err.Error())
@@ -97,7 +97,7 @@ func (m *Manager) Delete(key kv.Key) (*IMemTable, error) {
 		return nil, nil
 	}
 
-	log.Info("[MemTableManager] MemTable full during delete, promoting to Immutable MemTable")
+	log.Debug("[MemTableManager] MemTable full during delete, promoting to Immutable MemTable")
 	evicted := m.promoteLocked()
 	if err := m.Mem.Insert(pair); err != nil {
 		log.Errorf("[MemTableManager] Insert after promote error: %s", err.Error())
@@ -143,7 +143,7 @@ func (m *Manager) ForcePromote() *IMemTable {
 		return nil
 	}
 
-	log.Info("[MemTableManager] Force promoting MemTable to Immutable MemTable")
+	log.Debug("[MemTableManager] Force promoting MemTable to Immutable MemTable")
 	m.promoteLocked()
 
 	if len(m.IMems) > 0 {
@@ -170,7 +170,7 @@ func (m *Manager) Recover() error {
 	if err != nil {
 		// 如果目录不存在，则不需要恢复，直接返回
 		if os.IsNotExist(err) {
-			log.Infof("[MemTableManager] WAL directory %s does not exist, skipping recovery", m.walPath)
+			log.Debugf("[MemTableManager] WAL directory %s does not exist, skipping recovery", m.walPath)
 			return nil
 		}
 		log.Errorf("[MemTableManager] Failed to read WAL directory %s: %s", m.walPath, err.Error())
@@ -204,7 +204,7 @@ func (m *Manager) Recover() error {
 		m.IMems = m.IMems[len(m.IMems)-m.maxIMemTableCount:]
 	}
 
-	log.Infof("[MemTableManager] Recovered %d Immutable MemTables and 1 Active MemTable", len(m.IMems))
+	log.Debugf("[MemTableManager] Recovered %d Immutable MemTables and 1 Active MemTable", len(m.IMems))
 	return nil
 }
 

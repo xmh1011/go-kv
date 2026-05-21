@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -12,6 +13,7 @@ import (
 
 const (
 	errorLogFileSubfix = "wf"
+	envLogLevel        = "GO_KV_LOG_LEVEL"
 )
 
 var logger *logrus.Logger
@@ -25,7 +27,7 @@ func init() {
 		TimestampFormat:        time.DateTime,
 		DisableLevelTruncation: true, // 防止日志级别被截断
 	})
-	logger.SetLevel(logrus.InfoLevel)
+	logger.SetLevel(resolveLevel(""))
 }
 
 // Config 日志配置
@@ -42,11 +44,8 @@ type Config struct {
 // Init 初始化日志
 func Init(cfg Config) {
 	// 设置日志级别
-	level, err := logrus.ParseLevel(cfg.Level)
-	if err != nil {
-		level = logrus.InfoLevel
-	}
-	logger.SetLevel(level)
+	logger.SetLevel(resolveLevel(cfg.Level))
+	logger.ReplaceHooks(make(logrus.LevelHooks))
 
 	// 设置格式
 	logger.SetFormatter(&logrus.TextFormatter{
@@ -86,20 +85,36 @@ func Init(cfg Config) {
 	}
 
 	// 2. 配置错误日志独立输出 Hook
-	errorWriter := &lumberjack.Logger{
-		Filename:   fmt.Sprintf("%s.%s", cfg.Filename, errorLogFileSubfix),
-		MaxSize:    cfg.MaxSize,
-		MaxBackups: cfg.MaxBackups,
-		MaxAge:     cfg.MaxAge,
-		Compress:   cfg.Compress,
-	}
+	if cfg.Filename != "" {
+		errorWriter := &lumberjack.Logger{
+			Filename:   fmt.Sprintf("%s.%s", cfg.Filename, errorLogFileSubfix),
+			MaxSize:    cfg.MaxSize,
+			MaxBackups: cfg.MaxBackups,
+			MaxAge:     cfg.MaxAge,
+			Compress:   cfg.Compress,
+		}
 
-	// 添加 Hook
-	logger.AddHook(&ErrorHook{
-		Writer:    errorWriter,
-		LogLevels: []logrus.Level{logrus.ErrorLevel, logrus.FatalLevel, logrus.PanicLevel},
-		Formatter: logger.Formatter,
-	})
+		// 添加 Hook
+		logger.AddHook(&ErrorHook{
+			Writer:    errorWriter,
+			LogLevels: []logrus.Level{logrus.ErrorLevel, logrus.FatalLevel, logrus.PanicLevel},
+			Formatter: logger.Formatter,
+		})
+	}
+}
+
+func resolveLevel(configLevel string) logrus.Level {
+	if envLevel := strings.TrimSpace(os.Getenv(envLogLevel)); envLevel != "" {
+		configLevel = envLevel
+	}
+	if strings.TrimSpace(configLevel) == "" {
+		return logrus.WarnLevel
+	}
+	level, err := logrus.ParseLevel(strings.ToLower(strings.TrimSpace(configLevel)))
+	if err != nil {
+		return logrus.WarnLevel
+	}
+	return level
 }
 
 // ErrorHook 是一个自定义的 logrus Hook，用于将错误日志写入单独的文件

@@ -29,7 +29,7 @@ func (m *Manager) Compaction() error {
 		return nil
 	}
 
-	log.Infof("[Compaction] Starting compaction for level %d", m.minSSTableLevel)
+	log.Debugf("[Compaction] Starting compaction for level %d", m.minSSTableLevel)
 	// 开始 Level0 压缩
 	if err := m.compactLevel(m.minSSTableLevel); err != nil {
 		log.Errorf("[Compaction] Compact level %d error: %s", m.minSSTableLevel, err.Error())
@@ -38,7 +38,7 @@ func (m *Manager) Compaction() error {
 
 	// 触发下一层级异步压缩（如果需要）
 	if m.isLevelNeedToBeMerged(m.minSSTableLevel + 1) {
-		log.Infof("[Compaction] Triggering async compaction for level %d", m.minSSTableLevel+1)
+		log.Debugf("[Compaction] Triggering async compaction for level %d", m.minSSTableLevel+1)
 		go m.asyncCompactLevel(m.minSSTableLevel + 1)
 	}
 
@@ -59,7 +59,7 @@ func (m *Manager) asyncCompactLevel(level int) {
 			return
 		}
 
-		log.Infof("[Compaction] Starting async compaction for level %d", level)
+		log.Debugf("[Compaction] Starting async compaction for level %d", level)
 		// 执行压缩
 		if err := m.compactLevel(level); err != nil {
 			log.Errorf("[Compaction] Async compaction at level %d error: %v", level, err)
@@ -132,7 +132,7 @@ func (m *Manager) compactLevel(level int) error {
 		return fmt.Errorf("add new SSTables error: %w", err)
 	}
 
-	log.Infof("[Compaction] Level %d compaction finished, generated %d new tables", level, len(newTables))
+	log.Debugf("[Compaction] Level %d compaction finished, generated %d new tables", level, len(newTables))
 
 	// 6. 如果目标层级仍需压缩，递归处理（仅对中间层级）
 	if level < m.maxSSTableLevel && m.isLevelNeedToBeMerged(level+1) {

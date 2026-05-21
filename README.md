@@ -99,7 +99,17 @@ make cluster
 make stop-cluster
 ```
 
-### 4. 使用客户端
+### 4. 日志级别
+
+默认日志级别是 `warn`，日常运行只输出超时、异常和故障信息。排查 Raft 复制、ReadIndex、LSM flush/compaction 或传输细节时，可以临时打开更详细日志：
+
+```bash
+GO_KV_LOG_LEVEL=debug make e2e-test
+```
+
+也可以在配置文件中设置 `log.level`，支持 `debug`、`info`、`warn`、`error`；环境变量 `GO_KV_LOG_LEVEL` 优先级更高。
+
+### 5. 使用客户端
 
 客户端通过 `conf/config.yaml` 文件来发现集群节点。
 
@@ -127,7 +137,7 @@ make stop-cluster
   ```
   > ✅ Success! Result: key not found
 
-### 5. 其他 Makefile 命令
+### 6. 其他 Makefile 命令
 
 - **运行所有测试**:
   ```bash

@@ -162,7 +162,7 @@ func (t *Transport) getPeerClient(targetID string) (*rpc.Client, error) {
 		return client, nil
 	}
 
-	log.Infof("[TCPTransport] Dialing new connection to node %s at %s", targetID, addr)
+	log.Debugf("[TCPTransport] Dialing new connection to node %s at %s", targetID, addr)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return nil, err
