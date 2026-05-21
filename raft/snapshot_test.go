@@ -11,6 +11,7 @@ import (
 
 	"github.com/xmh1011/go-kv/pkg/param"
 	"github.com/xmh1011/go-kv/pkg/storage"
+	memstorage "github.com/xmh1011/go-kv/pkg/storage/inmemory"
 	"github.com/xmh1011/go-kv/pkg/transport"
 )
 
@@ -288,6 +289,38 @@ func TestInstallSnapshot(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestInstallSnapshotCompactsPastLocalLogTail(t *testing.T) {
+	store := memstorage.NewStorage()
+	assert.NoError(t, store.AppendEntries([]param.LogEntry{
+		{Term: 1, Index: 1},
+		{Term: 1, Index: 2},
+		{Term: 1, Index: 3},
+	}))
+
+	stateMachine := memstorage.NewInMemoryStateMachine()
+	r := NewRaft(2, []int{1, 3}, store, stateMachine, nil, nil)
+	r.currentTerm = 5
+
+	reply := &param.InstallSnapshotReply{}
+	err := r.InstallSnapshot(param.NewInstallSnapshotArgs(5, 1, 5, 2, []byte(`{"snap":"value"}`)), reply)
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(5), reply.Term)
+	assert.Equal(t, uint64(5), r.lastApplied)
+	assert.Equal(t, uint64(5), r.commitIndex)
+
+	first, err := store.FirstLogIndex()
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(6), first)
+
+	last, err := store.LastLogIndex()
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(5), last)
+
+	value, err := stateMachine.Get("snap")
+	assert.NoError(t, err)
+	assert.Equal(t, "value", value)
 }
 
 func TestSendSnapshot(t *testing.T) {

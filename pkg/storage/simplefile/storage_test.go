@@ -122,6 +122,38 @@ func TestStorage(t *testing.T) {
 		assert.Equal(t, snapshot, readSnap)
 	})
 
+	t.Run("Compact Beyond Last Index From Snapshot", func(t *testing.T) {
+		s, filePath := newTestStorage(t)
+		assert.NoError(t, s.AppendEntries(newTestEntries(1, 3)))
+
+		assert.NoError(t, s.CompactLog(5))
+
+		firstIdx, err := s.FirstLogIndex()
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(6), firstIdx)
+
+		lastIdx, err := s.LastLogIndex()
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(5), lastIdx)
+
+		assert.NoError(t, s.AppendEntries([]param.LogEntry{{Term: 2, Index: 6}}))
+
+		s2, err := NewStorage(filePath)
+		assert.NoError(t, err)
+
+		firstIdx, err = s2.FirstLogIndex()
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(6), firstIdx)
+
+		lastIdx, err = s2.LastLogIndex()
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(6), lastIdx)
+
+		entry, err := s2.GetEntry(6)
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(6), entry.Index)
+	})
+
 	t.Run("Corrupted File", func(t *testing.T) {
 		// Create a file with garbage data
 		tmpDir := t.TempDir()

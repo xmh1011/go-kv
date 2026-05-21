@@ -335,8 +335,13 @@ func (s *StorageAdapter) CompactLog(upToIndex uint64) error {
 		return nil
 	}
 
+	deleteTo := upToIndex
+	if deleteTo > s.lastIndex {
+		deleteTo = s.lastIndex
+	}
+
 	// 逐个删除
-	for i := s.firstIndex; i <= upToIndex; i++ {
+	for i := s.firstIndex; i <= deleteTo; i++ {
 		key := s.getLogKey(i)
 		val, _ := s.db.Get(key)
 		if val != nil {
@@ -348,8 +353,8 @@ func (s *StorageAdapter) CompactLog(upToIndex uint64) error {
 	}
 
 	s.firstIndex = upToIndex + 1
-	if s.firstIndex > s.lastIndex+1 {
-		s.firstIndex = s.lastIndex + 1
+	if upToIndex >= s.lastIndex {
+		s.lastIndex = upToIndex
 	}
 
 	return s.saveMetadata()

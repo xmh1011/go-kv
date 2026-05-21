@@ -6,8 +6,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/natefinch/lumberjack"
 	"github.com/sirupsen/logrus"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 const (

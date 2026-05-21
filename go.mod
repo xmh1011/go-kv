@@ -6,7 +6,6 @@ require (
 	github.com/bits-and-blooms/bitset v1.24.4
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/golang/mock v1.6.0
-	github.com/natefinch/lumberjack v2.2.1+incompatible
 	github.com/sirupsen/logrus v1.9.4
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
@@ -14,6 +13,7 @@ require (
 	github.com/twmb/murmur3 v1.1.8
 	google.golang.org/grpc v1.79.1
 	google.golang.org/protobuf v1.36.11
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
 require (
