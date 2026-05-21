@@ -920,6 +920,58 @@ func TestAppendEntries(t *testing.T) {
 	}
 }
 
+func TestAppendEntriesRejectsIfTermChangesDuringDiskIO(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	r := &Raft{
+		id:                 2,
+		currentTerm:        5,
+		store:              mockStore,
+		stateMachine:       mockSM,
+		commitChan:         make(chan param.CommitEntry, 1),
+		cachedLastLogIndex: 10,
+		electionTimeout:    config.Conf.Raft.ElectionTimeout,
+		heartbeatTimeout:   config.Conf.Raft.HeartbeatTimeout,
+	}
+	r.setState(Follower)
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	args := &param.AppendEntriesArgs{
+		Term:         5,
+		LeaderID:     1,
+		PrevLogIndex: 10,
+		PrevLogTerm:  5,
+		Entries:      []param.LogEntry{{Command: "cmd11", Term: 5, Index: 11}},
+		LeaderCommit: 11,
+	}
+
+	gomock.InOrder(
+		mockStore.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 5, Index: 10}, nil),
+		mockStore.EXPECT().GetEntry(uint64(11)).Return(nil, nil),
+		mockStore.EXPECT().AppendEntries(gomock.Any()).DoAndReturn(func(entries []param.LogEntry) error {
+			assert.Len(t, entries, 1)
+			assert.Equal(t, uint64(11), entries[0].Index)
+			r.mu.Lock()
+			r.currentTerm = 6
+			r.mu.Unlock()
+			return nil
+		}),
+	)
+
+	reply := &param.AppendEntriesReply{}
+	err := r.AppendEntries(args, reply)
+
+	assert.NoError(t, err)
+	assert.False(t, reply.Success)
+	assert.Equal(t, uint64(6), reply.Term)
+	assert.Equal(t, uint64(11), r.cachedLastLogIndex)
+	assert.Equal(t, uint64(0), r.commitIndex)
+}
+
 func TestIsReplicatedByMajority(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -1088,6 +1140,48 @@ func TestProcessAppendEntriesReply(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSuccessfulAppendEntriesReplyDoesNotRegressPeerProgress(t *testing.T) {
+	r := &Raft{
+		id:                 1,
+		currentTerm:        5,
+		peerIDs:            []int{1, 2, 3, 4, 5},
+		nextIndex:          map[int]uint64{2: 12},
+		matchIndex:         map[int]uint64{2: 11},
+		lastAck:            make(map[int]time.Time),
+		cachedLastLogIndex: 11,
+	}
+	r.setState(Leader)
+
+	args := &param.AppendEntriesArgs{
+		Term:         5,
+		LeaderID:     1,
+		PrevLogIndex: 9,
+		PrevLogTerm:  5,
+	}
+	reply := &param.AppendEntriesReply{Term: 5, Success: true}
+
+	r.processAppendEntriesReply(2, args, reply, 5)
+
+	assert.Equal(t, uint64(12), r.nextIndex[2])
+	assert.Equal(t, uint64(11), r.matchIndex[2])
+}
+
+func TestFailedAppendEntriesReplyDoesNotBacktrackBelowMatchIndex(t *testing.T) {
+	r := &Raft{
+		id:         1,
+		nextIndex:  map[int]uint64{2: 12},
+		matchIndex: map[int]uint64{2: 11},
+	}
+	r.setState(Follower)
+
+	r.handleFailedAppendEntries(2, &param.AppendEntriesReply{
+		Success:       false,
+		ConflictIndex: 5,
+	})
+
+	assert.Equal(t, uint64(12), r.nextIndex[2])
 }
 
 func TestDispatchEntries(t *testing.T) {

@@ -1077,6 +1077,7 @@ func TestLeaseRead_LeaseExpired(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, reply.Success)
 	assert.Equal(t, "test-value", reply.Result)
+	waitForWaitGroup(t, &wg, time.Second)
 
 	// 验证租约被更新
 	assert.True(t, time.Now().Before(r.leaseUntil), "lease should be renewed after heartbeat confirmation")
@@ -1139,6 +1140,21 @@ func TestLeaseRead_HeartbeatMode(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, reply.Success)
 	assert.Equal(t, "test-value", reply.Result)
+	waitForWaitGroup(t, &wg, time.Second)
+}
+
+func waitForWaitGroup(t *testing.T, wg *sync.WaitGroup, timeout time.Duration) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for expected goroutines")
+	}
 }
 
 // TestTryRenewLease 测试租约续租逻辑
@@ -1206,6 +1222,30 @@ func TestTryRenewLeaseRequiresJointQuorum(t *testing.T) {
 	r.lastAck[4] = now
 	r.tryRenewLease()
 	assert.False(t, r.leaseUntil.IsZero(), "lease should renew after both old and new majorities ack")
+}
+
+func TestTransitionToLeaderClearsLeadershipCache(t *testing.T) {
+	r := &Raft{
+		id:                    1,
+		peerIDs:               []int{1},
+		currentTerm:           7,
+		heartbeatTimeout:      time.Hour,
+		shutdownChan:          make(chan struct{}),
+		proposalCh:            make(chan proposalRequest, proposalChSize),
+		lastAck:               map[int]time.Time{2: time.Now()},
+		lastLeadershipConfirm: time.Now(),
+		leaseUntil:            time.Now().Add(time.Hour),
+	}
+	r.setState(Candidate)
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	r.transitionToLeader(7)
+	defer r.Stop()
+
+	assert.Equal(t, Leader, r.getState())
+	assert.Empty(t, r.lastAck)
+	assert.True(t, r.lastLeadershipConfirm.IsZero())
+	assert.True(t, r.leaseUntil.IsZero())
 }
 
 func TestConfirmLeadershipRequiresJointQuorumFromRecentAcks(t *testing.T) {

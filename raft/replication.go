@@ -185,8 +185,13 @@ func (r *Raft) processAppendEntriesReply(peerID int, args *param.AppendEntriesAr
 // handleSuccessfulAppendEntries 在收到成功的 AppendEntries 响应后更新 Leader 的状态。
 func (r *Raft) handleSuccessfulAppendEntries(peerID int, args *param.AppendEntriesArgs) {
 	newNextIndex := args.PrevLogIndex + uint64(len(args.Entries)) + 1
-	r.nextIndex[peerID] = newNextIndex
-	r.matchIndex[peerID] = newNextIndex - 1
+	newMatchIndex := newNextIndex - 1
+	if newNextIndex > r.nextIndex[peerID] {
+		r.nextIndex[peerID] = newNextIndex
+	}
+	if newMatchIndex > r.matchIndex[peerID] {
+		r.matchIndex[peerID] = newMatchIndex
+	}
 
 	r.updateCommitIndex()
 }
@@ -196,14 +201,22 @@ func (r *Raft) handleFailedAppendEntries(peerID int, reply *param.AppendEntriesR
 	log.Infof("[Log Replication] Node %d rejected AppendEntries from leader %d (ConflictIndex=%d, ConflictTerm=%d)", peerID, r.id, reply.ConflictIndex, reply.ConflictTerm)
 
 	// 根据论文中的优化策略，快速回退 nextIndex。
+	nextIndex := r.nextIndex[peerID]
 	if reply.ConflictIndex > 0 {
-		r.nextIndex[peerID] = reply.ConflictIndex
+		nextIndex = reply.ConflictIndex
 	} else {
 		// 如果 ConflictIndex 为 0（异常情况），则回退一步
 		if r.nextIndex[peerID] > 1 {
-			r.nextIndex[peerID]--
+			nextIndex = r.nextIndex[peerID] - 1
 		}
 	}
+	if nextIndex > r.nextIndex[peerID] {
+		nextIndex = r.nextIndex[peerID]
+	}
+	if minNextIndex := r.matchIndex[peerID] + 1; nextIndex < minNextIndex {
+		nextIndex = minNextIndex
+	}
+	r.nextIndex[peerID] = nextIndex
 
 	go r.sendAppendEntries(peerID)
 }
@@ -384,14 +397,6 @@ func (r *Raft) AppendEntries(args *param.AppendEntriesArgs, reply *param.AppendE
 	// === Phase 3: 短锁 — 验证任期 + 更新 commitIndex ===
 	r.mu.Lock()
 
-	// 验证任期未在 Phase 2 期间变化
-	if r.currentTerm != savedTerm {
-		// 任期已变，放弃更新（但日志已写入磁盘，无害）
-		r.mu.Unlock()
-		reply.Success = true
-		return nil
-	}
-
 	// 更新缓存的 lastLogIndex：使用 args.Entries 中的最后一个 entry 的 Index，
 	// 因为无论是否有冲突截断，最终结果都是 store 中包含了所有 args.Entries。
 	newLastIndex := args.Entries[len(args.Entries)-1].Index
@@ -400,6 +405,16 @@ func (r *Raft) AppendEntries(args *param.AppendEntriesArgs, reply *param.AppendE
 	} else if truncateFrom > 0 {
 		// 如果发生了截断，lastLogIndex 可能减小了
 		r.cachedLastLogIndex = newLastIndex
+	}
+
+	// 验证任期未在 Phase 2 期间变化
+	if r.currentTerm != savedTerm {
+		// 日志已经按当时合法的 AppendEntries 写入本地，但不能让旧任期
+		// Leader 把这个响应当作当前任期的复制确认。
+		reply.Term = r.currentTerm
+		reply.Success = false
+		r.mu.Unlock()
+		return nil
 	}
 
 	// 4. 根据 Leader 的进度更新本地的 commitIndex。

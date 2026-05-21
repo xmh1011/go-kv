@@ -709,6 +709,11 @@ func (r *Raft) confirmLeadership() bool {
 
 	// 6. 更新缓存时间和租约
 	r.mu.Lock()
+	if r.getState() != Leader || r.currentTerm != term {
+		r.mu.Unlock()
+		return false
+	}
+
 	now = time.Now()
 	hasQuorum := quorum.hasAckQuorum(acked)
 	if hasQuorum {
@@ -1116,6 +1121,9 @@ func (r *Raft) becomeFollower(newTerm uint64) error {
 	// 广播 lastAppliedCond，唤醒可能在等待的读请求
 	// 这样它们可以检测到 Leader 状态变化并返回 NotLeader 错误
 	r.lastAppliedCond.Broadcast()
+	r.lastAck = make(map[int]time.Time)
+	r.lastLeadershipConfirm = time.Time{}
+	r.leaseUntil = time.Time{}
 
 	if err := r.store.SetState(param.HardState{CurrentTerm: r.currentTerm, VotedFor: uint64(r.votedFor)}); err != nil {
 		log.Errorf("[Raft] Node %d failed to persist state after becoming follower: %v", r.id, err)
