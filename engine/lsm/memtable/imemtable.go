@@ -44,11 +44,8 @@ func (t *IMemTable) Search(key kv.Key) (kv.Value, bool) {
 
 // RangeScan scans all key-value pairs in order and calls the callback.
 func (t *IMemTable) RangeScan(callback func(*kv.KeyValuePair)) {
-	iter := skiplist.NewSkipListIterator(t.entries)
-	defer iter.Close()
-
-	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
-		callback(iter.Pair())
+	for node := t.entries.Head.Forward[0]; node != nil; node = node.Forward[0] {
+		callback(&node.Pair)
 	}
 }
 

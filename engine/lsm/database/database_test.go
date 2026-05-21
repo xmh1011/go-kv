@@ -78,6 +78,63 @@ func TestDatabasePersistenceAcrossRecovery(t *testing.T) {
 	assert.Equal(t, []byte("world"), val)
 }
 
+func TestDatabaseDeleteHidesFlushedValue(t *testing.T) {
+	tmpDir := t.TempDir()
+	db := Open(tmpDir)
+
+	err := db.Put("key", []byte("old-value"))
+	assert.NoError(t, err)
+	assert.NoError(t, db.ForceFlush())
+
+	err = db.Delete("key")
+	assert.NoError(t, err)
+
+	val, err := db.Get("key")
+	assert.NoError(t, err)
+	assert.Nil(t, val)
+
+	assert.NoError(t, db.ForceFlush())
+
+	val, err = db.Get("key")
+	assert.NoError(t, err)
+	assert.Nil(t, val)
+
+	db.Close()
+
+	db2 := Open(tmpDir)
+	defer db2.Close()
+	err = db2.Recover()
+	assert.NoError(t, err)
+
+	val, err = db2.Get("key")
+	assert.NoError(t, err)
+	assert.Nil(t, val)
+}
+
+func TestDatabaseRecoveryKeepsNewestLevel0Value(t *testing.T) {
+	tmpDir := t.TempDir()
+	db := Open(tmpDir)
+
+	err := db.Put("key", []byte("value1"))
+	assert.NoError(t, err)
+	assert.NoError(t, db.ForceFlush())
+
+	err = db.Put("key", []byte("value2"))
+	assert.NoError(t, err)
+	assert.NoError(t, db.ForceFlush())
+
+	db.Close()
+
+	db2 := Open(tmpDir)
+	defer db2.Close()
+	err = db2.Recover()
+	assert.NoError(t, err)
+
+	val, err := db2.Get("key")
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("value2"), val)
+}
+
 func TestDatabaseRecoveryOnEmpty(t *testing.T) {
 	tmpDir := t.TempDir()
 	db := Open(tmpDir)

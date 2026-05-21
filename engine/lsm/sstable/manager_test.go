@@ -118,20 +118,22 @@ func TestSSTableManagerSearch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			val, err := manager.Search(tt.key)
+			val, found, err := manager.Search(tt.key)
 			if tt.wantErr {
 				assert.Error(t, err)
 				return
 			}
 
 			assert.NoError(t, err)
-			assert.Equal(t, tt.expected, val)
+			assert.Equal(t, tt.expected != nil, found)
+			assert.Equal(t, kv.Value(tt.expected), val)
 		})
 	}
 
 	// 6. 测试布隆过滤器优化 - 查询明显不存在的key
-	val, err := manager.Search("definitely_not_exist_key")
+	val, found, err := manager.Search("definitely_not_exist_key")
 	assert.NoError(t, err)
+	assert.False(t, found)
 	assert.Nil(t, val)
 }
 

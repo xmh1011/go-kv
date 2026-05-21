@@ -61,6 +61,25 @@ func TestIMemTableRangeScan(t *testing.T) {
 	assert.Equal(t, expected, actual, "RangeScan should return all kv pairs in sorted order")
 }
 
+func TestIMemTableRangeScanIncludesTombstones(t *testing.T) {
+	dir := t.TempDir()
+	mem := NewMemTable(12, dir)
+
+	err := mem.Insert(kv.KeyValuePair{Key: "deleted", Value: kv.DeletedValue})
+	assert.NoError(t, err)
+
+	imem := NewIMemTable(mem)
+
+	var actual []*kv.KeyValuePair
+	imem.RangeScan(func(pair *kv.KeyValuePair) {
+		actual = append(actual, pair)
+	})
+
+	assert.Len(t, actual, 1)
+	assert.Equal(t, kv.Key("deleted"), actual[0].Key)
+	assert.True(t, actual[0].IsDeleted())
+}
+
 // TestIMemTable_Id verifies that the ID from the original memtable is preserved.
 func TestIMemTableId(t *testing.T) {
 	dir := t.TempDir()
