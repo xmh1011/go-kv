@@ -16,7 +16,7 @@ type Database struct {
 }
 
 func Open(name string) *Database {
-	log.Infof("[Database] Opening database: %s", name)
+	log.Debugf("[Database] Opening database: %s", name)
 	walPath := filepath.Join(name, "wal")
 	sstPath := filepath.Join(name, "sst")
 	return &Database{
@@ -84,7 +84,7 @@ func (d *Database) Delete(key string) error {
 }
 
 func (d *Database) Recover() error {
-	log.Info("[Database] Starting recovery...")
+	log.Debug("[Database] Starting recovery...")
 	// 1. 恢复内存中的 MemTable
 	if err := d.MemTables.Recover(); err != nil {
 		log.Errorf("[Database] Recover memtable error: %s", err.Error())
@@ -97,18 +97,18 @@ func (d *Database) Recover() error {
 		return err
 	}
 
-	log.Info("[Database] Recovery completed successfully")
+	log.Debug("[Database] Recovery completed successfully")
 	return nil
 }
 
 // ForceFlush 强制将当前的 MemTable 转换为 Immutable MemTable 并刷新到 SSTable。
 // 这通常用于快照操作。
 func (d *Database) ForceFlush() error {
-	log.Info("[Database] Force flushing MemTable to SSTable")
+	log.Debug("[Database] Force flushing MemTable to SSTable")
 	// 1. 强制 Promote
 	imem := d.MemTables.ForcePromote()
 	if imem == nil {
-		log.Info("[Database] MemTable is empty, nothing to flush")
+		log.Debug("[Database] MemTable is empty, nothing to flush")
 		return nil
 	}
 
@@ -118,7 +118,7 @@ func (d *Database) ForceFlush() error {
 		return err
 	}
 
-	log.Info("[Database] Force flush completed")
+	log.Debug("[Database] Force flush completed")
 	return nil
 }
 
@@ -132,7 +132,7 @@ func (d *Database) createNewSSTable(imem *memtable.IMemTable) {
 	if imem == nil {
 		return
 	}
-	log.Info("[Database] MemTable full, flushing to SSTable")
+	log.Debug("[Database] MemTable full, flushing to SSTable")
 	if err := d.SSTables.CreateNewSSTable(imem); err != nil {
 		log.Errorf("[Database] Create new sstable error: %s", err.Error())
 	}
@@ -140,7 +140,7 @@ func (d *Database) createNewSSTable(imem *memtable.IMemTable) {
 
 // Close 关闭数据库，释放资源。
 func (d *Database) Close() error {
-	log.Info("[Database] Closing database...")
+	log.Debug("[Database] Closing database...")
 	// 关闭 MemTable Manager (主要是关闭 WAL)
 	if err := d.MemTables.Close(); err != nil {
 		log.Errorf("[Database] Close MemTable manager error: %s", err.Error())
@@ -151,7 +151,7 @@ func (d *Database) Close() error {
 
 // Reload 关闭并重新打开数据库（用于快照恢复后）
 func (d *Database) Reload() error {
-	log.Info("[Database] Reloading database...")
+	log.Debug("[Database] Reloading database...")
 	if err := d.Close(); err != nil {
 		return err
 	}

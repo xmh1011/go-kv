@@ -54,7 +54,7 @@ func (s *StorageAdapter) init() error {
 		s.firstIndex = binary.BigEndian.Uint64(val[0:8])
 		s.lastIndex = binary.BigEndian.Uint64(val[8:16])
 		s.logSize = int(binary.BigEndian.Uint64(val[16:24]))
-		log.Infof("[LSMStorage] Initialized. FirstIndex: %d, LastIndex: %d, LogSize: %d", s.firstIndex, s.lastIndex, s.logSize)
+		log.Debugf("[LSMStorage] Initialized. FirstIndex: %d, LastIndex: %d, LogSize: %d", s.firstIndex, s.lastIndex, s.logSize)
 		return nil
 	}
 
@@ -98,7 +98,7 @@ func (s *StorageAdapter) init() error {
 		s.logSize = 0
 	}
 
-	log.Infof("[LSMStorage] Initialized. FirstIndex: %d, LastIndex: %d, LogSize: %d", s.firstIndex, s.lastIndex, s.logSize)
+	log.Debugf("[LSMStorage] Initialized. FirstIndex: %d, LastIndex: %d, LogSize: %d", s.firstIndex, s.lastIndex, s.logSize)
 	return nil
 }
 

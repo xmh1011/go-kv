@@ -289,12 +289,15 @@ func TestE2E_WriteHeavy(t *testing.T) {
 	t.Logf("Test: WriteHeavy, Leader: Node %d", leader.ID())
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		opCount := 0
 		for {
 			select {
 			case <-stopCh:
-				break
+				return
 			default:
 				key := fmt.Sprintf("key-%d", rand.Intn(100000))
 				value := fmt.Sprintf("val-%d", rand.Intn(1000000))
@@ -318,6 +321,7 @@ func TestE2E_WriteHeavy(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	latenciesMu.Lock()
 	p50 := percentile(latencies, 50)
@@ -380,11 +384,14 @@ func TestE2E_ReadHeavy(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-stopCh:
-				break
+				return
 			default:
 				keyNum := rand.Intn(warmupCount)
 				key := fmt.Sprintf("warmup-key-%d", keyNum)
@@ -409,6 +416,7 @@ func TestE2E_ReadHeavy(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	latenciesMu.Lock()
 	p50 := percentile(latencies, 50)
@@ -471,11 +479,14 @@ func TestE2E_MixedWorkload(t *testing.T) {
 	currentLeader.Store(leader)
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-stopCh:
-				break
+				return
 			default:
 				isWrite := rand.Float64() < 0.7 // 70% 写入
 				keyNum := rand.Intn(warmupCount)
@@ -514,6 +525,7 @@ func TestE2E_MixedWorkload(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	latenciesMu.Lock()
 	p50 := percentile(latencies, 50)
@@ -563,11 +575,14 @@ func TestE2E_SmallValues(t *testing.T) {
 	currentLeader.Store(leader)
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-stopCh:
-				break
+				return
 			default:
 				key := fmt.Sprintf("k%d", rand.Intn(1000))
 				isWrite := rand.Float64() < 0.5
@@ -605,6 +620,7 @@ func TestE2E_SmallValues(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	latenciesMu.Lock()
 	p50 := percentile(latencies, 50)
@@ -652,11 +668,14 @@ func TestE2E_BatchOperations(t *testing.T) {
 	numBatches := 0
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-stopCh:
-				break
+				return
 			default:
 				batchStart := time.Now()
 
@@ -709,6 +728,7 @@ func TestE2E_BatchOperations(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	batchLatenciesMu.Lock()
 	p50 := percentile(batchLatencies, 50)
@@ -769,11 +789,14 @@ func TestE2E_DeleteOperations(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-stopCh:
-				break
+				return
 			default:
 				keyNum := rand.Intn(warmupCount)
 				key := fmt.Sprintf("warmup-key-%d", keyNum)
@@ -794,6 +817,7 @@ func TestE2E_DeleteOperations(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	latenciesMu.Lock()
 	p50 := percentile(latencies, 50)
@@ -874,7 +898,10 @@ func TestNetworkE2E_WriteHeavy(t *testing.T) {
 	t.Logf("[Network E2E] Test: WriteHeavy, Leader: Node %d, Address: %s", leader.ID(), c.transports[leader.ID()-1].Addr())
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		opCount := 0
 		for {
 			select {
@@ -903,6 +930,7 @@ func TestNetworkE2E_WriteHeavy(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	latenciesMu.Lock()
 	p50 := percentile(latencies, 50)
@@ -956,7 +984,10 @@ func TestNetworkE2E_ReadHeavy(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-stopCh:
@@ -983,6 +1014,7 @@ func TestNetworkE2E_ReadHeavy(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	latenciesMu.Lock()
 	p50 := percentile(latencies, 50)
@@ -1036,7 +1068,10 @@ func TestNetworkE2E_MixedWorkload(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-stopCh:
@@ -1078,6 +1113,7 @@ func TestNetworkE2E_MixedWorkload(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	latenciesMu.Lock()
 	p50 := percentile(latencies, 50)
@@ -1123,7 +1159,10 @@ func TestNetworkE2E_SmallValues(t *testing.T) {
 	t.Logf("[Network E2E] Test: SmallValues, Leader: Node %d", leader.ID())
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-stopCh:
@@ -1164,6 +1203,7 @@ func TestNetworkE2E_SmallValues(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	latenciesMu.Lock()
 	p50 := percentile(latencies, 50)
@@ -1212,7 +1252,10 @@ func TestNetworkE2E_BatchOperations(t *testing.T) {
 	numBatches := 0
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-stopCh:
@@ -1261,6 +1304,7 @@ func TestNetworkE2E_BatchOperations(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	batchLatenciesMu.Lock()
 	p50 := percentile(batchLatencies, 50)
@@ -1316,7 +1360,10 @@ func TestNetworkE2E_DeleteOperations(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-stopCh:
@@ -1341,6 +1388,7 @@ func TestNetworkE2E_DeleteOperations(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	latenciesMu.Lock()
 	p50 := percentile(latencies, 50)

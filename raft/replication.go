@@ -64,7 +64,7 @@ func (r *Raft) determineReplicationAction(peerID int) replicationAction {
 	// 如果 Follower 需要的下一条日志索引小于 Leader 的第一条日志索引，
 	// 说明该日志已被压缩，必须发送快照。
 	if r.nextIndex[peerID] < firstLogIndex {
-		log.Infof("[Snapshot] Node %d log for peer %d (nextIndex=%d) is behind compacted log (firstLogIndex=%d). Decided to send snapshot.", r.id, peerID, r.nextIndex[peerID], firstLogIndex)
+		log.Debugf("[Snapshot] Node %d log for peer %d (nextIndex=%d) is behind compacted log (firstLogIndex=%d). Decided to send snapshot.", r.id, peerID, r.nextIndex[peerID], firstLogIndex)
 		return actionSendSnapshot
 	}
 
@@ -94,7 +94,7 @@ func (r *Raft) replicateLogsToPeer(peerID int) {
 	go func() {
 		reply := param.NewAppendEntriesReply()
 		if err := r.trans.SendAppendEntries(strconv.Itoa(peerID), args, reply); err != nil {
-			log.Errorf("[Log Replication] Node %d failed to send AppendEntries to %d: %s", r.id, peerID, err.Error())
+			log.Debugf("[Log Replication] Node %d failed to send AppendEntries to %d: %s", r.id, peerID, err.Error())
 			return
 		}
 
@@ -198,7 +198,7 @@ func (r *Raft) handleSuccessfulAppendEntries(peerID int, args *param.AppendEntri
 
 // handleFailedAppendEntries 在收到失败的 AppendEntries 响应后调整 nextIndex。
 func (r *Raft) handleFailedAppendEntries(peerID int, reply *param.AppendEntriesReply) {
-	log.Infof("[Log Replication] Node %d rejected AppendEntries from leader %d (ConflictIndex=%d, ConflictTerm=%d)", peerID, r.id, reply.ConflictIndex, reply.ConflictTerm)
+	log.Debugf("[Log Replication] Node %d rejected AppendEntries from leader %d (ConflictIndex=%d, ConflictTerm=%d)", peerID, r.id, reply.ConflictIndex, reply.ConflictTerm)
 
 	// 根据论文中的优化策略，快速回退 nextIndex。
 	nextIndex := r.nextIndex[peerID]
@@ -235,9 +235,9 @@ func (r *Raft) updateCommitIndex() {
 		}
 
 		if entry.Term == r.currentTerm {
-			log.Infof("[Log Replication] Node %d advances commitIndex to %d (term=%d)", r.id, newCommitIndex, r.currentTerm)
+			log.Debugf("[Log Replication] Node %d advances commitIndex to %d (term=%d)", r.id, newCommitIndex, r.currentTerm)
 			r.commitIndex = newCommitIndex
-			go r.applyLogs()
+			r.startApplyLogsLocked()
 		}
 	}
 }
@@ -392,7 +392,7 @@ func (r *Raft) AppendEntries(args *param.AppendEntriesArgs, reply *param.AppendE
 			return err
 		}
 	}
-	log.Infof("[Log Replication] Node %d accepted and stored %d new entries from leader %d", r.id, len(newEntries), args.LeaderID)
+	log.Debugf("[Log Replication] Node %d accepted and stored %d new entries from leader %d", r.id, len(newEntries), args.LeaderID)
 
 	// === Phase 3: 短锁 — 验证任期 + 更新 commitIndex ===
 	r.mu.Lock()
@@ -611,10 +611,25 @@ func (r *Raft) updateFollowerCommitIndex(args *param.AppendEntriesArgs) {
 		}
 
 		if r.commitIndex > oldCommitIndex {
-			log.Infof("[Log Replication] Node %d advances commitIndex to %d", r.id, r.commitIndex)
-			go r.applyLogs()
+			log.Debugf("[Log Replication] Node %d advances commitIndex to %d", r.id, r.commitIndex)
+			r.startApplyLogsLocked()
 		}
 	}
+}
+
+// startApplyLogsLocked schedules committed entries to be applied.
+// The caller must hold r.mu. Stop sets the state to Dead under the same lock
+// before waiting on applyWG, so no new apply goroutine can be added after
+// Stop starts waiting.
+func (r *Raft) startApplyLogsLocked() {
+	if r.getState() == Dead {
+		return
+	}
+	r.applyWG.Add(1)
+	go func() {
+		defer r.applyWG.Done()
+		r.applyLogs()
+	}()
 }
 
 // applyLogs 将已提交的日志应用到状态机。此函数会在后台 goroutine 中运行。
@@ -629,7 +644,7 @@ func (r *Raft) applyLogs() {
 	}
 
 	endIndex := lastAppliedBefore + uint64(len(entriesToApply))
-	log.Infof("[State Machine] Node %d applying %d entries from index %d to %d", r.id, len(entriesToApply), lastAppliedBefore+1, endIndex)
+	log.Debugf("[State Machine] Node %d applying %d entries from index %d to %d", r.id, len(entriesToApply), lastAppliedBefore+1, endIndex)
 
 	// 2. 遍历并分发每一条待应用的日志。
 	r.dispatchEntries(entriesToApply)
@@ -713,7 +728,7 @@ func (r *Raft) completeAppliedEntry(index uint64, result any) {
 	r.mu.Unlock()
 
 	if ok {
-		log.Infof("[Client] dispatchEntries: Notifying for index %d", index)
+		log.Debugf("[Client] dispatchEntries: Notifying for index %d", index)
 		notifyChan <- result
 	}
 }

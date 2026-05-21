@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/xmh1011/go-kv/pkg/param"
@@ -58,11 +59,35 @@ func (sm *StateMachine) persist() error {
 	}
 
 	// Write to temp file and rename for atomicity
-	tmpPath := sm.filePath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	dir := filepath.Dir(sm.filePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, sm.filePath)
+
+	f, err := os.CreateTemp(dir, filepath.Base(sm.filePath)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := f.Name()
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, sm.filePath); err != nil {
+		return err
+	}
+	renamed = true
+	return nil
 }
 
 // Apply applies a log entry to the state machine.

@@ -84,7 +84,7 @@ func (lsm *StateMachineAdapter) Get(key string) (string, error) {
 // 3. 读取所有 SSTable 文件的内容。
 // 4. 将文件名（相对路径）和内容打包成 map[string][]byte 并序列化。
 func (lsm *StateMachineAdapter) GetSnapshot() ([]byte, error) {
-	log.Info("[LSMAdapter] Creating snapshot...")
+	log.Debug("[LSMAdapter] Creating snapshot...")
 
 	// 1. 强制 Flush
 	if err := lsm.db.ForceFlush(); err != nil {
@@ -122,7 +122,7 @@ func (lsm *StateMachineAdapter) GetSnapshot() ([]byte, error) {
 		return nil, err
 	}
 
-	log.Infof("[LSMAdapter] Snapshot created with %d files", len(files))
+	log.Debugf("[LSMAdapter] Snapshot created with %d files", len(files))
 	return data, nil
 }
 
@@ -133,7 +133,7 @@ func (lsm *StateMachineAdapter) GetSnapshot() ([]byte, error) {
 // 3. 将快照中的文件写回磁盘。
 // 4. 重新加载数据库。
 func (lsm *StateMachineAdapter) ApplySnapshot(snapshot []byte) error {
-	log.Info("[LSMAdapter] Applying snapshot...")
+	log.Debug("[LSMAdapter] Applying snapshot...")
 
 	// 1. 反序列化
 	var snapshotData map[string][]byte
@@ -180,7 +180,7 @@ func (lsm *StateMachineAdapter) ApplySnapshot(snapshot []byte) error {
 		}
 	}
 
-	log.Infof("[LSMAdapter] Snapshot applied. %d files restored.", len(snapshotData))
+	log.Debugf("[LSMAdapter] Snapshot applied. %d files restored.", len(snapshotData))
 
 	// 4. 重新加载
 	// 重新加载前，确保 WAL 目录存在

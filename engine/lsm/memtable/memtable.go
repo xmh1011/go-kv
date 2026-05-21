@@ -138,7 +138,7 @@ func (t *MemTable) RecoverFromWAL(fileName string, walPath string) error {
 		return fmt.Errorf("recover WAL %s failed: %w", fileName, err)
 	}
 	t.AddPairs(pairs)
-	log.Infof("[MemTable] Recovered %d entries from WAL %s", len(pairs), fileName)
+	log.Debugf("[MemTable] Recovered %d entries from WAL %s", len(pairs), fileName)
 
 	return nil
 }

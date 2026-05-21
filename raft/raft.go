@@ -87,6 +87,7 @@ type Raft struct {
 	cachedLastLogIndex uint64 // 缓存 lastLogIndex 避免重复存储调用
 	commitChan         chan param.CommitEntry
 	lastAppliedCond    *sync.Cond // 用于等待 lastApplied 赶上 commitIndex
+	applyWG            sync.WaitGroup
 
 	// --- 快照相关 ---
 	// snapshot 在内存中持有当前最新的快照，避免频繁从存储中读取
@@ -260,14 +261,14 @@ func (r *Raft) SetSnapshotThreshold(threshold int) {
 // Run 启动 Raft 节点的主循环。
 // 它会Ticking，检查选举超时，并在 Follower/Candidate 状态下发起选举。
 func (r *Raft) Run() {
-	log.Infof("[Core] Node %d starting main loop (Initial timeout: %s)", r.id, r.currentElectionTimeout)
+	log.Debugf("[Core] Node %d starting main loop (Initial timeout: %s)", r.id, r.currentElectionTimeout)
 	ticker := time.NewTicker(r.heartbeatTimeout) // 使用心跳间隔作为 tick 频率
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-r.shutdownChan:
-			log.Infof("[Core] Node %d shutting down main loop.", r.id)
+			log.Debugf("[Core] Node %d shutting down main loop.", r.id)
 			return
 
 		case <-ticker.C:
@@ -283,7 +284,7 @@ func (r *Raft) Run() {
 			}
 
 			if time.Since(r.electionResetEvent) > r.currentElectionTimeout {
-				log.Infof("[Core] Node %d election timeout reached (timeout: %s), starting election.", r.id, r.currentElectionTimeout)
+				log.Debugf("[Core] Node %d election timeout reached (timeout: %s), starting election.", r.id, r.currentElectionTimeout)
 				r.currentElectionTimeout = r.randomizedElectionTimeout()
 
 				r.mu.Unlock() // startElection 会自己加锁
@@ -300,16 +301,16 @@ func (r *Raft) Run() {
 // Stop 停止 Raft 节点的主循环。
 func (r *Raft) Stop() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	select {
 	case <-r.shutdownChan:
 		// 已经关闭
+		r.mu.Unlock()
 		return
 	default:
 	}
 
-	log.Infof("[Core] Node %d received stop signal.", r.id)
+	log.Debugf("[Core] Node %d received stop signal.", r.id)
 	r.setState(Dead)
 
 	// 广播 lastAppliedCond，唤醒可能在等待的读请求
@@ -317,6 +318,9 @@ func (r *Raft) Stop() {
 	r.lastAppliedCond.Broadcast()
 
 	close(r.shutdownChan)
+	r.mu.Unlock()
+
+	r.applyWG.Wait()
 }
 
 // randomizedElectionTimeout 返回一个在 [electionTimeout, 2 * electionTimeout) 范围内的随机超时时间。
@@ -848,7 +852,7 @@ func (r *Raft) proposeToLog(command any) (param.LogEntry, error) {
 		log.Errorf("[Raft] Leader %d failed to append new log entry: %s", r.id, err.Error())
 		return param.LogEntry{}, err
 	}
-	log.Infof("[Raft] Leader %d proposed new log entry at index %d", r.id, newIndex)
+	log.Debugf("[Raft] Leader %d proposed new log entry at index %d", r.id, newIndex)
 
 	// 3. 更新缓存的 lastLogIndex
 	r.cachedLastLogIndex = newLogEntry.Index
@@ -882,7 +886,7 @@ func (r *Raft) Commit(command any) (any, bool, int) {
 
 	// 等待命令被状态机成功应用，或等待超时。
 	// 使用 5 秒超时以应对高负载场景下的日志复制延迟
-	log.Infof("[Client] Waiting for log index %d to be applied...", index)
+	log.Debugf("[Client] Waiting for log index %d to be applied...", index)
 	result, ok := r.waitForAppliedLog(index, 5*time.Second)
 	return result, ok, r.id
 }
@@ -1008,7 +1012,7 @@ func (r *Raft) processBatch(batch []proposalRequest) {
 
 	// 更新缓存
 	r.cachedLastLogIndex = entries[len(entries)-1].Index
-	log.Infof("[Raft] Leader %d proposed batch of %d entries (index %d-%d)", r.id, len(entries), startIndex, r.cachedLastLogIndex)
+	log.Debugf("[Raft] Leader %d proposed batch of %d entries (index %d-%d)", r.id, len(entries), startIndex, r.cachedLastLogIndex)
 
 	// A single-node cluster has no follower replies to trigger commit
 	// advancement, so try to commit after the local append as well.
@@ -1077,9 +1081,9 @@ func (r *Raft) ChangeConfig(newPeerIDs []int) (uint64, uint64, bool) {
 		if _, ok := r.nextIndex[peerID]; !ok {
 			r.nextIndex[peerID] = newLogEntry.Index + 1
 			r.matchIndex[peerID] = 0
-			log.Infof("[Config Change] Initialized nextIndex[%d] = %d", peerID, r.nextIndex[peerID])
+			log.Debugf("[Config Change] Initialized nextIndex[%d] = %d", peerID, r.nextIndex[peerID])
 		} else {
-			log.Infof("[Config Change] nextIndex[%d] already exists: %d", peerID, r.nextIndex[peerID])
+			log.Debugf("[Config Change] nextIndex[%d] already exists: %d", peerID, r.nextIndex[peerID])
 		}
 	}
 
@@ -1178,7 +1182,7 @@ func (r *Raft) waitForAppliedLog(index uint64, timeout time.Duration) (any, bool
 	// 5. 等待 applyLogs 发出通知，或等待超时。
 	select {
 	case result := <-notifyChan:
-		log.Infof("[Client] Notified that log index %d has been applied.", index)
+		log.Debugf("[Client] Notified that log index %d has been applied.", index)
 		return result, true
 	case <-time.After(timeout):
 		log.Warnf("[Client] Timed out waiting for log index %d to be applied.", index)

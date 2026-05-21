@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"sync"
 	"testing"
 	"time"
 
@@ -184,12 +185,15 @@ func (s *PerfTestSuite) TestPerf_WriteHeavy(t *testing.T) {
 	t.Logf("Test: WriteHeavy, Leader: Node %d", leader.ID())
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		opCount := 0
 		for {
 			select {
 			case <-stopCh:
-				break
+				return
 			default:
 				key := fmt.Sprintf("key-%d", rand.Intn(10000))
 				value := fmt.Sprintf("val-%d", rand.Intn(100000))
@@ -211,6 +215,7 @@ func (s *PerfTestSuite) TestPerf_WriteHeavy(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	metrics := PerfMetrics{
 		TestName:      "WriteHeavy (写密集型)",
@@ -256,11 +261,14 @@ func (s *PerfTestSuite) TestPerf_ReadHeavy(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-stopCh:
-				break
+				return
 			default:
 				keyNum := rand.Intn(warmupCount)
 				key := fmt.Sprintf("key-%d", keyNum)
@@ -281,6 +289,7 @@ func (s *PerfTestSuite) TestPerf_ReadHeavy(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	metrics := PerfMetrics{
 		TestName:      "ReadHeavy (读密集型)",
@@ -326,11 +335,14 @@ func (s *PerfTestSuite) TestPerf_MixedWorkload(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-stopCh:
-				break
+				return
 			default:
 				isWrite := rand.Float64() < 0.7 // 70% 写入
 				keyNum := rand.Intn(warmupCount)
@@ -368,6 +380,7 @@ func (s *PerfTestSuite) TestPerf_MixedWorkload(t *testing.T) {
 
 	time.Sleep(duration)
 	close(stopCh)
+	wg.Wait()
 
 	metrics := PerfMetrics{
 		TestName:      "MixedWorkload (混合负载 - 70%%写/30%%读)",

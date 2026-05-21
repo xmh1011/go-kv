@@ -103,7 +103,7 @@ func NewStorage(storageType, dataDir string, nodeID int) (Storage, StateMachine,
 
 	switch storageType {
 	case InmemoryStorage:
-		log.Info("Using in-memory storage")
+		log.Debug("Using in-memory storage")
 		return inmemory.NewStorage(), inmemory.NewInMemoryStateMachine(), nil
 	case SimpleFileStorage:
 		storagePath := filepath.Join(nodeDir, "raft_storage.gob")
@@ -119,7 +119,7 @@ func NewStorage(storageType, dataDir string, nodeID int) (Storage, StateMachine,
 			store.Close()
 			return nil, nil, fmt.Errorf("failed to create simplefile state machine: %w", err)
 		}
-		log.Infof("Using simple file storage at %s", nodeDir)
+		log.Debugf("Using simple file storage at %s", nodeDir)
 		return store, stateMachine, nil
 	case LSMStorage:
 		// State Machine: 使用 LSM 引擎
@@ -144,7 +144,7 @@ func NewStorage(storageType, dataDir string, nodeID int) (Storage, StateMachine,
 			return nil, nil, fmt.Errorf("failed to create lsm storage adapter: %w", err)
 		}
 
-		log.Infof("Using LSM storage engine at %s", nodeDir)
+		log.Debugf("Using LSM storage engine at %s", nodeDir)
 		return lsmStorage, lsmStateMachine, nil
 	default:
 		return nil, nil, fmt.Errorf("unknown storage type: %s", storageType)

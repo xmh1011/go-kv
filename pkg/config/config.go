@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -47,7 +48,7 @@ const (
 	DefaultRaftID            = 1
 	DefaultDataDir           = "./data"
 	DefaultLogFilename       = "go-kv.log"
-	DefaultLogLevel          = "info"
+	DefaultLogLevel          = "warn"
 	DefaultLogMaxSize        = 100 // MB
 	DefaultLogMaxBackups     = 5
 	DefaultLogMaxAge         = 30 // days
@@ -132,7 +133,7 @@ func Init(configPath string) error {
 		}
 	} else {
 		// 如果没有提供配置文件，Viper 会仅使用默认值
-		log.Info("No config file provided, using default values.")
+		log.Debug("No config file provided, using default values.")
 	}
 
 	// 3. 解析配置到结构体
@@ -142,24 +143,28 @@ func Init(configPath string) error {
 
 	// 4. 初始化日志
 	log.Init(Conf.Log)
-	log.Info("Config loaded successfully")
+	log.Debug("Config loaded successfully")
 
 	// 5. 监听配置文件变化（热更新）
 	viper.WatchConfig()
 	viper.OnConfigChange(func(e fsnotify.Event) {
-		log.Infof("Config file changed: %s", e.Name)
+		log.Debugf("Config file changed: %s", e.Name)
 		if err := viper.Unmarshal(&Conf); err != nil {
 			log.Errorf("Failed to re-unmarshal config: %v", err)
 			return
 		}
 		log.Init(Conf.Log)
-		log.Info("Config reloaded and applied")
+		log.Debug("Config reloaded and applied")
 	})
 
 	return nil
 }
 
 func setDefaults() {
+	viper.SetEnvPrefix("GO_KV")
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	viper.AutomaticEnv()
+
 	// Log
 	viper.SetDefault(KeyLogFilename, DefaultLogFilename)
 	viper.SetDefault(KeyLogLevel, DefaultLogLevel)

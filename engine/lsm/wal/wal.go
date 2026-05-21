@@ -153,6 +153,6 @@ func Recover(path string, callback func(pair kv.KeyValuePair)) (*WAL, error) {
 		count++
 	}
 
-	log.Infof("[WAL] Recovered %d entries from %s", count, path)
+	log.Debugf("[WAL] Recovered %d entries from %s", count, path)
 	return &WAL{file: file, buf: bufio.NewWriterSize(file, 32*1024), path: path}, nil
 }

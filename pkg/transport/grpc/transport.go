@@ -152,7 +152,7 @@ func (t *Transport) Start() error {
 
 	go func() {
 		if err := t.grpcServer.Serve(t.listener); err != nil {
-			log.Infof("[GRPCTransport] Server stopped: %v", err)
+			log.Debugf("[GRPCTransport] Server stopped: %v", err)
 		}
 	}()
 
@@ -348,7 +348,7 @@ func (t *Transport) SendInstallSnapshotStream(target string, term, leaderID, las
 	totalSize := uint64(len(data))
 	offset := uint64(0)
 
-	log.Infof("[GRPCTransport] Starting streaming snapshot transfer: target=%s, size=%d bytes, chunks=%d",
+	log.Debugf("[GRPCTransport] Starting streaming snapshot transfer: target=%s, size=%d bytes, chunks=%d",
 		target, totalSize, (totalSize+chunkSize-1)/chunkSize)
 
 	// 流式发送数据块
@@ -406,7 +406,7 @@ func (t *Transport) SendInstallSnapshotStream(target string, term, leaderID, las
 
 		// 进度日志（每 100MB 打印一次）
 		if offset%(100*1024*1024) == 0 || offset == totalSize {
-			log.Infof("[GRPCTransport] Snapshot transfer progress: %d/%d bytes (%.1f%%)", offset, totalSize, float64(offset)*100/float64(totalSize))
+			log.Debugf("[GRPCTransport] Snapshot transfer progress: %d/%d bytes (%.1f%%)", offset, totalSize, float64(offset)*100/float64(totalSize))
 		}
 	}
 
@@ -421,7 +421,7 @@ func (t *Transport) SendInstallSnapshotStream(target string, term, leaderID, las
 		return fmt.Errorf("failed to receive final ack: %w", err)
 	}
 
-	log.Infof("[GRPCTransport] Snapshot transfer completed: target=%s, size=%d bytes", target, totalSize)
+	log.Debugf("[GRPCTransport] Snapshot transfer completed: target=%s, size=%d bytes", target, totalSize)
 
 	return nil
 }
@@ -554,7 +554,7 @@ func (t *Transport) InstallSnapshotStream(stream pb.RaftService_InstallSnapshotS
 	var totalSize uint64 = 0
 	var receivedBytes uint64 = 0
 
-	log.Infof("[GRPCTransport] Starting to receive streaming snapshot")
+	log.Debugf("[GRPCTransport] Starting to receive streaming snapshot")
 
 	for {
 		chunk, err := stream.Recv()
@@ -583,7 +583,7 @@ func (t *Transport) InstallSnapshotStream(stream pb.RaftService_InstallSnapshotS
 				snapshotBuffer = make([]byte, 0, 10*1024*1024) // 至少 10MB 缓冲
 			}
 
-			log.Infof("[GRPCTransport] Snapshot metadata: term=%d, leader=%d, lastIndex=%d, size=%d bytes",
+			log.Debugf("[GRPCTransport] Snapshot metadata: term=%d, leader=%d, lastIndex=%d, size=%d bytes",
 				chunk.Term, chunk.LeaderId, chunk.LastIncludedIndex, totalSize)
 		}
 
@@ -620,7 +620,7 @@ func (t *Transport) InstallSnapshotStream(stream pb.RaftService_InstallSnapshotS
 
 		// 进度日志
 		if chunk.Done || receivedBytes%(50*1024*1024) == 0 {
-			log.Infof("[GRPCTransport] Snapshot receive progress: %d/%d bytes (%.1f%%)",
+			log.Debugf("[GRPCTransport] Snapshot receive progress: %d/%d bytes (%.1f%%)",
 				receivedBytes, totalSize, float64(receivedBytes)*100/float64(totalSize))
 		}
 
@@ -649,7 +649,7 @@ func (t *Transport) InstallSnapshotStream(stream pb.RaftService_InstallSnapshotS
 				currentOffset = chunkEnd
 			}
 
-			log.Infof("[GRPCTransport] Snapshot installation completed: size=%d bytes", receivedBytes)
+			log.Debugf("[GRPCTransport] Snapshot installation completed: size=%d bytes", receivedBytes)
 			return nil
 		}
 	}
