@@ -73,7 +73,8 @@ func TestInsertTriggersPromotion(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Nil(t, evicted, "Should evict one IMemTable")
 
-	val := manager.Search("someKey")
+	val, found := manager.Search("someKey")
+	assert.True(t, found, "Deleted key tombstone should be found")
 	assert.Nil(t, val, "Deleted key should return nil")
 }
 
@@ -98,7 +99,8 @@ func TestSearchFromMemTables(t *testing.T) {
 	_, err = manager.Insert(kv.KeyValuePair{Key: "key", Value: []byte("newValue")}) // 更新同一 key
 	assert.NoError(t, err, "Insert should not return error")
 
-	val := manager.Search("key")
+	val, found := manager.Search("key")
+	assert.True(t, found)
 	assert.Equal(t, kv.Value("newValue"), val)
 }
 

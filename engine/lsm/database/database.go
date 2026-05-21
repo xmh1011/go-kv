@@ -33,19 +33,27 @@ func (d *Database) Name() string {
 
 func (d *Database) Get(key string) ([]byte, error) {
 	log.Debugf("[Database] Get key: %s", key)
-	value := d.MemTables.Search(kv.Key(key))
-	if value != nil {
+	value, found := d.MemTables.Search(kv.Key(key))
+	if found {
+		if value == nil {
+			log.Debugf("[Database] Key %s deleted in MemTable", key)
+			return nil, nil
+		}
 		log.Debugf("[Database] Key %s found in MemTable", key)
 		return value, nil
 	}
 
-	value, err := d.SSTables.Search(kv.Key(key))
+	value, found, err := d.SSTables.Search(kv.Key(key))
 	if err != nil {
 		log.Errorf("[Database] Search key %s in sstable error: %s", key, err.Error())
 		return nil, err
 	}
-	if value == nil {
+	if !found {
 		log.Debugf("[Database] Key %s not found", key)
+		return nil, nil
+	}
+	if value == nil {
+		log.Debugf("[Database] Key %s deleted in SSTable", key)
 		return nil, nil
 	}
 

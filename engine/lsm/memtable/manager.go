@@ -64,19 +64,19 @@ func (m *Manager) Insert(pair kv.KeyValuePair) (*IMemTable, error) {
 	return evicted, nil
 }
 
-func (m *Manager) Search(key kv.Key) kv.Value {
+func (m *Manager) Search(key kv.Key) (kv.Value, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	if value, ok := m.Mem.Search(key); ok {
-		return value
+		return value, true
 	}
 	for i := len(m.IMems) - 1; i >= 0; i-- {
 		if value, ok := m.IMems[i].Search(key); ok {
-			return value
+			return value, true
 		}
 	}
-	return nil
+	return nil, false
 }
 
 func (m *Manager) Delete(key kv.Key) (*IMemTable, error) {

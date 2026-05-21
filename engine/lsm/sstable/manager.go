@@ -100,42 +100,42 @@ func (m *Manager) CreateNewSSTable(imem *memtable.IMemTable) error {
 	return nil
 }
 
-// Search 从低层级向高层级查找 key，同层级按 id 降序查找
-// 返回找到的值或错误，如果未找到返回 (nil, nil)
-func (m *Manager) Search(key kv.Key) ([]byte, error) {
+// Search 从低层级向高层级查找 key，同层级按 id 降序查找。
+// found 为 true 且 value 为 nil 表示找到了删除标记，调用方应停止继续查找。
+func (m *Manager) Search(key kv.Key) (kv.Value, bool, error) {
 	// 1. 从高层级向低层级查找
 	for level := m.minSSTableLevel; level <= m.maxSSTableLevel; level++ {
 		// 2. 等待该层级的潜在合并完成（仅对需要等待的层级）
 		if err := m.waitForCompactionIfNeeded(level); err != nil {
 			log.Errorf("[SSTableManager] Wait for compaction at level %d failed: %s", level, err.Error())
-			return nil, fmt.Errorf("wait for compaction failed: %w", err)
+			return nil, false, fmt.Errorf("wait for compaction failed: %w", err)
 		}
 
 		// 3. 先从level 0开始查找
 		if level == m.minSSTableLevel {
-			val, err := m.searchFromLevel0(key)
+			val, found, err := m.searchFromLevel0(key)
 			if err != nil {
 				log.Errorf("[SSTableManager] Search from level 0 failed: %s", err.Error())
-				return nil, fmt.Errorf("search from level 0 failed: %w", err)
+				return nil, false, fmt.Errorf("search from level 0 failed: %w", err)
 			}
-			if val != nil {
-				return val, nil
+			if found {
+				return val, true, nil
 			}
 			continue
 		}
 
-		val, err := m.searchFromLevelWithSparseIndex(key, level)
+		val, found, err := m.searchFromLevelWithSparseIndex(key, level)
 		if err != nil {
 			log.Errorf("[SSTableManager] Search from level %d failed: %s", level, err.Error())
-			return nil, fmt.Errorf("search from level %d failed: %w", level, err)
+			return nil, false, fmt.Errorf("search from level %d failed: %w", level, err)
 		}
-		if val != nil {
-			return val, nil
+		if found {
+			return val, true, nil
 		}
 	}
 
 	// 5. 所有层级都未找到
-	return nil, nil
+	return nil, false, nil
 }
 
 // waitForCompactionIfNeeded 等待指定层级完成合并（如果正在合并）
@@ -163,26 +163,26 @@ func (m *Manager) isCompacting(level int) bool {
 	return m.compactingLevels[level]
 }
 
-func (m *Manager) searchFromLevel0(key kv.Key) (kv.Value, error) {
+func (m *Manager) searchFromLevel0(key kv.Key) (kv.Value, bool, error) {
 	tables := m.getLevelTables(m.minSSTableLevel)
 
 	// 在当前层级中按表ID降序查找
 	for _, table := range tables {
-		val, err := m.searchFromTable(table, key)
+		val, found, err := m.searchFromTable(table, key)
 		if err != nil {
 			log.Errorf("[SSTableManager] Search from table %s failed: %s", table.FilePath(), err.Error())
-			return nil, fmt.Errorf("search from table %s failed: %w", table.FilePath(), err)
+			return nil, false, fmt.Errorf("search from table %s failed: %w", table.FilePath(), err)
 		}
-		if val != nil {
-			return val, nil
+		if found {
+			return val, true, nil
 		}
 	}
 
-	return nil, nil
+	return nil, false, nil
 }
 
 // searchFromLevelWithSparseIndex 使用稀疏索引在指定层级查找key
-func (m *Manager) searchFromLevelWithSparseIndex(key kv.Key, level int) (kv.Value, error) {
+func (m *Manager) searchFromLevelWithSparseIndex(key kv.Key, level int) (kv.Value, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -199,22 +199,22 @@ func (m *Manager) searchFromLevelWithSparseIndex(key kv.Key, level int) (kv.Valu
 	// 2. 在SSTable中查找key
 	if index < len(sparseIndexes) {
 		sst := sparseIndexes[index]
-		val, err := m.searchFromTable(sst, key)
+		val, found, err := m.searchFromTable(sst, key)
 		if err != nil {
 			log.Errorf("[SSTableManager] Search from table %s failed: %s", sst.FilePath(), err.Error())
-			return nil, fmt.Errorf("search from table %s failed: %w", sst.FilePath(), err)
+			return nil, false, fmt.Errorf("search from table %s failed: %w", sst.FilePath(), err)
 		}
-		if val != nil {
-			return val, nil
+		if found {
+			return val, true, nil
 		}
 	}
 
-	return nil, nil
+	return nil, false, nil
 }
 
-func (m *Manager) searchFromTable(sst *SSTable, key kv.Key) (kv.Value, error) {
+func (m *Manager) searchFromTable(sst *SSTable, key kv.Key) (kv.Value, bool, error) {
 	if !sst.MayContain(key) {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	// 使用迭代器查找
@@ -223,9 +223,16 @@ func (m *Manager) searchFromTable(sst *SSTable, key kv.Key) (kv.Value, error) {
 
 	it.Seek(key)
 	if it.Valid() && it.Key() == key {
-		return it.Value()
+		value, err := it.Value()
+		if err != nil {
+			return nil, false, err
+		}
+		if (&kv.KeyValuePair{Key: key, Value: value}).IsDeleted() {
+			return nil, true, nil
+		}
+		return value, true, nil
 	}
-	return nil, nil
+	return nil, false, nil
 }
 
 // Recover 加载所有层中 SSTable 的元数据信息到内存中
@@ -250,13 +257,14 @@ func (m *Manager) Recover() error {
 			continue
 		}
 
-		// 按文件名降序排序（假设文件名包含ID）
+		// addTable inserts at the front, so recover in ascending ID order to
+		// preserve newest-first lookup order for overlapping Level 0 tables.
 		sort.Slice(files, func(i, j int) bool {
-			return utils.ExtractID(files[i].Name()) > utils.ExtractID(files[j].Name())
+			return utils.ExtractID(files[i].Name()) < utils.ExtractID(files[j].Name())
 		})
 
 		// 记录最大ID
-		latestID := utils.ExtractID(files[0].Name())
+		latestID := utils.ExtractID(files[len(files)-1].Name())
 		if latestID > maxID {
 			maxID = latestID
 		}
