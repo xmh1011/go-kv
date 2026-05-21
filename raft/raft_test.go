@@ -53,6 +53,7 @@ func TestSubmit(t *testing.T) {
 			command: "test-command",
 			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine, wg *sync.WaitGroup) {
 				lastLogIndex := uint64(5)
+				s.EXPECT().ReadSnapshot().Return(nil, nil).AnyTimes()
 				gomock.InOrder(
 					s.EXPECT().LastLogIndex().Return(lastLogIndex, nil).Times(1),
 					s.EXPECT().AppendEntries(gomock.Any()).Return(nil).Times(1),
@@ -173,6 +174,7 @@ func TestChangeConfig(t *testing.T) {
 			newPeers: []int{1, 2, 4, 5},
 			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine, wg *sync.WaitGroup) {
 				lastLogIndex := uint64(10)
+				s.EXPECT().ReadSnapshot().Return(nil, nil).AnyTimes()
 				gomock.InOrder(
 					s.EXPECT().LastLogIndex().Return(lastLogIndex, nil).Times(1),
 					s.EXPECT().AppendEntries(gomock.Any()).Return(nil).Times(1),
@@ -348,6 +350,7 @@ func TestClientRequest(t *testing.T) {
 			if tt.initialState.state == Leader && tt.setupMocks != nil {
 				mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
 				mockStore.EXPECT().LastLogIndex().Return(uint64(5), nil).Times(1)
+				mockStore.EXPECT().ReadSnapshot().Return(nil, nil).AnyTimes()
 				r = NewRaft(1, []int{2, 3}, mockStore, mockSM, mockTrans, commitChan)
 				r.currentTerm = tt.initialState.term
 				r.setState(tt.initialState.state)
@@ -614,6 +617,7 @@ func TestClientRequest_ReadWriteBranching(t *testing.T) {
 
 	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
 	mockStore.EXPECT().LastLogIndex().Return(uint64(1), nil).Times(1)
+	mockStore.EXPECT().ReadSnapshot().Return(nil, nil).AnyTimes()
 	r := NewRaft(1, []int{2, 3}, mockStore, mockSM, mockTrans, commitChan)
 	defer r.Stop()
 
@@ -1073,6 +1077,7 @@ func TestLeaseRead_LeaseExpired(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, reply.Success)
 	assert.Equal(t, "test-value", reply.Result)
+	waitForWaitGroup(t, &wg, time.Second)
 
 	// 验证租约被更新
 	assert.True(t, time.Now().Before(r.leaseUntil), "lease should be renewed after heartbeat confirmation")
@@ -1135,6 +1140,21 @@ func TestLeaseRead_HeartbeatMode(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, reply.Success)
 	assert.Equal(t, "test-value", reply.Result)
+	waitForWaitGroup(t, &wg, time.Second)
+}
+
+func waitForWaitGroup(t *testing.T, wg *sync.WaitGroup, timeout time.Duration) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for expected goroutines")
+	}
 }
 
 // TestTryRenewLease 测试租约续租逻辑
@@ -1170,6 +1190,97 @@ func TestTryRenewLease(t *testing.T) {
 	r.tryRenewLease()
 	assert.False(t, r.leaseUntil.IsZero(), "lease should be renewed with majority acks")
 	assert.True(t, r.leaseUntil.After(now), "lease should be in the future")
+}
+
+func TestTryRenewLeaseRequiresJointQuorum(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockTrans := transport.NewMockTransport(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
+
+	r := NewRaft(1, []int{1, 2, 3}, mockStore, mockSM, mockTrans, nil)
+	r.currentTerm = 2
+	r.setState(Leader)
+	r.inJointConsensus = true
+	r.newPeerIDs = []int{3, 4, 5}
+	r.readIndexMode = config.ReadIndexModeLease
+	r.leaseDuration = 200 * time.Millisecond
+	r.electionTimeout = time.Second
+
+	now := time.Now()
+	r.lastAck[2] = now
+	r.lastAck[3] = now
+
+	r.tryRenewLease()
+	assert.True(t, r.leaseUntil.IsZero(), "lease should not renew with only the old-config majority")
+
+	r.lastAck[4] = now
+	r.tryRenewLease()
+	assert.False(t, r.leaseUntil.IsZero(), "lease should renew after both old and new majorities ack")
+}
+
+func TestTransitionToLeaderClearsLeadershipCache(t *testing.T) {
+	r := &Raft{
+		id:                    1,
+		peerIDs:               []int{1},
+		currentTerm:           7,
+		heartbeatTimeout:      time.Hour,
+		shutdownChan:          make(chan struct{}),
+		proposalCh:            make(chan proposalRequest, proposalChSize),
+		lastAck:               map[int]time.Time{2: time.Now()},
+		lastLeadershipConfirm: time.Now(),
+		leaseUntil:            time.Now().Add(time.Hour),
+	}
+	r.setState(Candidate)
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	r.transitionToLeader(7)
+	defer r.Stop()
+
+	assert.Equal(t, Leader, r.getState())
+	assert.Empty(t, r.lastAck)
+	assert.True(t, r.lastLeadershipConfirm.IsZero())
+	assert.True(t, r.leaseUntil.IsZero())
+}
+
+func TestConfirmLeadershipRequiresJointQuorumFromRecentAcks(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockTrans := transport.NewMockTransport(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
+	mockTrans.EXPECT().
+		SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ string, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
+			reply.Term = args.Term
+			reply.Success = true
+			return nil
+		}).
+		Times(2)
+
+	r := NewRaft(1, []int{1, 2, 3}, mockStore, mockSM, mockTrans, nil)
+	r.currentTerm = 2
+	r.setState(Leader)
+	r.inJointConsensus = true
+	r.newPeerIDs = []int{3, 4, 5}
+	r.electionTimeout = time.Second
+	r.nextIndex[4] = 1
+	r.nextIndex[5] = 1
+
+	now := time.Now()
+	r.lastAck[2] = now
+	r.lastAck[3] = now
+
+	assert.True(t, r.confirmLeadership())
 }
 
 // TestLeaseRead_NotLeader 测试非 Leader 节点的读取请求

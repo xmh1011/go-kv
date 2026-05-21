@@ -66,7 +66,8 @@ type Raft struct {
 	peerIDs          []int // 代表当前有效的配置 (Cold)
 	newPeerIDs       []int // 在转换期间代表新配置 (Cnew)
 	inJointConsensus bool  // 标记集群是否处于联合共识状态
-	knownLeaderID    int   // 当前节点已知的 Leader ID
+	jointConfigIndex uint64
+	knownLeaderID    int // 当前节点已知的 Leader ID
 
 	// store 负责持久化 Raft 状态和日志信息
 	store storage.Storage
@@ -169,6 +170,9 @@ func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.
 			log.Errorf("[Raft] Failed to get last log index from storage: %v", err)
 		} else {
 			r.cachedLastLogIndex = lastIdx
+			if lastIdx > 0 {
+				r.restoreSnapshotFromStorage()
+			}
 		}
 	}
 
@@ -177,6 +181,28 @@ func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.
 	r.lastAppliedCond = sync.NewCond(&r.mu)
 
 	return r
+}
+
+func (r *Raft) restoreSnapshotFromStorage() {
+	snapshot, err := r.store.ReadSnapshot()
+	if err != nil {
+		log.Fatalf("[Raft] Failed to read snapshot from storage: %s", err.Error())
+		return
+	}
+	if snapshot == nil {
+		return
+	}
+
+	r.snapshot = snapshot
+	r.commitIndex = max(r.commitIndex, snapshot.LastIncludedIndex)
+	r.lastApplied = max(r.lastApplied, snapshot.LastIncludedIndex)
+	r.cachedLastLogIndex = max(r.cachedLastLogIndex, snapshot.LastIncludedIndex)
+
+	if r.stateMachine != nil {
+		if err := r.stateMachine.ApplySnapshot(snapshot.Data); err != nil {
+			log.Fatalf("[Raft] Failed to restore state machine snapshot: %s", err.Error())
+		}
+	}
 }
 
 // ID 返回当前节点的 ID。
@@ -459,6 +485,73 @@ func (r *Raft) performReadAfterApply(cmd param.KVCommand, reply *param.ClientRep
 	return nil
 }
 
+type quorumSnapshot struct {
+	selfID  int
+	inJoint bool
+	old     []int
+	new     []int
+}
+
+func (r *Raft) readQuorumSnapshotLocked() quorumSnapshot {
+	return quorumSnapshot{
+		selfID:  r.id,
+		inJoint: r.inJointConsensus,
+		old:     append([]int(nil), r.peerIDs...),
+		new:     append([]int(nil), r.newPeerIDs...),
+	}
+}
+
+func (q quorumSnapshot) allPeers() []int {
+	peerSet := make(map[int]struct{})
+	for _, peerID := range q.old {
+		peerSet[peerID] = struct{}{}
+	}
+	if q.inJoint {
+		for _, peerID := range q.new {
+			peerSet[peerID] = struct{}{}
+		}
+	}
+
+	peers := make([]int, 0, len(peerSet))
+	for peerID := range peerSet {
+		peers = append(peers, peerID)
+	}
+	return peers
+}
+
+func (q quorumSnapshot) hasAckQuorum(acked map[int]bool) bool {
+	oldAcks := 1
+	for _, peerID := range q.old {
+		if peerID == q.selfID {
+			continue
+		}
+		if acked[peerID] {
+			oldAcks++
+		}
+	}
+	oldMajority := len(q.old)/2 + 1
+
+	if !q.inJoint {
+		return oldAcks >= oldMajority
+	}
+
+	newAcks := 0
+	if _, inNew := findPeer(q.selfID, q.new); inNew {
+		newAcks = 1
+	}
+	for _, peerID := range q.new {
+		if peerID == q.selfID {
+			continue
+		}
+		if acked[peerID] {
+			newAcks++
+		}
+	}
+	newMajority := len(q.new)/2 + 1
+
+	return oldAcks >= oldMajority && newAcks >= newMajority
+}
+
 // confirmLeadership 辅助方法：向所有节点发送轻量级心跳，并等待多数派确认。
 // 返回 true 表示确认成功（自己仍是 Leader）。
 //
@@ -489,25 +582,24 @@ func (r *Raft) confirmLeadership() bool {
 	// 获取需要的信息
 	term := r.currentTerm
 	leaderID := r.id
-	peerIDs := r.getAllPeerIDs()
+	quorum := r.readQuorumSnapshotLocked()
+	peerIDs := quorum.allPeers()
 	electionTimeout := r.electionTimeout
 	leaseDuration := r.leaseDuration
 
 	// 检查 lastAck 时间
-	recentAcks := 0
+	acked := map[int]bool{r.id: true}
 	for _, pid := range peerIDs {
 		if pid == r.id {
-			recentAcks++
 			continue
 		}
 		if lastAck, ok := r.lastAck[pid]; ok && now.Sub(lastAck) < electionTimeout {
-			recentAcks++
+			acked[pid] = true
 		}
 	}
-	majority := len(peerIDs)/2 + 1
-	if recentAcks >= majority {
+	if quorum.hasAckQuorum(acked) {
 		// 已经有足够的最近确认，不需要发送心跳
-		log.Debugf("[ReadIndex] Node %d has enough recent acks (%d/%d), skipping heartbeat.", leaderID, recentAcks, majority)
+		log.Debugf("[ReadIndex] Node %d has enough recent acks, skipping heartbeat.", leaderID)
 		r.lastLeadershipConfirm = now
 		if r.readIndexMode == config.ReadIndexModeLease {
 			r.leaseUntil = now.Add(leaseDuration)
@@ -530,7 +622,7 @@ func (r *Raft) confirmLeadership() bool {
 		}
 
 		// 如果这个节点最近确认过，跳过它
-		if lastAck, ok := r.lastAck[pid]; ok && now.Sub(lastAck) < electionTimeout {
+		if acked[pid] {
 			continue
 		}
 
@@ -546,10 +638,13 @@ func (r *Raft) confirmLeadership() bool {
 
 	// 2. 如果没有需要发送的 peer，直接返回成功
 	if len(peersToSend) == 0 {
+		hasQuorum := quorum.hasAckQuorum(acked)
 		r.mu.Lock()
-		r.lastLeadershipConfirm = time.Now()
+		if hasQuorum {
+			r.lastLeadershipConfirm = time.Now()
+		}
 		r.mu.Unlock()
-		return true
+		return hasQuorum
 	}
 
 	// 3. 在锁外获取 prevLogTerm（磁盘 I/O）
@@ -568,7 +663,11 @@ func (r *Raft) confirmLeadership() bool {
 	}
 
 	// 4. 并行发送心跳（网络 I/O，无锁）
-	ackChan := make(chan bool, len(requests))
+	type heartbeatAck struct {
+		peerID int
+		ok     bool
+	}
+	ackChan := make(chan heartbeatAck, len(requests))
 
 	for _, req := range requests {
 		go func(target int, args *param.AppendEntriesArgs) {
@@ -579,47 +678,54 @@ func (r *Raft) confirmLeadership() bool {
 					r.mu.Lock()
 					r.lastAck[target] = time.Now()
 					r.mu.Unlock()
-					ackChan <- true
+					ackChan <- heartbeatAck{peerID: target, ok: true}
 				} else {
-					ackChan <- false
+					ackChan <- heartbeatAck{peerID: target}
 				}
 			} else {
-				ackChan <- false
+				ackChan <- heartbeatAck{peerID: target}
 			}
 		}(req.peerID, req.args)
 	}
 
 	// 5. 统计票数
-	votes := recentAcks
 	timeout := time.After(electionTimeout * 2)
 
 	for i := 0; i < len(requests); i++ {
 		select {
-		case ok := <-ackChan:
-			if ok {
-				votes++
+		case ack := <-ackChan:
+			if ack.ok {
+				acked[ack.peerID] = true
 			}
 		case <-timeout:
 			log.Warnf("[ReadIndex] Node %d timed out waiting for heartbeat quorum.", leaderID)
 			return false
 		}
 
-		if votes >= majority {
+		if quorum.hasAckQuorum(acked) {
 			break
 		}
 	}
 
 	// 6. 更新缓存时间和租约
 	r.mu.Lock()
+	if r.getState() != Leader || r.currentTerm != term {
+		r.mu.Unlock()
+		return false
+	}
+
 	now = time.Now()
-	r.lastLeadershipConfirm = now
-	if r.readIndexMode == config.ReadIndexModeLease && votes >= majority {
+	hasQuorum := quorum.hasAckQuorum(acked)
+	if hasQuorum {
+		r.lastLeadershipConfirm = now
+	}
+	if r.readIndexMode == config.ReadIndexModeLease && hasQuorum {
 		r.leaseUntil = now.Add(leaseDuration)
 		log.Debugf("[Lease Read] Node %d renewed lease until %v after heartbeat quorum", r.id, r.leaseUntil)
 	}
 	r.mu.Unlock()
 
-	return votes >= majority
+	return hasQuorum
 }
 
 // tryRenewLease 检查是否有足够的多数派确认，如果有则更新租约。
@@ -630,19 +736,19 @@ func (r *Raft) tryRenewLease() {
 	}
 
 	now := time.Now()
-	peerIDs := r.getAllPeerIDs()
-	recentAcks := 1 // 自己始终算作一个确认
+	quorum := r.readQuorumSnapshotLocked()
+	peerIDs := quorum.allPeers()
+	acked := map[int]bool{r.id: true}
 
 	for _, pid := range peerIDs {
 		if lastAck, ok := r.lastAck[pid]; ok && now.Sub(lastAck) < r.electionTimeout {
-			recentAcks++
+			acked[pid] = true
 		}
 	}
 
-	majority := len(peerIDs)/2 + 1
-	if recentAcks >= majority {
+	if quorum.hasAckQuorum(acked) {
 		r.leaseUntil = now.Add(r.leaseDuration)
-		log.Debugf("[Lease Read] Node %d renewed lease until %v (acks: %d/%d)", r.id, r.leaseUntil, recentAcks, majority)
+		log.Debugf("[Lease Read] Node %d renewed lease until %v", r.id, r.leaseUntil)
 	}
 }
 
@@ -679,10 +785,30 @@ func (r *Raft) getLogTerm(index uint64) (uint64, error) {
 		return 0, err
 	}
 	if entry == nil {
+		term, ok, snapErr := r.readStoredSnapshotTerm(index)
+		if snapErr != nil {
+			log.Errorf("[Raft] Failed to read snapshot while resolving term at index %d: %v", index, snapErr)
+			return 0, snapErr
+		}
+		if ok {
+			return term, nil
+		}
+
 		log.Errorf("[Raft] Log entry at index %d not found", index)
 		return 0, nil
 	}
 	return entry.Term, nil
+}
+
+func (r *Raft) readStoredSnapshotTerm(index uint64) (uint64, bool, error) {
+	snapshot, err := r.store.ReadSnapshot()
+	if err != nil {
+		return 0, false, err
+	}
+	if snapshot != nil && index == snapshot.LastIncludedIndex {
+		return snapshot.LastIncludedTerm, true, nil
+	}
+	return 0, false, nil
 }
 
 // getFirstLogIndex 返回日志中的第一条条目的索引。从存储层查询。
@@ -933,6 +1059,7 @@ func (r *Raft) ChangeConfig(newPeerIDs []int) (uint64, uint64, bool) {
 	// 3. 提议成功后，Leader 自身立即进入“联合共识”状态。
 	r.inJointConsensus = true
 	r.newPeerIDs = newPeerIDs
+	r.jointConfigIndex = newLogEntry.Index
 
 	// Initialize tracking state for new peers
 	for _, peerID := range newPeerIDs {
@@ -994,6 +1121,9 @@ func (r *Raft) becomeFollower(newTerm uint64) error {
 	// 广播 lastAppliedCond，唤醒可能在等待的读请求
 	// 这样它们可以检测到 Leader 状态变化并返回 NotLeader 错误
 	r.lastAppliedCond.Broadcast()
+	r.lastAck = make(map[int]time.Time)
+	r.lastLeadershipConfirm = time.Time{}
+	r.leaseUntil = time.Time{}
 
 	if err := r.store.SetState(param.HardState{CurrentTerm: r.currentTerm, VotedFor: uint64(r.votedFor)}); err != nil {
 		log.Errorf("[Raft] Node %d failed to persist state after becoming follower: %v", r.id, err)
