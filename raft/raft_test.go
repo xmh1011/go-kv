@@ -13,6 +13,7 @@ import (
 	"github.com/xmh1011/go-kv/pkg/config"
 	"github.com/xmh1011/go-kv/pkg/param"
 	"github.com/xmh1011/go-kv/pkg/storage"
+	"github.com/xmh1011/go-kv/pkg/storage/kvstore"
 	"github.com/xmh1011/go-kv/pkg/transport"
 )
 
@@ -452,6 +453,28 @@ func TestHandleLinearizableRead(t *testing.T) {
 			},
 			expectedSuccess: true,
 			expectedResult:  "testValue",
+		},
+		{
+			name: "MissingKeyIsApplicationResult",
+			initialState: state{
+				term:        1,
+				state:       Leader,
+				commitIndex: 10,
+				lastApplied: 10,
+			},
+			cmd: param.KVCommand{Op: param.OpGet, Key: "missingKey"},
+			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine, r *Raft) {
+				s.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 1, Index: 10}, nil).AnyTimes()
+				tr.EXPECT().SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(id string, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
+						reply.Term = 1
+						reply.Success = true
+						return nil
+					}).AnyTimes()
+				sm.EXPECT().Get("missingKey").Return("", kvstore.ErrKeyNotFound).Times(1)
+			},
+			expectedSuccess: true,
+			expectedResult:  "key not found",
 		},
 		{
 			name: "NotLeader",

@@ -186,7 +186,7 @@ func decodeLogEntry(data []byte) (*param.LogEntry, error) {
 	}
 
 	// gob 解码 Command
-	if err := gob.NewDecoder(bytes.NewReader(data[20:20+cmdLen])).Decode(&entry.Command); err != nil {
+	if err := gob.NewDecoder(bytes.NewReader(data[20 : 20+cmdLen])).Decode(&entry.Command); err != nil {
 		return nil, err
 	}
 	return entry, nil
@@ -205,6 +205,15 @@ func (s *StorageAdapter) AppendEntries(entries []param.LogEntry) error {
 		}
 
 		key := s.getLogKey(entry.Index)
+		oldData, err := s.db.Get(key)
+		if err != nil {
+			log.Errorf("[LSMStorage] Get existing entry %d failed before append: %v", entry.Index, err)
+			return err
+		}
+		if oldData != nil {
+			s.logSize -= len(oldData)
+		}
+
 		if err := s.db.Put(key, data); err != nil {
 			log.Errorf("[LSMStorage] Append entry %d failed: %v", entry.Index, err)
 			return err

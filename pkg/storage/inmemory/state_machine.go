@@ -2,14 +2,14 @@ package inmemory
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/xmh1011/go-kv/pkg/param"
+	"github.com/xmh1011/go-kv/pkg/storage/kvstore"
 )
 
-var ErrKeyNotFound = errors.New("key not found")
+var ErrKeyNotFound = kvstore.ErrKeyNotFound
 
 // StateMachine 是 StateMachine 接口的一个内存实现，模拟一个简单的KV数据库。
 type StateMachine struct {

@@ -10,7 +10,10 @@ import (
 	"github.com/xmh1011/go-kv/engine/lsm/database"
 	"github.com/xmh1011/go-kv/pkg/log"
 	"github.com/xmh1011/go-kv/pkg/param"
+	"github.com/xmh1011/go-kv/pkg/storage/kvstore"
 )
+
+var ErrKeyNotFound = kvstore.ErrKeyNotFound
 
 // StateMachineAdapter 实现了 storage.StateMachine 接口，
 // 将 Raft 的 Apply 请求适配到底层的 LSM 数据库。
@@ -69,7 +72,7 @@ func (lsm *StateMachineAdapter) Get(key string) (string, error) {
 		return "", err
 	}
 	if value == nil {
-		return "", nil // Not found
+		return "", ErrKeyNotFound
 	}
 	return string(value), nil
 }

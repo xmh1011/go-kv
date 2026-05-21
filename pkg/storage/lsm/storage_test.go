@@ -47,7 +47,7 @@ func TestStateMachineAdapter_ApplyAndGet(t *testing.T) {
 	assert.Nil(t, result)
 
 	val, err = adapter.Get("key1")
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, ErrKeyNotFound)
 	assert.Equal(t, "", val)
 }
 
@@ -85,11 +85,30 @@ func TestStorageAdapter_LogEntries(t *testing.T) {
 	// Test AppendEntries
 	err = adapter.AppendEntries(entries)
 	assert.NoError(t, err)
+	initialSize, err := adapter.LogSize()
+	assert.NoError(t, err)
 
 	// Test GetEntry
 	entry, err := adapter.GetEntry(2)
 	assert.NoError(t, err)
 	assert.Equal(t, entries[1], *entry)
+
+	// Test replacement does not inflate log size
+	replacement := param.LogEntry{Term: 3, Index: 2, Command: []byte("replacement-cmd")}
+	oldEncoded, err := encodeLogEntry(&entries[1])
+	assert.NoError(t, err)
+	replacementEncoded, err := encodeLogEntry(&replacement)
+	assert.NoError(t, err)
+
+	err = adapter.AppendEntries([]param.LogEntry{replacement})
+	assert.NoError(t, err)
+	sizeAfterReplacement, err := adapter.LogSize()
+	assert.NoError(t, err)
+	assert.Equal(t, initialSize-len(oldEncoded)+len(replacementEncoded), sizeAfterReplacement)
+
+	entry, err = adapter.GetEntry(2)
+	assert.NoError(t, err)
+	assert.Equal(t, replacement, *entry)
 
 	// Test First/Last Index
 	first, err := adapter.FirstLogIndex()
