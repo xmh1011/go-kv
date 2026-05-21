@@ -1258,11 +1258,14 @@ func TestConfirmLeadershipRequiresJointQuorumFromRecentAcks(t *testing.T) {
 
 	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
 	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
+	var wg sync.WaitGroup
+	wg.Add(2)
 	mockTrans.EXPECT().
 		SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).
 		DoAndReturn(func(_ string, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
 			reply.Term = args.Term
 			reply.Success = true
+			wg.Done()
 			return nil
 		}).
 		Times(2)
@@ -1281,6 +1284,37 @@ func TestConfirmLeadershipRequiresJointQuorumFromRecentAcks(t *testing.T) {
 	r.lastAck[3] = now
 
 	assert.True(t, r.confirmLeadership())
+	waitForWaitGroup(t, &wg, time.Second)
+}
+
+func TestConfirmLeadershipStepsDownOnHigherTermReply(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockTrans := transport.NewMockTransport(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
+	mockStore.EXPECT().SetState(param.HardState{CurrentTerm: 3, VotedFor: math.MaxUint64}).Return(nil).Times(1)
+	mockTrans.EXPECT().
+		SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ string, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
+			reply.Term = args.Term + 1
+			reply.Success = false
+			return nil
+		}).
+		Times(2)
+
+	r := NewRaft(1, []int{2, 3}, mockStore, mockSM, mockTrans, nil)
+	r.currentTerm = 2
+	r.setState(Leader)
+	r.electionTimeout = 100 * time.Millisecond
+
+	assert.False(t, r.confirmLeadership())
+	assert.Equal(t, Follower, r.getState())
+	assert.Equal(t, uint64(3), r.currentTerm)
 }
 
 // TestLeaseRead_NotLeader 测试非 Leader 节点的读取请求

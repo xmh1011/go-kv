@@ -674,12 +674,23 @@ func (r *Raft) confirmLeadership() bool {
 			reply := param.NewAppendEntriesReply()
 			if err := r.trans.SendAppendEntries(strconv.Itoa(target), args, reply); err == nil {
 				if reply.Term == term {
-					// 更新 lastAck
 					r.mu.Lock()
-					r.lastAck[target] = time.Now()
+					stillLeader := r.getState() == Leader && r.currentTerm == term
+					if stillLeader {
+						r.lastAck[target] = time.Now()
+					}
 					r.mu.Unlock()
-					ackChan <- heartbeatAck{peerID: target, ok: true}
+					ackChan <- heartbeatAck{peerID: target, ok: stillLeader}
 				} else {
+					if reply.Term > term {
+						r.mu.Lock()
+						if reply.Term > r.currentTerm {
+							if err := r.becomeFollower(reply.Term); err != nil {
+								log.Errorf("[ReadIndex] Node %d failed to persist higher term %d from peer %d: %v", leaderID, reply.Term, target, err)
+							}
+						}
+						r.mu.Unlock()
+					}
 					ackChan <- heartbeatAck{peerID: target}
 				}
 			} else {
