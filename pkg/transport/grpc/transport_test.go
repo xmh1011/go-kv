@@ -180,15 +180,12 @@ func TestInstallSnapshotStream(t *testing.T) {
 				mu.Lock()
 				defer mu.Unlock()
 				callCount++
-				assert.LessOrEqual(t, args.Offset, uint64(len(snapshotData)))
-				assert.NotEmpty(t, args.Data)
-				// 最后一次调用应该是 Done=true
-				if args.Done {
-					assert.Equal(t, uint64(len(snapshotData)), args.Offset+uint64(len(args.Data)))
-				}
+				assert.Equal(t, uint64(0), args.Offset)
+				assert.Equal(t, snapshotData, args.Data)
+				assert.True(t, args.Done)
 				reply.Term = args.Term
 				return nil
-			}).MinTimes(1)
+			}).Times(1)
 
 		start := time.Now()
 		err := t1.SendInstallSnapshotStream("2", 1, 1, 100, 1, snapshotData)
@@ -198,7 +195,7 @@ func TestInstallSnapshotStream(t *testing.T) {
 		t.Logf("10MB snapshot transferred in %v", elapsed)
 
 		mu.Lock()
-		assert.Greater(t, callCount, 0, "Should have called InstallSnapshot at least once")
+		assert.Equal(t, 1, callCount, "Should have called InstallSnapshot once with the complete snapshot")
 		mu.Unlock()
 	})
 }
@@ -243,10 +240,12 @@ func TestSendInstallSnapshot(t *testing.T) {
 				mu.Lock()
 				defer mu.Unlock()
 				callCount++
-				assert.NotEmpty(t, args.Data)
+				assert.Equal(t, uint64(0), args.Offset)
+				assert.Equal(t, snapshotData, args.Data)
+				assert.True(t, args.Done)
 				reply.Term = args.Term
 				return nil
-			}).MinTimes(1)
+			}).Times(1)
 
 		req := &param.InstallSnapshotArgs{
 			Term:              1,
@@ -262,7 +261,7 @@ func TestSendInstallSnapshot(t *testing.T) {
 		assert.Equal(t, uint64(1), resp.Term)
 
 		mu.Lock()
-		assert.Greater(t, callCount, 0, "Should have called InstallSnapshot at least once")
+		assert.Equal(t, 1, callCount, "Should have called InstallSnapshot once with the complete snapshot")
 		mu.Unlock()
 	})
 }
