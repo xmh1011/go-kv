@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -851,11 +852,36 @@ func percentile(latencies []time.Duration, p float64) time.Duration {
 	if len(latencies) == 0 {
 		return 0
 	}
-	idx := int(float64(len(latencies)) * p / 100)
-	if idx >= len(latencies) {
-		idx = len(latencies) - 1
+
+	sorted := make([]time.Duration, len(latencies))
+	copy(sorted, latencies)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i] < sorted[j]
+	})
+
+	idx := int(float64(len(sorted)) * p / 100)
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
 	}
-	return latencies[idx]
+	return sorted[idx]
+}
+
+func TestPercentileSortsLatencySamples(t *testing.T) {
+	latencies := []time.Duration{
+		100 * time.Millisecond,
+		1 * time.Millisecond,
+		50 * time.Millisecond,
+		10 * time.Millisecond,
+		200 * time.Millisecond,
+	}
+
+	p50 := percentile(latencies, 50)
+	p95 := percentile(latencies, 95)
+	p99 := percentile(latencies, 99)
+
+	if p50 > p95 || p95 > p99 {
+		t.Fatalf("percentiles must be monotonic: p50=%v p95=%v p99=%v", p50, p95, p99)
+	}
 }
 
 // printPerfMetrics 打印性能指标（独立函数，供所有测试套件使用）

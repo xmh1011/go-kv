@@ -114,9 +114,11 @@ func (d *Database) ForceFlush() error {
 
 	// 2. 刷新到 SSTable
 	if err := d.SSTables.CreateNewSSTable(imem); err != nil {
+		d.MemTables.CompleteFlush(imem, false)
 		log.Errorf("[Database] Create new sstable error: %s", err.Error())
 		return err
 	}
+	d.MemTables.CompleteFlush(imem, true)
 
 	log.Debug("[Database] Force flush completed")
 	return nil
@@ -134,13 +136,17 @@ func (d *Database) createNewSSTable(imem *memtable.IMemTable) {
 	}
 	log.Debug("[Database] MemTable full, flushing to SSTable")
 	if err := d.SSTables.CreateNewSSTable(imem); err != nil {
+		d.MemTables.CompleteFlush(imem, false)
 		log.Errorf("[Database] Create new sstable error: %s", err.Error())
+		return
 	}
+	d.MemTables.CompleteFlush(imem, true)
 }
 
 // Close 关闭数据库，释放资源。
 func (d *Database) Close() error {
 	log.Debug("[Database] Closing database...")
+	d.SSTables.WaitForCompactions()
 	// 关闭 MemTable Manager (主要是关闭 WAL)
 	if err := d.MemTables.Close(); err != nil {
 		log.Errorf("[Database] Close MemTable manager error: %s", err.Error())

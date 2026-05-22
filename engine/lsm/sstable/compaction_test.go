@@ -202,7 +202,14 @@ func TestCompactionEdgeCases(t *testing.T) {
 		{
 			name: "Invalid SSTable file",
 			setup: func(mgr *Manager) {
-				mgr.totalMap[mgr.minSSTableLevel] = []string{"invalid1.sst", "invalid2.sst", "invalid3.sst"}
+				for i := 0; i <= mgr.maxFileNumsInLevel(mgr.minSSTableLevel); i++ {
+					mgr.addTable(&SSTable{
+						id:       uint64(i + 1),
+						level:    mgr.minSSTableLevel,
+						Header:   block.NewHeader("a", "z"),
+						filePath: fmt.Sprintf("invalid%d.sst", i),
+					})
+				}
 			},
 			expectedError: true,
 		},

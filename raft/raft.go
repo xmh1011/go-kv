@@ -18,6 +18,8 @@ import (
 	"github.com/xmh1011/go-kv/pkg/transport"
 )
 
+var errLogEntryNotFound = errors.New("log entry not found")
+
 // State 定义节点的状态（Consensus Module State）
 type State int
 
@@ -30,15 +32,23 @@ const (
 
 // proposalRequest 表示一个待批处理的 Submit 请求
 type proposalRequest struct {
-	command any
-	result  chan proposalResult
+	command     any
+	result      chan proposalResult
+	clientKey   clientRequestKey
+	trackClient bool
 }
 
 // proposalResult 表示批处理后的结果
 type proposalResult struct {
-	index uint64
-	term  uint64
-	ok    bool
+	index          uint64
+	term           uint64
+	ok             bool
+	alreadyApplied bool
+}
+
+type clientRequestKey struct {
+	clientID    int64
+	sequenceNum int64
 }
 
 // proposal 批处理常量
@@ -46,6 +56,8 @@ const (
 	proposalChSize = 256 // proposalCh 缓冲大小
 	maxBatchSize   = 64  // 单批最大 proposal 数量
 )
+
+const clientApplyTimeout = 5 * time.Second
 
 type Raft struct {
 	// mu 保护对 Raft 状态的并发访问
@@ -58,6 +70,11 @@ type Raft struct {
 	// applyMu serializes apply loops so lastApplied only advances after a
 	// committed entry has been delivered to the state machine.
 	applyMu sync.Mutex
+
+	// stateMachineMu protects destructive state-machine operations. LSM
+	// snapshots flush and rewrite storage, so reads, writes, and snapshot
+	// install must not overlap at the state-machine layer.
+	stateMachineMu sync.RWMutex
 
 	// id 是当前节点的服务器ID
 	id int
@@ -94,6 +111,7 @@ type Raft struct {
 	snapshot          *param.Snapshot
 	isSnapshotting    bool // 标记是否正在后台生成快照
 	snapshotThreshold int  // 自动触发快照的日志大小阈值，<=0 表示禁用
+	snapshotWG        sync.WaitGroup
 
 	// --- 选举相关 ---
 	electionResetEvent     time.Time
@@ -107,8 +125,10 @@ type Raft struct {
 	lastAck    map[int]time.Time // 跟踪 Leader 收到的每个 peer 的最后 ACK 时间
 
 	// --- 客户端交互状态 ---
-	clientSessions map[int64]int64
-	notifyApply    map[uint64]chan any
+	clientSessions        map[int64]int64
+	pendingClientRequests map[clientRequestKey]uint64
+	pendingLogClients     map[uint64]clientRequestKey
+	notifyApply           map[uint64][]chan any
 
 	// --- 内部控制 ---
 	shutdownChan chan struct{} // 用于关闭 Run 循环
@@ -130,24 +150,26 @@ type Raft struct {
 // 注意：store 参数的类型现在是 storage.KVStorage。
 func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.StateMachine, trans transport.Transport, commitChan chan param.CommitEntry) *Raft {
 	r := &Raft{
-		id:                id,
-		peerIDs:           peerIDs,
-		store:             store,
-		stateMachine:      stateMachine,
-		trans:             trans,
-		inJointConsensus:  false,
-		votedFor:          -1, // -1 表示未投票
-		commitChan:        commitChan,
-		nextIndex:         make(map[int]uint64),
-		matchIndex:        make(map[int]uint64),
-		clientSessions:    make(map[int64]int64),
-		notifyApply:       make(map[uint64]chan any),
-		shutdownChan:      make(chan struct{}),
-		proposalCh:        make(chan proposalRequest, proposalChSize),
-		lastAck:           make(map[int]time.Time),
-		snapshotThreshold: -1, // 默认禁用自动快照
-		electionTimeout:   config.Conf.Raft.ElectionTimeout,
-		heartbeatTimeout:  config.Conf.Raft.HeartbeatTimeout,
+		id:                    id,
+		peerIDs:               peerIDs,
+		store:                 store,
+		stateMachine:          stateMachine,
+		trans:                 trans,
+		inJointConsensus:      false,
+		votedFor:              -1, // -1 表示未投票
+		commitChan:            commitChan,
+		nextIndex:             make(map[int]uint64),
+		matchIndex:            make(map[int]uint64),
+		clientSessions:        make(map[int64]int64),
+		notifyApply:           make(map[uint64][]chan any),
+		shutdownChan:          make(chan struct{}),
+		proposalCh:            make(chan proposalRequest, proposalChSize),
+		lastAck:               make(map[int]time.Time),
+		pendingClientRequests: make(map[clientRequestKey]uint64),
+		pendingLogClients:     make(map[uint64]clientRequestKey),
+		snapshotThreshold:     -1, // 默认禁用自动快照
+		electionTimeout:       config.Conf.Raft.ElectionTimeout,
+		heartbeatTimeout:      config.Conf.Raft.HeartbeatTimeout,
 		// 初始化 ReadIndex 缓存，缓存时间设置为心跳间隔的一半
 		leadershipCacheTime: config.Conf.Raft.HeartbeatTimeout / 2,
 		// 初始化 Lease Read 相关配置
@@ -258,10 +280,22 @@ func (r *Raft) SetSnapshotThreshold(threshold int) {
 	r.snapshotThreshold = threshold
 }
 
+func (r *Raft) SnapshotIndex() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.snapshot == nil {
+		return 0
+	}
+	return r.snapshot.LastIncludedIndex
+}
+
 // Run 启动 Raft 节点的主循环。
 // 它会Ticking，检查选举超时，并在 Follower/Candidate 状态下发起选举。
 func (r *Raft) Run() {
-	log.Debugf("[Core] Node %d starting main loop (Initial timeout: %s)", r.id, r.currentElectionTimeout)
+	r.mu.Lock()
+	initialTimeout := r.currentElectionTimeout
+	r.mu.Unlock()
+	log.Debugf("[Core] Node %d starting main loop (Initial timeout: %s)", r.id, initialTimeout)
 	ticker := time.NewTicker(r.heartbeatTimeout) // 使用心跳间隔作为 tick 频率
 	defer ticker.Stop()
 
@@ -321,6 +355,7 @@ func (r *Raft) Stop() {
 	r.mu.Unlock()
 
 	r.applyWG.Wait()
+	r.snapshotWG.Wait()
 }
 
 // randomizedElectionTimeout 返回一个在 [electionTimeout, 2 * electionTimeout) 范围内的随机超时时间。
@@ -423,8 +458,13 @@ func (r *Raft) performReadAfterApply(cmd param.KVCommand, reply *param.ClientRep
 
 	log.Debugf("[ReadIndex] Node %d confirmed leadership. ReadIndex: %d. Waiting for lastApplied (%d)...", r.id, readIndex, r.lastApplied)
 
-	// 设置超时：使用选举超时的 2 倍作为读请求超时
+	// Reads may need to wait behind committed writes and LSM snapshot work.
+	// Keep this aligned with the write apply timeout instead of the much
+	// shorter election timeout.
 	timeout := r.electionTimeout * 2
+	if timeout < clientApplyTimeout {
+		timeout = clientApplyTimeout
+	}
 	timedOut := false
 
 	// 使用 time.AfterFunc 替代 goroutine+time.Sleep，避免 goroutine 泄漏
@@ -444,6 +484,9 @@ func (r *Raft) performReadAfterApply(cmd param.KVCommand, reply *param.ClientRep
 		// sync.Cond.Wait() 会释放锁并等待，被唤醒后重新获取锁
 		r.lastAppliedCond.Wait()
 
+		if r.lastApplied >= readIndex || r.getState() != Leader {
+			break
+		}
 		if time.Now().After(deadline) {
 			timedOut = true
 			break
@@ -473,7 +516,9 @@ func (r *Raft) performReadAfterApply(cmd param.KVCommand, reply *param.ClientRep
 	log.Debugf("[ReadIndex] Node %d state machine ready (lastApplied=%d). performing read.", r.id, r.lastApplied)
 	r.mu.Unlock()
 
+	r.stateMachineMu.RLock()
 	value, err := r.stateMachine.Get(cmd.Key)
+	r.stateMachineMu.RUnlock()
 	if err != nil {
 		reply.Result = err.Error()
 		if errors.Is(err, kvstore.ErrKeyNotFound) {
@@ -638,6 +683,7 @@ func (r *Raft) confirmLeadership() bool {
 	}
 
 	commitIdx := r.commitIndex
+	snapshot := r.snapshot
 	r.mu.Unlock()
 
 	// 2. 如果没有需要发送的 peer，直接返回成功
@@ -660,7 +706,7 @@ func (r *Raft) confirmLeadership() bool {
 
 	for _, pi := range peersToSend {
 		prevLogIndex := pi.nextIndex - 1
-		prevLogTerm, _ := r.getLogTerm(prevLogIndex) // 锁外执行磁盘 I/O
+		prevLogTerm, _ := r.getLogTermWithSnapshot(prevLogIndex, snapshot) // 锁外执行磁盘 I/O
 
 		args := param.NewAppendEntriesArgs(term, leaderID, prevLogIndex, prevLogTerm, commitIdx, nil)
 		requests = append(requests, hbRequest{pi.peerID, args})
@@ -774,8 +820,16 @@ func (r *Raft) handleWriteRequest(args *param.ClientArgs, reply *param.ClientRep
 		return nil
 	}
 
+	command := args.Command
+	trackClient := true
+	if _, ok := command.(param.ConfigChangeCommand); ok {
+		trackClient = false
+	} else {
+		command = param.NewClientCommand(args.ClientID, args.SequenceNum, args.Command)
+	}
+
 	// 2. 将命令提交到 Raft 日志，并同步等待其被状态机应用。
-	result, ok, leaderID := r.Commit(args.Command)
+	result, ok, leaderID := r.CommitClient(command, args.ClientID, args.SequenceNum, trackClient)
 
 	// 3. 根据提交和等待的结果，最终填充客户端的响应。
 	r.finalizeClientReply(args, reply, result, ok, leaderID)
@@ -783,15 +837,20 @@ func (r *Raft) handleWriteRequest(args *param.ClientArgs, reply *param.ClientRep
 	return nil
 }
 
-// getLogTerm 返回指定索引的日志条目的任期。
-func (r *Raft) getLogTerm(index uint64) (uint64, error) {
+// getLogTermLocked 返回指定索引的日志条目的任期。
+// 调用方必须持有 r.mu，以便安全读取当前内存快照引用。
+func (r *Raft) getLogTermLocked(index uint64) (uint64, error) {
+	return r.getLogTermWithSnapshot(index, r.snapshot)
+}
+
+func (r *Raft) getLogTermWithSnapshot(index uint64, snapshot *param.Snapshot) (uint64, error) {
 	if index == 0 {
 		return 0, nil
 	}
 
 	// 检查是否在快照中
-	if r.snapshot != nil && index == r.snapshot.LastIncludedIndex {
-		return r.snapshot.LastIncludedTerm, nil
+	if snapshot != nil && index == snapshot.LastIncludedIndex {
+		return snapshot.LastIncludedTerm, nil
 	}
 
 	entry, err := r.store.GetEntry(index)
@@ -809,8 +868,8 @@ func (r *Raft) getLogTerm(index uint64) (uint64, error) {
 			return term, nil
 		}
 
-		log.Errorf("[Raft] Log entry at index %d not found", index)
-		return 0, nil
+		log.Debugf("[Raft] Log entry at index %d not found", index)
+		return 0, fmt.Errorf("%w: index %d", errLogEntryNotFound, index)
 	}
 	return entry.Term, nil
 }
@@ -878,16 +937,26 @@ func (r *Raft) preHandleClientRequest(args *param.ClientArgs, reply *param.Clien
 // Commit 封装了将命令提交到 Raft 日志并等待其被应用的全过程。
 // 它返回从状态机获得的结果，一个表示成功的布尔值，以及当前的 Leader ID。
 func (r *Raft) Commit(command any) (any, bool, int) {
-	index, _, isLeader := r.Submit(command)
+	return r.CommitClient(command, 0, 0, false)
+}
+
+func (r *Raft) CommitClient(command any, clientID, sequenceNum int64, trackClient bool) (any, bool, int) {
+	index, _, isLeader, alreadyApplied := r.submit(command, clientID, sequenceNum, trackClient)
 	if !isLeader {
 		// 在提交过程中，可能失去了 Leader 地位。
 		return nil, false, r.knownLeaderID
+	}
+	if alreadyApplied {
+		return nil, true, r.id
 	}
 
 	// 等待命令被状态机成功应用，或等待超时。
 	// 使用 5 秒超时以应对高负载场景下的日志复制延迟
 	log.Debugf("[Client] Waiting for log index %d to be applied...", index)
-	result, ok := r.waitForAppliedLog(index, 5*time.Second)
+	result, ok := r.waitForAppliedLog(index, clientApplyTimeout)
+	if !ok && trackClient {
+		r.clearPendingClientRequest(index)
+	}
 	return result, ok, r.id
 }
 
@@ -913,29 +982,36 @@ func (r *Raft) finalizeClientReply(args *param.ClientArgs, reply *param.ClientRe
 // Submit 将一个普通的客户端命令追加到 Raft 日志中。
 // 优化：通过 proposalCh 发送到批处理 goroutine，多个并发 Submit 可合并为单次磁盘写入。
 func (r *Raft) Submit(command any) (uint64, uint64, bool) {
+	index, term, ok, _ := r.submit(command, 0, 0, false)
+	return index, term, ok
+}
+
+func (r *Raft) submit(command any, clientID, sequenceNum int64, trackClient bool) (uint64, uint64, bool, bool) {
 	// 快速检查：无锁原子读取，避免非 Leader 时的 channel 操作
 	if r.getState() != Leader {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 
 	req := proposalRequest{
-		command: command,
-		result:  make(chan proposalResult, 1),
+		command:     command,
+		result:      make(chan proposalResult, 1),
+		clientKey:   clientRequestKey{clientID: clientID, sequenceNum: sequenceNum},
+		trackClient: trackClient,
 	}
 
 	// 发送到 proposalCh，如果 channel 满了说明系统过载
 	select {
 	case r.proposalCh <- req:
 	case <-r.shutdownChan:
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 
 	// 等待批处理结果
 	select {
 	case res := <-req.result:
-		return res.index, res.term, res.ok
+		return res.index, res.term, res.ok, res.alreadyApplied
 	case <-r.shutdownChan:
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 }
 
@@ -989,46 +1065,108 @@ func (r *Raft) processBatch(batch []proposalRequest) {
 		}
 		return
 	}
+	if r.pendingClientRequests == nil {
+		r.pendingClientRequests = make(map[clientRequestKey]uint64)
+	}
+	if r.pendingLogClients == nil {
+		r.pendingLogClients = make(map[uint64]clientRequestKey)
+	}
+
+	type batchResponse struct {
+		req    proposalRequest
+		result proposalResult
+		isNew  bool
+	}
 
 	// 构建批量日志条目
 	entries := make([]param.LogEntry, 0, len(batch))
-	startIndex := r.cachedLastLogIndex + 1
+	nextIndex := r.cachedLastLogIndex + 1
 	currentTerm := r.currentTerm
+	responses := make([]batchResponse, 0, len(batch))
+	addedPending := make([]uint64, 0, len(batch))
 
-	for i, req := range batch {
-		idx := startIndex + uint64(i)
+	for _, req := range batch {
+		if req.trackClient {
+			if lastSeq, exists := r.clientSessions[req.clientKey.clientID]; exists && req.clientKey.sequenceNum <= lastSeq {
+				responses = append(responses, batchResponse{
+					req: req,
+					result: proposalResult{
+						term:           currentTerm,
+						ok:             true,
+						alreadyApplied: true,
+					},
+				})
+				continue
+			}
+			if pendingIndex, exists := r.pendingClientRequests[req.clientKey]; exists {
+				responses = append(responses, batchResponse{
+					req: req,
+					result: proposalResult{
+						index: pendingIndex,
+						term:  currentTerm,
+						ok:    true,
+					},
+				})
+				continue
+			}
+		}
+
+		idx := nextIndex
+		nextIndex++
 		entries = append(entries, param.NewLogEntry(req.command, currentTerm, idx))
+		if req.trackClient {
+			r.pendingClientRequests[req.clientKey] = idx
+			r.pendingLogClients[idx] = req.clientKey
+			addedPending = append(addedPending, idx)
+		}
+		responses = append(responses, batchResponse{
+			req: req,
+			result: proposalResult{
+				index: idx,
+				term:  currentTerm,
+				ok:    true,
+			},
+			isNew: true,
+		})
 	}
 
 	// 单次磁盘写入
-	if err := r.store.AppendEntries(entries); err != nil {
-		log.Errorf("[Raft] Leader %d failed to append batch of %d entries: %v", r.id, len(entries), err)
-		r.mu.Unlock()
-		for _, req := range batch {
-			req.result <- proposalResult{ok: false}
+	if len(entries) > 0 {
+		if err := r.store.AppendEntries(entries); err != nil {
+			for _, index := range addedPending {
+				if key, ok := r.pendingLogClients[index]; ok {
+					delete(r.pendingClientRequests, key)
+				}
+				delete(r.pendingLogClients, index)
+			}
+			log.Errorf("[Raft] Leader %d failed to append batch of %d entries: %v", r.id, len(entries), err)
+			r.mu.Unlock()
+			for _, response := range responses {
+				if response.isNew {
+					response.req.result <- proposalResult{ok: false}
+				} else {
+					response.req.result <- response.result
+				}
+			}
+			return
 		}
-		return
+
+		// 更新缓存
+		r.cachedLastLogIndex = entries[len(entries)-1].Index
+		log.Debugf("[Raft] Leader %d proposed batch of %d entries (index %d-%d)", r.id, len(entries), entries[0].Index, r.cachedLastLogIndex)
+
+		// A single-node cluster has no follower replies to trigger commit
+		// advancement, so try to commit after the local append as well.
+		r.updateCommitIndex()
 	}
-
-	// 更新缓存
-	r.cachedLastLogIndex = entries[len(entries)-1].Index
-	log.Debugf("[Raft] Leader %d proposed batch of %d entries (index %d-%d)", r.id, len(entries), startIndex, r.cachedLastLogIndex)
-
-	// A single-node cluster has no follower replies to trigger commit
-	// advancement, so try to commit after the local append as well.
-	r.updateCommitIndex()
 
 	// 获取需要通知的 peer 列表
 	peersToNotify := r.getAllPeerIDs()
 	r.mu.Unlock()
 
 	// 通知所有请求完成
-	for i, req := range batch {
-		req.result <- proposalResult{
-			index: entries[i].Index,
-			term:  entries[i].Term,
-			ok:    true,
-		}
+	for _, response := range responses {
+		response.req.result <- response.result
 	}
 
 	// 在没有持有锁的情况下广播
@@ -1123,7 +1261,7 @@ func (r *Raft) getAllPeerIDs() []int {
 // becomeFollower 将节点的状态更新为指定新任期的 Follower。
 // 它会持久化新状态，并且必须在持有锁的情况下被调用。
 func (r *Raft) becomeFollower(newTerm uint64) error {
-	log.Infof("[State Change] Node %d received higher term %d. Updating term and becoming follower.", r.id, newTerm)
+	log.Debugf("[State Change] Node %d received higher term %d. Updating term and becoming follower.", r.id, newTerm)
 	r.currentTerm = newTerm
 	r.setState(Follower)
 	r.votedFor = -1 // 进入新任期时，重置投票记录。
@@ -1160,12 +1298,26 @@ func (r *Raft) waitForAppliedLog(index uint64, timeout time.Duration) (any, bool
 
 	// 2. 注册通知 channel。
 	notifyChan := make(chan any, 1)
-	r.notifyApply[index] = notifyChan
+	if r.notifyApply == nil {
+		r.notifyApply = make(map[uint64][]chan any)
+	}
+	r.notifyApply[index] = append(r.notifyApply[index], notifyChan)
 
 	// 3. 再次检查：防止在注册期间日志被应用。
 	if r.lastApplied >= index {
 		// 如果此时发现已经应用了，清理刚刚注册的 channel 并返回。
-		delete(r.notifyApply, index)
+		waiters := r.notifyApply[index]
+		for i, waiter := range waiters {
+			if waiter == notifyChan {
+				waiters = append(waiters[:i], waiters[i+1:]...)
+				break
+			}
+		}
+		if len(waiters) == 0 {
+			delete(r.notifyApply, index)
+		} else {
+			r.notifyApply[index] = waiters
+		}
 		r.mu.Unlock()
 		return nil, true
 	}
@@ -1175,24 +1327,57 @@ func (r *Raft) waitForAppliedLog(index uint64, timeout time.Duration) (any, bool
 	// 4. 无论等待成功还是超时，最后都负责清理 channel。
 	defer func() {
 		r.mu.Lock()
-		delete(r.notifyApply, index)
+		waiters := r.notifyApply[index]
+		for i, waiter := range waiters {
+			if waiter == notifyChan {
+				waiters = append(waiters[:i], waiters[i+1:]...)
+				break
+			}
+		}
+		if len(waiters) == 0 {
+			delete(r.notifyApply, index)
+		} else {
+			r.notifyApply[index] = waiters
+		}
 		r.mu.Unlock()
 	}()
 
 	// 5. 等待 applyLogs 发出通知，或等待超时。
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case result := <-notifyChan:
 		log.Debugf("[Client] Notified that log index %d has been applied.", index)
 		return result, true
-	case <-time.After(timeout):
-		log.Warnf("[Client] Timed out waiting for log index %d to be applied.", index)
+	case <-timer.C:
+		r.mu.Lock()
+		applied := r.lastApplied >= index
+		r.mu.Unlock()
+		if applied {
+			return nil, true
+		}
+		log.Debugf("[Client] Timed out waiting for log index %d to be applied.", index)
 		return nil, false
+	}
+}
+
+func (r *Raft) clearPendingClientRequest(index uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key, ok := r.pendingLogClients[index]
+	if !ok {
+		return
+	}
+	delete(r.pendingLogClients, index)
+	if r.pendingClientRequests[key] == index {
+		delete(r.pendingClientRequests, key)
 	}
 }
 
 // initLeaderState initializes leader state after election
 func (r *Raft) initLeaderState() {
 	// This method is called with the lock held.
+	r.refreshCachedLastLogIndexLocked()
 	lastLogIndex := r.cachedLastLogIndex
 
 	r.nextIndex = make(map[int]uint64)
@@ -1204,6 +1389,50 @@ func (r *Raft) initLeaderState() {
 		r.nextIndex[peerID] = lastLogIndex + 1
 		r.matchIndex[peerID] = 0
 	}
+}
+
+func (r *Raft) refreshCachedLastLogIndexLocked() {
+	if r.store == nil {
+		return
+	}
+
+	lastLogIndex, err := r.store.LastLogIndex()
+	if err != nil {
+		log.Errorf("[Raft] Failed to refresh last log index from storage: %v", err)
+		return
+	}
+
+	snapshot := r.snapshot
+	if snapshot == nil {
+		if storedSnapshot, err := r.store.ReadSnapshot(); err == nil {
+			snapshot = storedSnapshot
+			r.snapshot = storedSnapshot
+		} else {
+			log.Errorf("[Raft] Failed to refresh snapshot while checking last log index: %v", err)
+		}
+	}
+
+	for lastLogIndex > 0 {
+		if snapshot != nil && lastLogIndex <= snapshot.LastIncludedIndex {
+			break
+		}
+
+		entry, err := r.store.GetEntry(lastLogIndex)
+		if err != nil {
+			log.Errorf("[Raft] Failed to verify last log entry %d: %v", lastLogIndex, err)
+			break
+		}
+		if entry != nil {
+			break
+		}
+		log.Warnf("[Raft] Last log index %d is missing from storage; rewinding cached last log index", lastLogIndex)
+		lastLogIndex--
+	}
+
+	if snapshot != nil && lastLogIndex < snapshot.LastIncludedIndex {
+		lastLogIndex = snapshot.LastIncludedIndex
+	}
+	r.cachedLastLogIndex = lastLogIndex
 }
 
 // startHeartbeat starts periodic heartbeat loops

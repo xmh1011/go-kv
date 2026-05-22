@@ -292,10 +292,8 @@ func TestWaitForCompactionIfNeeded(t *testing.T) {
 }
 
 func TestIsLevelNeedToBeMerged(t *testing.T) {
-	tmpDir := t.TempDir()
-	manager := NewSSTableManager(tmpDir)
 	level := 2
-	limit := manager.maxFileNumsInLevel(level)
+	limit := NewSSTableManager(t.TempDir()).maxFileNumsInLevel(level)
 
 	tests := []struct {
 		name      string
@@ -309,16 +307,54 @@ func TestIsLevelNeedToBeMerged(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Setup files
-			paths := make([]string, tt.fileCount)
+			tmpDir := t.TempDir()
+			manager := NewSSTableManager(tmpDir)
 			for i := 0; i < tt.fileCount; i++ {
-				paths[i] = filepath.Join("mock", fmt.Sprintf("%d.sst", i))
+				manager.addTable(&SSTable{
+					id:       uint64(i + 1),
+					level:    level,
+					Header:   block.NewHeader("a", "z"),
+					filePath: filepath.Join("mock", fmt.Sprintf("%d.sst", i)),
+				})
 			}
-			manager.totalMap[level] = paths
 
 			assert.Equal(t, tt.want, manager.isLevelNeedToBeMerged(level))
 		})
 	}
+}
+
+func TestGetFilesByLevelIgnoresStaleTotalMap(t *testing.T) {
+	tmpDir := t.TempDir()
+	manager := NewSSTableManager(tmpDir)
+
+	manager.totalMap[0] = []string{"stale.sst", "stale.sst"}
+
+	assert.Empty(t, manager.getFilesByLevel(0))
+	assert.False(t, manager.isLevelNeedToBeMerged(0))
+}
+
+func TestRemoveTableMetadataCleansStaleLevelEntries(t *testing.T) {
+	tmpDir := t.TempDir()
+	manager := NewSSTableManager(tmpDir)
+
+	path := filepath.Join(tmpDir, "1-level", "44.sst")
+	stale := &SSTable{
+		id:       44,
+		level:    1,
+		Header:   block.NewHeader("a", "z"),
+		filePath: path,
+	}
+	manager.levels[1] = append(manager.levels[1], stale)
+	manager.sparseIndexes[0] = append(manager.sparseIndexes[0], stale)
+	manager.totalMap[1] = append(manager.totalMap[1], path)
+
+	manager.mu.Lock()
+	manager.removeTableMetadataLocked(path, 0)
+	manager.mu.Unlock()
+
+	assert.Empty(t, manager.getFilesByLevel(1))
+	assert.Empty(t, manager.sparseIndexes[0])
+	assert.NotContains(t, manager.totalMap[1], path)
 }
 
 func TestGetSSTableByPath(t *testing.T) {

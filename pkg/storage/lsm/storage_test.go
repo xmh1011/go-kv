@@ -1,11 +1,17 @@
 package lsm
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/xmh1011/go-kv/engine/lsm/database"
+	"github.com/xmh1011/go-kv/engine/lsm/sstable"
 	"github.com/xmh1011/go-kv/pkg/log"
 	"github.com/xmh1011/go-kv/pkg/param"
 )
@@ -13,7 +19,7 @@ import (
 func init() {
 	// 初始化日志配置，避免测试时 panic
 	log.Init(log.Config{
-		Level:   "debug",
+		Level:   "warn",
 		Console: true,
 	})
 }
@@ -132,6 +138,26 @@ func TestStorageAdapter_LogEntries(t *testing.T) {
 	assert.Nil(t, entry)
 }
 
+func TestStorageAdapter_LogEntryEncodingUsesBinaryCommands(t *testing.T) {
+	entry := param.LogEntry{
+		Term:  7,
+		Index: 42,
+		Command: param.NewClientCommand(
+			99,
+			12,
+			[]byte(`{"op":2,"key":"k","value":"v"}`),
+		),
+	}
+
+	encoded, err := encodeLogEntry(&entry)
+	assert.NoError(t, err)
+	assert.True(t, bytes.HasPrefix(encoded, []byte(logEntryFormatMagic)))
+
+	decoded, err := decodeLogEntry(encoded)
+	assert.NoError(t, err)
+	assert.Equal(t, entry, *decoded)
+}
+
 func TestStorageAdapter_Snapshot(t *testing.T) {
 	db, dir := setupTestDB(t, "lsm_storage_test_snap")
 	defer cleanupTestDB(t, dir)
@@ -223,4 +249,91 @@ func TestStorageAdapter_CompactBeyondLastIndexFromSnapshot(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, entry)
 	assert.Equal(t, uint64(6), entry.Index)
+}
+
+func TestStorageAdapter_ReappendAfterTruncateSurvivesFlushCompactionAndRestart(t *testing.T) {
+	db, dir := setupTestDB(t, "lsm_storage_test_reappend_after_truncate")
+	defer cleanupTestDB(t, dir)
+
+	adapter, err := NewStorageAdapter(db)
+	assert.NoError(t, err)
+
+	const totalEntries = 12000
+	const truncateFrom = 6000
+	payload := bytes.Repeat([]byte("x"), 1024)
+
+	initial := make([]param.LogEntry, 0, totalEntries)
+	for i := 1; i <= totalEntries; i++ {
+		initial = append(initial, param.LogEntry{
+			Term:    1,
+			Index:   uint64(i),
+			Command: append([]byte(nil), payload...),
+		})
+	}
+	assert.NoError(t, adapter.AppendEntries(initial))
+	assert.NoError(t, adapter.db.ForceFlush())
+
+	assert.NoError(t, adapter.TruncateLog(truncateFrom))
+	assert.NoError(t, adapter.db.ForceFlush())
+
+	reappended := make([]param.LogEntry, 0, totalEntries-truncateFrom+1)
+	for i := truncateFrom; i <= totalEntries; i++ {
+		reappended = append(reappended, param.LogEntry{
+			Term:    2,
+			Index:   uint64(i),
+			Command: append([]byte(nil), payload...),
+		})
+	}
+	assert.NoError(t, adapter.AppendEntries(reappended))
+	assert.NoError(t, adapter.db.ForceFlush())
+	adapter.db.SSTables.WaitForCompactions()
+
+	entry, err := adapter.GetEntry(truncateFrom)
+	assert.NoError(t, err)
+	if entry == nil {
+		t.Fatalf("entry %d missing before restart", truncateFrom)
+	}
+	assert.NoError(t, adapter.Close())
+
+	reopenedDB := database.Open(dir)
+	assert.NoError(t, reopenedDB.Recover())
+	reopened, err := NewStorageAdapter(reopenedDB)
+	assert.NoError(t, err)
+	defer reopened.Close()
+
+	for i := truncateFrom; i <= totalEntries; i++ {
+		entry, err := reopened.GetEntry(uint64(i))
+		assert.NoError(t, err)
+		if entry == nil {
+			t.Fatalf("entry %d must survive truncate/reappend/restart; %s", i, describeLogKeyOnDisk(t, reopened.db.GetAllSSTables(), reopened.getLogKey(uint64(i))))
+		}
+		assert.Equal(t, uint64(2), entry.Term)
+		assert.Equal(t, uint64(i), entry.Index)
+	}
+}
+
+func describeLogKeyOnDisk(t *testing.T, files []string, key string) string {
+	t.Helper()
+	for _, file := range files {
+		level := 0
+		_, _ = fmt.Sscanf(filepath.Base(filepath.Dir(file)), "%d-level", &level)
+		table := sstable.NewRecoverSSTable(level)
+		if err := table.DecodeFrom(file); err != nil {
+			continue
+		}
+		pairs, err := table.GetDataBlockFromFile(file)
+		if err != nil {
+			continue
+		}
+		for _, pair := range pairs {
+			if string(pair.Key) == key {
+				deleted := "value"
+				if pair.IsDeleted() {
+					deleted = "tombstone"
+				}
+				return fmt.Sprintf("found %s in %s", deleted, file)
+			}
+		}
+	}
+	return fmt.Sprintf("key not present in %d files: %s", len(files), strings.Join(files, ","))
 }

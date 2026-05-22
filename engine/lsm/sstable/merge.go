@@ -10,6 +10,7 @@ import (
 // KVEntry 包装 KV 对，用于堆排序
 type KVEntry struct {
 	pair kv.KeyValuePair
+	seq  int
 }
 
 // minHeap 按 Key 排序的最小堆
@@ -20,6 +21,9 @@ func (h *minHeap) Len() int {
 }
 
 func (h *minHeap) Less(i, j int) bool {
+	if (*h)[i].pair.Key == (*h)[j].pair.Key {
+		return (*h)[i].seq < (*h)[j].seq
+	}
 	return (*h)[i].pair.Key < (*h)[j].pair.Key
 }
 
@@ -45,8 +49,8 @@ func (m *Manager) CompactAndMergeKVs(kvs []kv.KeyValuePair, level int) []*SSTabl
 	heap.Init(h)
 
 	// 1. 收集所有 KV 对并初始化堆
-	for _, pair := range kvs {
-		heap.Push(h, &KVEntry{pair: pair})
+	for seq, pair := range kvs {
+		heap.Push(h, &KVEntry{pair: pair, seq: seq})
 	}
 
 	results := make([]*SSTable, 0)
@@ -70,18 +74,18 @@ func (m *Manager) CompactAndMergeKVs(kvs []kv.KeyValuePair, level int) []*SSTabl
 		entry := heap.Pop(h).(*KVEntry)
 		currentPair := entry.pair
 
-		// 如果不是删除标记，则写入
-		// TODO: 最后一层合并时，将删除标记的 Key 写入 tombstone 文件
+		// 如果不是删除标记，则写入。
+		// 到达最后一层时可以丢弃 tombstone，但仍要标记该 key 已处理，
+		// 否则旧值会在同一轮 compaction 中复活。
 		if !currentPair.IsDeleted() || level < config.Conf.LSM.MaxSSTableLevel {
 			builder.Add(&currentPair)
-			lastWrittenKey = currentKey // 更新最后写入的 Key
 		}
+		lastWrittenKey = currentKey // 更新最后处理的 Key
 
 		// 检查是否需要 Flush
 		if builder.ShouldFlush() {
 			results = append(results, builder.Build())
 			builder = NewSSTableBuilder(level, m.sstPath)
-			lastWrittenKey = "" // 重置 lastWrittenKey
 		}
 	}
 

@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -18,6 +19,9 @@ const (
 	actionSendLogs                              // 动作：发送日志条目
 	actionSendSnapshot                          // 动作：发送快照
 )
+
+var errPeerNeedsSnapshot = errors.New("peer needs snapshot")
+var errLocalLogUnavailable = errors.New("local log unavailable")
 
 // sendAppendEntries 作为 Leader 节点为每个对等节点启动的专用 goroutine。
 // 主要负责：
@@ -81,6 +85,15 @@ func (r *Raft) replicateLogsToPeer(peerID int) {
 	// 准备 RPC 请求参数（日志读取在锁内执行以保证一致性）
 	args, err := r.prepareAppendEntriesArgs(peerID)
 	if err != nil {
+		if errors.Is(err, errLocalLogUnavailable) {
+			r.mu.Unlock()
+			return
+		}
+		if errors.Is(err, errPeerNeedsSnapshot) {
+			r.mu.Unlock()
+			r.sendSnapshot(peerID)
+			return
+		}
 		log.Errorf("[Replication] Node %d failed to prepare AppendEntries args for peer %d: %v", r.id, peerID, err)
 		r.mu.Unlock()
 		return
@@ -111,15 +124,37 @@ const MaxEntriesPerAppendEntries = 32
 
 // prepareAppendEntriesArgs 负责构建发送给对等节点的 AppendEntries RPC 参数。
 func (r *Raft) prepareAppendEntriesArgs(peerID int) (*param.AppendEntriesArgs, error) {
+	if r.snapshot != nil && r.nextIndex[peerID] <= r.snapshot.LastIncludedIndex {
+		log.Debugf("[Snapshot] Node %d peer %d nextIndex=%d is at or before snapshot index %d; sending snapshot", r.id, peerID, r.nextIndex[peerID], r.snapshot.LastIncludedIndex)
+		return nil, errPeerNeedsSnapshot
+	}
+
+	lastLogIndex := r.cachedLastLogIndex
+	if maxNextIndex := lastLogIndex + 1; r.nextIndex[peerID] > maxNextIndex {
+		log.Debugf("[Replication] Node %d clamps nextIndex[%d] from %d to %d", r.id, peerID, r.nextIndex[peerID], maxNextIndex)
+		r.nextIndex[peerID] = maxNextIndex
+	}
+
 	prevLogIndex := r.nextIndex[peerID] - 1
-	prevLogTerm, err := r.getLogTerm(prevLogIndex)
+	prevLogTerm, err := r.getLogTermLocked(prevLogIndex)
 	if err != nil {
+		if errors.Is(err, errLogEntryNotFound) {
+			if r.logIndexNeedsSnapshotLocked(prevLogIndex) {
+				return nil, errPeerNeedsSnapshot
+			}
+			r.refreshCachedLastLogIndexLocked()
+			if prevLogIndex > r.cachedLastLogIndex {
+				r.nextIndex[peerID] = r.cachedLastLogIndex + 1
+				return nil, errLocalLogUnavailable
+			}
+			r.markLocalLogGapLocked(peerID, prevLogIndex)
+			return nil, errLocalLogUnavailable
+		}
 		log.Errorf("[Replication] Node %d failed to get log term at index %d: %v", r.id, prevLogIndex, err)
 		return nil, err
 	}
 
 	var entries []param.LogEntry
-	lastLogIndex := r.cachedLastLogIndex
 	if r.nextIndex[peerID] <= lastLogIndex {
 		// 限制单次发送的日志数量，避免一次性发送过多导致超时
 		endIndex := r.nextIndex[peerID] + uint64(MaxEntriesPerAppendEntries) - 1
@@ -134,8 +169,20 @@ func (r *Raft) prepareAppendEntriesArgs(peerID int) (*param.AppendEntriesArgs, e
 				return nil, err
 			}
 			if entry == nil {
-				log.Errorf("[Raft] Log entry at index %d not found", i)
-				return nil, fmt.Errorf("log entry at index %d not found", i)
+				if r.logIndexNeedsSnapshotLocked(i) {
+					log.Debugf("[Snapshot] Node %d entry %d for peer %d is before the local log start; sending snapshot", r.id, i, peerID)
+					return nil, errPeerNeedsSnapshot
+				}
+				r.refreshCachedLastLogIndexLocked()
+				if i > r.cachedLastLogIndex {
+					if r.nextIndex[peerID] > r.cachedLastLogIndex+1 {
+						r.nextIndex[peerID] = r.cachedLastLogIndex + 1
+					}
+					return nil, errLocalLogUnavailable
+				}
+				r.markLocalLogGapLocked(peerID, i)
+				log.Debugf("[Replication] Node %d local log entry %d unavailable while preparing AppendEntries for peer %d; will retry", r.id, i, peerID)
+				return nil, errLocalLogUnavailable
 			}
 			entries = append(entries, *entry)
 		}
@@ -143,6 +190,50 @@ func (r *Raft) prepareAppendEntriesArgs(peerID int) (*param.AppendEntriesArgs, e
 
 	args := param.NewAppendEntriesArgs(r.currentTerm, r.id, prevLogIndex, prevLogTerm, r.commitIndex, entries)
 	return args, nil
+}
+
+func (r *Raft) markLocalLogGapLocked(peerID int, missingIndex uint64) {
+	if missingIndex == 0 {
+		return
+	}
+	newLastIndex := missingIndex - 1
+	if r.snapshot != nil && newLastIndex < r.snapshot.LastIncludedIndex {
+		newLastIndex = r.snapshot.LastIncludedIndex
+	}
+	if newLastIndex < r.cachedLastLogIndex {
+		log.Debugf("[Replication] Node %d found local log gap at %d; rewinding cached last log index from %d to %d", r.id, missingIndex, r.cachedLastLogIndex, newLastIndex)
+		r.cachedLastLogIndex = newLastIndex
+	}
+	if r.nextIndex != nil && r.nextIndex[peerID] > r.cachedLastLogIndex+1 {
+		r.nextIndex[peerID] = r.cachedLastLogIndex + 1
+	}
+}
+
+func (r *Raft) logIndexNeedsSnapshotLocked(index uint64) bool {
+	if index == 0 || r.store == nil {
+		return false
+	}
+
+	if r.snapshot != nil && index <= r.snapshot.LastIncludedIndex {
+		return true
+	}
+
+	storedSnapshot, err := r.store.ReadSnapshot()
+	if err != nil {
+		log.Debugf("[Snapshot] Node %d failed to read snapshot while checking index %d: %v", r.id, index, err)
+	} else if storedSnapshot != nil {
+		r.snapshot = storedSnapshot
+		if index <= storedSnapshot.LastIncludedIndex {
+			return true
+		}
+	}
+
+	firstLogIndex, err := r.store.FirstLogIndex()
+	if err != nil {
+		log.Debugf("[Snapshot] Node %d failed to read first log index while checking index %d: %v", r.id, index, err)
+		return false
+	}
+	return firstLogIndex > 0 && index < firstLogIndex
 }
 
 // processAppendEntriesReply 负责处理从对等节点返回的 AppendEntries 响应。
@@ -153,7 +244,7 @@ func (r *Raft) processAppendEntriesReply(peerID int, args *param.AppendEntriesAr
 	}
 
 	if reply.Term > r.currentTerm {
-		log.Infof("[Log Replication] Node %d found higher term %d from peer %d, becomes Follower", r.id, reply.Term, peerID)
+		log.Debugf("[Log Replication] Node %d found higher term %d from peer %d, becomes Follower", r.id, reply.Term, peerID)
 		err := r.becomeFollower(reply.Term)
 		if err != nil {
 			log.Errorf("[Replication] Node %d failed to persist state when stepping down to Follower: %v", r.id, err)
@@ -228,13 +319,19 @@ func (r *Raft) updateCommitIndex() {
 	newCommitIndex := r.findMajorityCommitIndex()
 
 	if newCommitIndex > r.commitIndex {
-		entry, err := r.store.GetEntry(newCommitIndex)
-		if err != nil || entry == nil {
-			log.Errorf("[Replication] Node %d failed to get entry for new commit index %d: %v", r.id, newCommitIndex, err)
+		term, err := r.getLogTermLocked(newCommitIndex)
+		if err != nil {
+			if errors.Is(err, errLogEntryNotFound) {
+				r.refreshCachedLastLogIndexLocked()
+				if newCommitIndex > r.cachedLastLogIndex {
+					return
+				}
+			}
+			log.Errorf("[Replication] Node %d failed to get term for new commit index %d: %v", r.id, newCommitIndex, err)
 			return
 		}
 
-		if entry.Term == r.currentTerm {
+		if term == r.currentTerm {
 			log.Debugf("[Log Replication] Node %d advances commitIndex to %d (term=%d)", r.id, newCommitIndex, r.currentTerm)
 			r.commitIndex = newCommitIndex
 			r.startApplyLogsLocked()
@@ -675,6 +772,10 @@ func (r *Raft) fetchEntriesToApply() ([]param.LogEntry, uint64) {
 		for i := r.lastApplied + 1; i <= r.commitIndex; i++ {
 			entry, err := r.store.GetEntry(i)
 			if err != nil || entry == nil {
+				if err == nil && r.advanceLastAppliedPastCompactedLogLocked(i) {
+					i = r.lastApplied
+					continue
+				}
 				log.Fatalf("[FATAL] Node %d could not retrieve committed log entry %d to apply it. Error: %v", r.id, i, err)
 				r.mu.Unlock()
 				r.appendEntriesMu.Unlock()
@@ -692,12 +793,45 @@ func (r *Raft) fetchEntriesToApply() ([]param.LogEntry, uint64) {
 	return entries, lastAppliedBeforeUpdate
 }
 
+func (r *Raft) advanceLastAppliedPastCompactedLogLocked(missingIndex uint64) bool {
+	snapshot := r.snapshot
+	if snapshot == nil || snapshot.LastIncludedIndex < missingIndex {
+		storedSnapshot, err := r.store.ReadSnapshot()
+		if err != nil {
+			log.Errorf("[State Machine] Node %d failed to read snapshot while applying compacted entry %d: %v", r.id, missingIndex, err)
+			return false
+		}
+		if storedSnapshot != nil {
+			snapshot = storedSnapshot
+			r.snapshot = storedSnapshot
+		}
+	}
+
+	if snapshot == nil || snapshot.LastIncludedIndex < missingIndex {
+		return false
+	}
+
+	if r.lastApplied < snapshot.LastIncludedIndex {
+		log.Debugf("[State Machine] Node %d skips compacted entries through snapshot index %d", r.id, snapshot.LastIncludedIndex)
+		r.lastApplied = snapshot.LastIncludedIndex
+		r.lastAppliedCond.Broadcast()
+	}
+	return true
+}
+
 // dispatchEntries 遍历日志条目切片，并根据命令类型将其分发给具体的处理函数。
 func (r *Raft) dispatchEntries(entries []param.LogEntry) {
 	for _, entry := range entries {
 		var result any
+		clientID, sequenceNum, hasClient := param.ClientCommandMetadata(entry.Command)
+		appliedEntry := entry
+		appliedEntry.Command = param.UnwrapClientCommand(entry.Command)
+		if hasClient && r.isClientCommandApplied(clientID, sequenceNum) {
+			r.completeAppliedEntry(entry.Index, nil, clientID, sequenceNum, hasClient)
+			continue
+		}
 
-		switch cmd := entry.Command.(type) {
+		switch cmd := appliedEntry.Command.(type) {
 		case param.ConfigChangeCommand:
 			// 配置变更命令，持有锁处理
 			r.applyConfigChange(cmd, entry.Index)
@@ -705,21 +839,41 @@ func (r *Raft) dispatchEntries(entries []param.LogEntry) {
 			result = nil
 		default:
 			// 普通命令：先应用状态机（不持有锁）
-			result = r.stateMachine.Apply(entry)
+			r.stateMachineMu.Lock()
+			result = r.stateMachine.Apply(appliedEntry)
+			r.stateMachineMu.Unlock()
 
 			// 发送到 commitChan（不持有锁）
-			r.applyStateMachineCommand(entry)
+			r.applyStateMachineCommand(appliedEntry)
 		}
 
-		r.completeAppliedEntry(entry.Index, result)
+		r.completeAppliedEntry(entry.Index, result, clientID, sequenceNum, hasClient)
 	}
 }
 
-func (r *Raft) completeAppliedEntry(index uint64, result any) {
+func (r *Raft) isClientCommandApplied(clientID, sequenceNum int64) bool {
 	r.mu.Lock()
-	notifyChan, ok := r.notifyApply[index]
-	if ok {
+	defer r.mu.Unlock()
+	lastSeq, exists := r.clientSessions[clientID]
+	return exists && sequenceNum <= lastSeq
+}
+
+func (r *Raft) completeAppliedEntry(index uint64, result any, clientID, sequenceNum int64, hasClient bool) {
+	r.mu.Lock()
+	notifyChans := r.notifyApply[index]
+	if len(notifyChans) > 0 {
 		delete(r.notifyApply, index)
+	}
+	if hasClient {
+		if r.clientSessions == nil {
+			r.clientSessions = make(map[int64]int64)
+		}
+		key := clientRequestKey{clientID: clientID, sequenceNum: sequenceNum}
+		if lastSeq, exists := r.clientSessions[clientID]; !exists || sequenceNum > lastSeq {
+			r.clientSessions[clientID] = sequenceNum
+		}
+		delete(r.pendingClientRequests, key)
+		delete(r.pendingLogClients, index)
 	}
 	if index > r.lastApplied {
 		r.lastApplied = index
@@ -727,7 +881,7 @@ func (r *Raft) completeAppliedEntry(index uint64, result any) {
 	}
 	r.mu.Unlock()
 
-	if ok {
+	for _, notifyChan := range notifyChans {
 		log.Debugf("[Client] dispatchEntries: Notifying for index %d", index)
 		notifyChan <- result
 	}
@@ -742,7 +896,7 @@ func (r *Raft) applyConfigChange(cmd param.ConfigChangeCommand, entryIndex uint6
 		r.inJointConsensus = true
 		r.newPeerIDs = cmd.NewPeerIDs
 		r.jointConfigIndex = entryIndex
-		log.Infof("[Config Change] Node %d entering joint consensus at index %d.", r.id, entryIndex)
+		log.Debugf("[Config Change] Node %d entering joint consensus at index %d.", r.id, entryIndex)
 
 		if r.nextIndex == nil {
 			r.nextIndex = make(map[int]uint64)
@@ -785,13 +939,13 @@ func (r *Raft) applyConfigChange(cmd param.ConfigChangeCommand, entryIndex uint6
 	r.newPeerIDs = nil
 	r.inJointConsensus = false
 	r.jointConfigIndex = 0
-	log.Infof("[Config Change] Node %d has transitioned to new configuration at index %d.", r.id, entryIndex)
+	log.Debugf("[Config Change] Node %d has transitioned to new configuration at index %d.", r.id, entryIndex)
 
 	// 检查自己是否还属于新配置。
 	// 如果 Leader 发现自己被移除了，必须立即“退位” (Step Down)。
 	_, exists := findPeer(r.id, r.peerIDs)
 	if !exists && r.getState() == Leader {
-		log.Infof("[Config Change] Leader %d detected it is NOT in the new configuration. Stepping down.", r.id)
+		log.Debugf("[Config Change] Leader %d detected it is NOT in the new configuration. Stepping down.", r.id)
 
 		// 自动降级为 Follower。
 		// 使用 r.currentTerm 即可，因为这不是因为发现了更高任期，而是因为配置变更逻辑。
@@ -850,7 +1004,7 @@ func (r *Raft) proposeNewConfigEntry() {
 	}
 	// 更新缓存
 	r.cachedLastLogIndex = newIndex
-	log.Infof("[Replication] leader %d proposed final C_new config entry at index %d", r.id, newIndex)
+	log.Debugf("[Replication] leader %d proposed final C_new config entry at index %d", r.id, newIndex)
 }
 
 // findPeer 在给定的 peers 列表中查找指定的 id。

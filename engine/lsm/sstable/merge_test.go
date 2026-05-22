@@ -61,3 +61,31 @@ func TestCompactAndMergeBlocks_Basic(t *testing.T) {
 	assert.False(t, sst[0].MayContain("nonexistent"))
 	assert.False(t, sst[0].MayContain("deletedKey"), "Deleted key should not be in filter")
 }
+
+func TestCompactAndMergeKVs_PreservesNewestDuplicateByInputOrder(t *testing.T) {
+	tmpDir := t.TempDir()
+	manager := NewSSTableManager(tmpDir)
+
+	tables := manager.CompactAndMergeKVs([]kv.KeyValuePair{
+		{Key: "log:0001", Value: []byte("new")},
+		{Key: "log:0001", Value: []byte("old")},
+		{Key: "log:0002", Value: []byte("next")},
+	}, 1)
+
+	assert.Len(t, tables, 1)
+	assert.Len(t, tables[0].DataBlock.Entries, 2)
+	assert.Equal(t, kv.Value("new"), tables[0].DataBlock.Entries[0])
+	assert.Equal(t, kv.Value("next"), tables[0].DataBlock.Entries[1])
+}
+
+func TestCompactAndMergeKVs_MaxLevelTombstoneSuppressesOlderValue(t *testing.T) {
+	tmpDir := t.TempDir()
+	manager := NewSSTableManager(tmpDir)
+
+	tables := manager.CompactAndMergeKVs([]kv.KeyValuePair{
+		{Key: "log:0001", Value: kv.DeletedValue},
+		{Key: "log:0001", Value: []byte("old")},
+	}, manager.maxSSTableLevel)
+
+	assert.Empty(t, tables)
+}

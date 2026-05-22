@@ -26,6 +26,7 @@ type Manager struct {
 	Mem               *MemTable
 	IMems             []*IMemTable
 	maxIMemTableCount int
+	flushing          map[uint64]bool
 }
 
 func NewMemTableManager(walPath string) *Manager {
@@ -39,6 +40,7 @@ func NewMemTableManager(walPath string) *Manager {
 		Mem:               NewMemTable(idGenerator.Add(1), walPath),
 		IMems:             make([]*IMemTable, 0),
 		maxIMemTableCount: config.Conf.LSM.MaxIMemTableCount,
+		flushing:          make(map[uint64]bool),
 	}
 }
 
@@ -118,18 +120,45 @@ func (m *Manager) GetAll() []*IMemTable {
 
 // promoteLocked：仅在已持有写锁的情况下调用！
 func (m *Manager) promoteLocked() *IMemTable {
-	var evicted *IMemTable
-	if len(m.IMems) >= m.maxIMemTableCount {
-		evicted = m.IMems[0]
-		m.IMems = m.IMems[1:]
-		log.Warn("[MemTableManager] Too many Immutable MemTables, evicting oldest")
-	}
-
 	imem := NewIMemTable(m.Mem)
 	m.IMems = append(m.IMems, imem)
 	m.Mem = NewMemTable(idGenerator.Add(1), m.walPath)
 
-	return evicted
+	if len(m.IMems) <= m.maxIMemTableCount {
+		return nil
+	}
+
+	for _, candidate := range m.IMems {
+		if !m.flushing[candidate.ID()] {
+			m.flushing[candidate.ID()] = true
+			log.Debugf("[MemTableManager] Immutable MemTable %d scheduled for flush", candidate.ID())
+			return candidate
+		}
+	}
+
+	log.Warn("[MemTableManager] Immutable MemTables exceed limit but all are already flushing")
+	return nil
+}
+
+func (m *Manager) CompleteFlush(imem *IMemTable, success bool) {
+	if imem == nil {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.flushing, imem.ID())
+	if !success {
+		return
+	}
+
+	for i, existing := range m.IMems {
+		if existing.ID() == imem.ID() {
+			m.IMems = append(m.IMems[:i], m.IMems[i+1:]...)
+			return
+		}
+	}
 }
 
 // ForcePromote 强制将当前 MemTable 转换为 Immutable MemTable，并返回新生成的 IMemTable。
@@ -165,6 +194,8 @@ func (m *Manager) Recover() error {
 	defer m.mu.Unlock()
 
 	ResetIDGenerator()
+	m.IMems = m.IMems[:0]
+	m.flushing = make(map[uint64]bool)
 	// 收集所有 WAL 恢复数据
 	files, err := os.ReadDir(m.walPath) // 返回的是文件名，而不是文件完整路径
 	if err != nil {
@@ -191,17 +222,8 @@ func (m *Manager) Recover() error {
 			idGenerator.Add(utils.ExtractID(file.Name()))
 		} else {
 			// 其他的都作为 IMemTable
-			if err = mem.Close(); err != nil {
-				log.Errorf("[MemTableManager] Close WAL file %s for imemtable failed: %s", file.Name(), err.Error())
-				return err
-			}
 			m.IMems = append(m.IMems, NewIMemTable(mem))
 		}
-	}
-
-	// 保证最多 10 个 IMemTable
-	if len(m.IMems) > m.maxIMemTableCount {
-		m.IMems = m.IMems[len(m.IMems)-m.maxIMemTableCount:]
 	}
 
 	log.Debugf("[MemTableManager] Recovered %d Immutable MemTables and 1 Active MemTable", len(m.IMems))

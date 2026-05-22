@@ -38,6 +38,7 @@ type Manager struct {
 	// 异步合并控制
 	compactionCond   *sync.Cond
 	compactingLevels map[int]bool // 记录各层级的压缩状态
+	compactionWG     sync.WaitGroup
 
 	minSSTableLevel int
 	maxSSTableLevel int
@@ -78,7 +79,6 @@ func NewSSTableManager(sstPath string) *Manager {
 // CreateNewSSTable 将 imem 数据构建为 SSTable，写入到磁盘，然后将其元数据添加到内存中。
 func (m *Manager) CreateNewSSTable(imem *memtable.IMemTable) error {
 	sst := BuildSSTableFromIMemTable(imem, m.sstPath)
-	defer imem.Clean() // 删除 WAL 文件
 
 	// 写入 Level0 文件
 	filePath := sstableFilePath(sst.id, sst.level, m.sstPath)
@@ -97,6 +97,7 @@ func (m *Manager) CreateNewSSTable(imem *memtable.IMemTable) error {
 		return fmt.Errorf("compaction failed: %w", err)
 	}
 
+	imem.Clean() // 删除已经成功落盘的 WAL 文件
 	return nil
 }
 
@@ -164,7 +165,10 @@ func (m *Manager) isCompacting(level int) bool {
 }
 
 func (m *Manager) searchFromLevel0(key kv.Key) (kv.Value, bool, error) {
-	tables := m.getLevelTables(m.minSSTableLevel)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	tables := m.levels[m.minSSTableLevel]
 
 	// 在当前层级中按表ID降序查找
 	for _, table := range tables {
@@ -298,8 +302,13 @@ func (m *Manager) addTable(table *SSTable) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.addTableLocked(table)
+}
+
+func (m *Manager) addTableLocked(table *SSTable) {
 	table.DataBlock = block.NewDataBlock()
 	level := table.level
+	m.removeTableMetadataLocked(table.FilePath(), level)
 	tables := m.levels[level]
 
 	// 直接插入到列表开头（保持降序）
@@ -322,37 +331,26 @@ func (m *Manager) addTable(table *SSTable) {
 	}
 }
 
+type sstableRemoval struct {
+	path  string
+	level int
+}
+
+func sstableRemovals(paths []string, level int) []sstableRemoval {
+	removals := make([]sstableRemoval, 0, len(paths))
+	for _, path := range paths {
+		removals = append(removals, sstableRemoval{path: path, level: level})
+	}
+	return removals
+}
+
 // removeOldSSTables 删除旧的 SSTable 文件
 func (m *Manager) removeOldSSTables(oldFiles []string, level int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	for _, oldPath := range oldFiles {
-		if sst, exists := m.fileIndex[oldPath]; exists {
-			// 从层级中移除
-			tables := m.levels[level]
-			for i, t := range tables {
-				if t.id == sst.id {
-					m.levels[level] = append(tables[:i], tables[i+1:]...)
-					break
-				}
-			}
-			// 从稀疏索引中移除
-			if level > m.minSSTableLevel {
-				sparseIndexes := m.sparseIndexes[level-1]
-				for i, t := range sparseIndexes {
-					if t.id == sst.id {
-						m.sparseIndexes[level-1] = append(sparseIndexes[:i], sparseIndexes[i+1:]...)
-						break
-					}
-				}
-			}
-		}
-		// 从文件索引中移除
-		delete(m.fileIndex, oldPath)
-
-		// 从 totalMap 中移除
-		m.totalMap[level] = utils.RemoveString(m.totalMap[level], oldPath)
+		m.removeTableMetadataLocked(oldPath, level)
 
 		// 物理删除文件
 		if err := os.Remove(oldPath); err != nil {
@@ -364,19 +362,83 @@ func (m *Manager) removeOldSSTables(oldFiles []string, level int) error {
 	return nil
 }
 
-// addNewSSTables 添加新的 SSTable 到指定层级
-func (m *Manager) addNewSSTables(newTables []*SSTable) error {
-	for _, nt := range newTables {
-		// 写入磁盘
-		if err := nt.EncodeTo(nt.FilePath()); err != nil {
-			log.Errorf("[SSTableManager] Encode sstable to file %s error: %s", nt.FilePath(), err.Error())
-			return fmt.Errorf("encode sstable failed: %w", err)
-		}
-
-		// 添加到内存
-		m.addTable(nt)
+func (m *Manager) removeTableMetadataLocked(path string, level int) {
+	var targetID uint64
+	if sst, exists := m.fileIndex[path]; exists {
+		targetID = sst.id
 	}
 
+	for lvl := m.minSSTableLevel; lvl <= m.maxSSTableLevel; lvl++ {
+		tables := m.levels[lvl]
+		if len(tables) == 0 {
+			continue
+		}
+		filtered := tables[:0]
+		for _, table := range tables {
+			if table.FilePath() == path || (targetID != 0 && table.id == targetID) {
+				continue
+			}
+			filtered = append(filtered, table)
+		}
+		m.levels[lvl] = filtered
+
+		if lvl > m.minSSTableLevel {
+			sparseIndexes := m.sparseIndexes[lvl-1]
+			filteredSparse := sparseIndexes[:0]
+			for _, table := range sparseIndexes {
+				if table.FilePath() == path || (targetID != 0 && table.id == targetID) {
+					continue
+				}
+				filteredSparse = append(filteredSparse, table)
+			}
+			m.sparseIndexes[lvl-1] = filteredSparse
+		}
+	}
+
+	// 从文件索引中移除
+	delete(m.fileIndex, path)
+
+	// 从 totalMap 中移除
+	for lvl, files := range m.totalMap {
+		m.totalMap[lvl] = utils.RemoveString(files, path)
+	}
+}
+
+func (m *Manager) encodeSSTables(newTables []*SSTable) error {
+	for _, table := range newTables {
+		if err := table.EncodeTo(table.FilePath()); err != nil {
+			log.Errorf("[SSTableManager] Encode sstable to file %s error: %s", table.FilePath(), err.Error())
+			return fmt.Errorf("encode sstable failed: %w", err)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) installCompactedSSTables(removals []sstableRemoval, newTables []*SSTable) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, removal := range removals {
+		m.removeTableMetadataLocked(removal.path, removal.level)
+	}
+	for _, table := range newTables {
+		m.addTableLocked(table)
+	}
+	for _, removal := range removals {
+		if err := os.Remove(removal.path); err != nil && !os.IsNotExist(err) {
+			log.Warnf("[SSTableManager] Remove compacted file %s error: %s", removal.path, err.Error())
+		}
+	}
+}
+
+// addNewSSTables 添加新的 SSTable 到指定层级
+func (m *Manager) addNewSSTables(newTables []*SSTable) error {
+	if err := m.encodeSSTables(newTables); err != nil {
+		return err
+	}
+	for _, nt := range newTables {
+		m.addTable(nt)
+	}
 	return nil
 }
 
@@ -401,7 +463,11 @@ func (m *Manager) getFilesByLevel(level int) []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	return append([]string{}, m.totalMap[level]...)
+	files := make([]string, 0, len(m.levels[level]))
+	for _, table := range m.levels[level] {
+		files = append(files, table.FilePath())
+	}
+	return files
 }
 
 // isLevelNeedToBeMerged 检查层级是否需要合并
@@ -411,6 +477,10 @@ func (m *Manager) isLevelNeedToBeMerged(level int) bool {
 
 func (m *Manager) maxFileNumsInLevel(level int) int {
 	return int(math.Pow(float64(m.levelSizeBase), float64(level+1)))
+}
+
+func (m *Manager) WaitForCompactions() {
+	m.compactionWG.Wait()
 }
 
 func (m *Manager) getSSTableByPath(path string) (*SSTable, bool) {
@@ -427,8 +497,10 @@ func (m *Manager) GetAllFiles() []string {
 	defer m.mu.RUnlock()
 
 	var allFiles []string
-	for _, files := range m.totalMap {
-		allFiles = append(allFiles, files...)
+	for _, tables := range m.levels {
+		for _, table := range tables {
+			allFiles = append(allFiles, table.FilePath())
+		}
 	}
 	return allFiles
 }

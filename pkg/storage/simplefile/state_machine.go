@@ -96,7 +96,7 @@ func (sm *StateMachine) Apply(entry param.LogEntry) any {
 	defer sm.mu.Unlock()
 
 	var cmd param.KVCommand
-	if err := json.Unmarshal(entry.Command.([]byte), &cmd); err != nil {
+	if err := json.Unmarshal(param.UnwrapClientCommand(entry.Command).([]byte), &cmd); err != nil {
 		panic(fmt.Sprintf("failed to unmarshal command: %v", err))
 	}
 

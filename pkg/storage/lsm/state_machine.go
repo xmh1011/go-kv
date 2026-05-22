@@ -1,10 +1,14 @@
 package lsm
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/xmh1011/go-kv/engine/lsm/database"
@@ -14,6 +18,8 @@ import (
 )
 
 var ErrKeyNotFound = kvstore.ErrKeyNotFound
+
+var lsmSnapshotMagic = []byte("GOKV-LSM-SNAPSHOT\x00\x01")
 
 // StateMachineAdapter 实现了 storage.StateMachine 接口，
 // 将 Raft 的 Apply 请求适配到底层的 LSM 数据库。
@@ -32,7 +38,7 @@ func NewStateMachineAdapter(db *database.Database) *StateMachineAdapter {
 func (lsm *StateMachineAdapter) Apply(entry param.LogEntry) any {
 	// 1. 解析命令
 	var cmd param.KVCommand
-	cmdBytes, ok := entry.Command.([]byte)
+	cmdBytes, ok := param.UnwrapClientCommand(entry.Command).([]byte)
 	if !ok {
 		log.Errorf("[LSMAdapter] Apply failed: command is not []byte, but %T", entry.Command)
 		return fmt.Errorf("invalid command format: not []byte")
@@ -82,7 +88,7 @@ func (lsm *StateMachineAdapter) Get(key string) (string, error) {
 // 1. 强制将所有 MemTable flush 到磁盘。
 // 2. 获取所有 SSTable 文件的路径列表。
 // 3. 读取所有 SSTable 文件的内容。
-// 4. 将文件名（相对路径）和内容打包成 map[string][]byte 并序列化。
+// 4. 将文件名（相对路径）和内容打包成长度前缀的二进制归档。
 func (lsm *StateMachineAdapter) GetSnapshot() ([]byte, error) {
 	log.Debug("[LSMAdapter] Creating snapshot...")
 
@@ -115,10 +121,11 @@ func (lsm *StateMachineAdapter) GetSnapshot() ([]byte, error) {
 		snapshotData[relPath] = content
 	}
 
-	// 4. 序列化
-	data, err := json.Marshal(snapshotData)
+	// 4. 序列化。避免 JSON 对 []byte 做 base64 编码，减少快照生成
+	// 在状态机锁内的 CPU 和内存放大。
+	data, err := encodeSnapshotData(snapshotData)
 	if err != nil {
-		log.Errorf("[LSMAdapter] Failed to marshal snapshot data: %v", err)
+		log.Errorf("[LSMAdapter] Failed to encode snapshot data: %v", err)
 		return nil, err
 	}
 
@@ -136,8 +143,8 @@ func (lsm *StateMachineAdapter) ApplySnapshot(snapshot []byte) error {
 	log.Debug("[LSMAdapter] Applying snapshot...")
 
 	// 1. 反序列化
-	var snapshotData map[string][]byte
-	if err := json.Unmarshal(snapshot, &snapshotData); err != nil {
+	snapshotData, err := decodeSnapshotData(snapshot)
+	if err != nil {
 		log.Errorf("[LSMAdapter] Failed to unmarshal snapshot data: %v", err)
 		return err
 	}
@@ -201,6 +208,94 @@ func (lsm *StateMachineAdapter) ApplySnapshot(snapshot []byte) error {
 	}
 
 	return nil
+}
+
+func encodeSnapshotData(files map[string][]byte) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.Write(lsmSnapshotMagic)
+
+	if len(files) > int(^uint32(0)) {
+		return nil, fmt.Errorf("too many snapshot files: %d", len(files))
+	}
+	if err := binary.Write(&buf, binary.BigEndian, uint32(len(files))); err != nil {
+		return nil, err
+	}
+
+	paths := make([]string, 0, len(files))
+	for path := range files {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	for _, path := range paths {
+		pathBytes := []byte(path)
+		content := files[path]
+		if len(pathBytes) > int(^uint32(0)) {
+			return nil, fmt.Errorf("snapshot path too long: %s", path)
+		}
+		if err := binary.Write(&buf, binary.BigEndian, uint32(len(pathBytes))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(pathBytes); err != nil {
+			return nil, err
+		}
+		if err := binary.Write(&buf, binary.BigEndian, uint64(len(content))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(content); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+func decodeSnapshotData(snapshot []byte) (map[string][]byte, error) {
+	if !bytes.HasPrefix(snapshot, lsmSnapshotMagic) {
+		var legacy map[string][]byte
+		if err := json.Unmarshal(snapshot, &legacy); err != nil {
+			return nil, err
+		}
+		return legacy, nil
+	}
+
+	reader := bytes.NewReader(snapshot[len(lsmSnapshotMagic):])
+	var count uint32
+	if err := binary.Read(reader, binary.BigEndian, &count); err != nil {
+		return nil, err
+	}
+
+	files := make(map[string][]byte, int(count))
+	for i := uint32(0); i < count; i++ {
+		var pathLen uint32
+		if err := binary.Read(reader, binary.BigEndian, &pathLen); err != nil {
+			return nil, err
+		}
+		if pathLen == 0 || uint64(pathLen) > uint64(reader.Len()) {
+			return nil, fmt.Errorf("invalid snapshot path length %d", pathLen)
+		}
+		pathBytes := make([]byte, int(pathLen))
+		if _, err := io.ReadFull(reader, pathBytes); err != nil {
+			return nil, err
+		}
+
+		var contentLen uint64
+		if err := binary.Read(reader, binary.BigEndian, &contentLen); err != nil {
+			return nil, err
+		}
+		if contentLen > uint64(reader.Len()) {
+			return nil, fmt.Errorf("invalid snapshot content length %d", contentLen)
+		}
+		content := make([]byte, int(contentLen))
+		if _, err := io.ReadFull(reader, content); err != nil {
+			return nil, err
+		}
+		files[string(pathBytes)] = content
+	}
+
+	if reader.Len() != 0 {
+		return nil, fmt.Errorf("snapshot has %d trailing bytes", reader.Len())
+	}
+	return files, nil
 }
 
 // Close 关闭底层的 LSM 数据库

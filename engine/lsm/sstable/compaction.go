@@ -13,7 +13,7 @@ import (
 // 1. 收集 Level0 文件，解码其 DataBlock，并统计全局 key 区间。
 // 2. 从 Level1 中找出与该区间交集的文件，将其 DataBlock 一并取出。
 // 3. 使用归并排序将所有块合并分块，产出新 SSTable（写入 Level1）。
-// 4. 删除旧 Level0 和 Level1 文件，并加入新文件记录。
+// 4. 先写入新 SSTable，再原子替换旧 Level0/Level1 元数据并清理旧文件。
 // 5. 如果 Level1 超限，异步触发后续合并。
 // Compaction 执行 Level0 的同步合并，并触发后续异步合并
 func (m *Manager) Compaction() error {
@@ -39,7 +39,11 @@ func (m *Manager) Compaction() error {
 	// 触发下一层级异步压缩（如果需要）
 	if m.isLevelNeedToBeMerged(m.minSSTableLevel + 1) {
 		log.Debugf("[Compaction] Triggering async compaction for level %d", m.minSSTableLevel+1)
-		go m.asyncCompactLevel(m.minSSTableLevel + 1)
+		m.compactionWG.Add(1)
+		go func() {
+			defer m.compactionWG.Done()
+			m.asyncCompactLevel(m.minSSTableLevel + 1)
+		}()
 	}
 
 	return nil
@@ -76,9 +80,10 @@ func (m *Manager) asyncCompactLevel(level int) {
 
 // compactLevel 同步合并指定层级
 func (m *Manager) compactLevel(level int) error {
-	// 标记当前层级开始压缩
-	m.startCompaction(level)
-	defer m.endCompaction(level)
+	// 标记当前层级及目标层级开始压缩。合并会同时读取/替换 level
+	// 和 level+1 的元数据，因此相邻层级的查询和合并都需要等待。
+	compactingLevels := m.compactionLevelsFor(level)
+	m.waitAndStartCompaction(compactingLevels)
 
 	// 1. 读取当前层级的所有键值对
 	files := m.getFilesByLevel(level)
@@ -94,6 +99,7 @@ func (m *Manager) compactLevel(level int) error {
 	}
 	allPairs, err := m.loadLevelData(files)
 	if err != nil {
+		m.endCompactionLevels(compactingLevels)
 		log.Errorf("[Compaction] Load level %d data error: %s", level, err.Error())
 		return fmt.Errorf("load level %d data error: %w", level, err)
 	}
@@ -105,6 +111,7 @@ func (m *Manager) compactLevel(level int) error {
 		minK, maxK := getGlobalKeyRangeFromPairs(allPairs)
 		nextLevelPairs, oldNextFiles, err = m.mergeNextLevelFiles(level+1, minK, maxK)
 		if err != nil {
+			m.endCompactionLevels(compactingLevels)
 			log.Errorf("[Compaction] Merge next level files error: %s", err.Error())
 			return fmt.Errorf("merge next level files error: %w", err)
 		}
@@ -114,25 +121,23 @@ func (m *Manager) compactLevel(level int) error {
 	// 3. 合并并生成新 SSTable
 	newTables := m.CompactAndMergeKVs(allPairs, level+1) // 目标层级为当前+1
 
-	// 4. 清理旧文件
-	if err := m.removeOldSSTables(files, level); err != nil {
-		log.Errorf("[Compaction] Remove old SSTables error: %s", err.Error())
-		return fmt.Errorf("remove old SSTables error: %w", err)
-	}
-	if len(oldNextFiles) > 0 {
-		if err := m.removeOldSSTables(oldNextFiles, level+1); err != nil {
-			log.Errorf("[Compaction] Remove old next level SSTables error: %s", err.Error())
-			return fmt.Errorf("remove old next level SSTables error: %w", err)
-		}
+	// 4. 先把新文件完整写入磁盘，再原子切换内存元数据。
+	if err := m.encodeSSTables(newTables); err != nil {
+		m.endCompactionLevels(compactingLevels)
+		log.Errorf("[Compaction] Encode new SSTables error: %s", err.Error())
+		return fmt.Errorf("encode new SSTables error: %w", err)
 	}
 
-	// 5. 添加新文件
-	if err := m.addNewSSTables(newTables); err != nil {
-		log.Errorf("[Compaction] Add new SSTables error: %s", err.Error())
-		return fmt.Errorf("add new SSTables error: %w", err)
+	removals := make([]sstableRemoval, 0, len(files)+len(oldNextFiles))
+	removals = append(removals, sstableRemovals(files, level)...)
+	if len(oldNextFiles) > 0 {
+		removals = append(removals, sstableRemovals(oldNextFiles, level+1)...)
 	}
+	m.installCompactedSSTables(removals, newTables)
 
 	log.Debugf("[Compaction] Level %d compaction finished, generated %d new tables", level, len(newTables))
+
+	m.endCompactionLevels(compactingLevels)
 
 	// 6. 如果目标层级仍需压缩，递归处理（仅对中间层级）
 	if level < m.maxSSTableLevel && m.isLevelNeedToBeMerged(level+1) {
@@ -140,6 +145,14 @@ func (m *Manager) compactLevel(level int) error {
 	}
 
 	return nil
+}
+
+func (m *Manager) compactionLevelsFor(level int) []int {
+	levels := []int{level}
+	if level < m.maxSSTableLevel {
+		levels = append(levels, level+1)
+	}
+	return levels
 }
 
 // waitCompaction 等待指定层级的压缩完成
@@ -154,20 +167,38 @@ func (m *Manager) waitCompaction(level int) error {
 	return nil
 }
 
-// startCompaction 标记层级开始压缩
-func (m *Manager) startCompaction(level int) {
+// waitAndStartCompaction 等待所有相关层级空闲后一次性标记为压缩中。
+func (m *Manager) waitAndStartCompaction(levels []int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.compactingLevels[level] = true
+	for {
+		blocked := false
+		for _, level := range levels {
+			if m.compactingLevels[level] {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			break
+		}
+		m.compactionCond.Wait()
+	}
+
+	for _, level := range levels {
+		m.compactingLevels[level] = true
+	}
 }
 
-// endCompaction 标记层级压缩完成并广播通知
-func (m *Manager) endCompaction(level int) {
+// endCompactionLevels 标记层级压缩完成并广播通知。
+func (m *Manager) endCompactionLevels(levels []int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	delete(m.compactingLevels, level)
+	for _, level := range levels {
+		delete(m.compactingLevels, level)
+	}
 	m.compactionCond.Broadcast()
 }
 
@@ -179,7 +210,7 @@ func (m *Manager) loadLevelData(files []string) ([]kv.KeyValuePair, error) {
 		sst, ok := m.getSSTableByPath(path)
 		if !ok {
 			log.Errorf("[Compaction] Sstable not found for path: %s", path)
-			continue
+			return nil, fmt.Errorf("sstable metadata not found for path %s", path)
 		}
 
 		pairs, err := sst.GetDataBlockFromFile(path)
@@ -204,7 +235,7 @@ func (m *Manager) mergeNextLevelFiles(level int, minK, maxK kv.Key) ([]kv.KeyVal
 		sst, ok := m.getSSTableByPath(path)
 		if !ok {
 			log.Errorf("[Compaction] Sstable not found for path: %s", path)
-			continue
+			return nil, nil, fmt.Errorf("sstable metadata not found for path %s", path)
 		}
 
 		if overlapRange(minK, maxK, sst) {
