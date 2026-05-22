@@ -2,6 +2,7 @@ package tests
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -15,6 +16,8 @@ import (
 	"github.com/xmh1011/go-kv/pkg/transport"
 	"github.com/xmh1011/go-kv/raft"
 )
+
+var errLongRunningTestStopped = errors.New("test stopped")
 
 // LongRunningMetrics 记录长时测试的性能指标
 type LongRunningMetrics struct {
@@ -41,9 +44,15 @@ type LongRunningMetrics struct {
 	DataConsistencyOK bool
 	KeysVerified      int64
 	SnapshotCount     int32
+	SnapshotMaxIndex  uint64
 	WALSize           int64
 	MemTableFlushes   int32
 }
+
+const (
+	longRunningSnapshotThreshold = 2 * 1024 * 1024
+	longRunningClientRetries     = 20
+)
 
 // latencySampler 延迟采样器，限制采样数量以控制内存使用
 type latencySampler struct {
@@ -106,7 +115,7 @@ type longRunningCluster struct {
 	dataDir       string
 	// 额外的监控数据
 	leaderElections int32
-	mu              sync.Mutex
+	mu              sync.RWMutex
 }
 
 // newLongRunningCluster 创建用于长时测试的生产环境集群
@@ -166,6 +175,7 @@ func newLongRunningCluster(t *testing.T, nodeCount int) *longRunningCluster {
 
 		// 创建 Raft 实例
 		rf := raft.NewRaft(id, initialPeerIDs, store, sm, c.transports[i], c.commitChans[i])
+		rf.SetSnapshotThreshold(longRunningSnapshotThreshold)
 		c.nodes[i] = rf
 
 		// 注册 Raft 到 Transport
@@ -205,6 +215,122 @@ func (c *longRunningCluster) shutdown() {
 	}
 }
 
+func (c *longRunningCluster) nodeCount() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.nodes)
+}
+
+func (c *longRunningCluster) nodeAt(index int) *raft.Raft {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if index < 0 || index >= len(c.nodes) {
+		return nil
+	}
+	return c.nodes[index]
+}
+
+func (c *longRunningCluster) nodesSnapshot() []*raft.Raft {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	nodes := make([]*raft.Raft, len(c.nodes))
+	copy(nodes, c.nodes)
+	return nodes
+}
+
+func (c *longRunningCluster) snapshotStats() (int32, uint64) {
+	var snapshotNodes int32
+	var maxSnapshotIndex uint64
+	for _, node := range c.nodesSnapshot() {
+		if node == nil || node.IsStopped() {
+			continue
+		}
+		index := node.SnapshotIndex()
+		if index == 0 {
+			continue
+		}
+		snapshotNodes++
+		if index > maxSnapshotIndex {
+			maxSnapshotIndex = index
+		}
+	}
+	return snapshotNodes, maxSnapshotIndex
+}
+
+func (c *longRunningCluster) stateMachineByID(id int) storage.StateMachine {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if id <= 0 || id > len(c.stateMachines) {
+		return nil
+	}
+	return c.stateMachines[id-1]
+}
+
+func (c *longRunningCluster) restartNode(t *testing.T, nodeIndex int) {
+	t.Helper()
+
+	c.mu.RLock()
+	if nodeIndex < 0 || nodeIndex >= len(c.nodes) {
+		c.mu.RUnlock()
+		t.Fatalf("node index %d out of range", nodeIndex)
+	}
+	oldNode := c.nodes[nodeIndex]
+	oldTransport := c.transports[nodeIndex]
+	oldStorage := c.storages[nodeIndex]
+	oldStateMachine := c.stateMachines[nodeIndex]
+	commitChan := c.commitChans[nodeIndex]
+	id := oldNode.ID()
+	addr := c.peerMap[id]
+	peerIDs := make([]int, 0, len(c.peerMap))
+	peerMap := make(map[int]string, len(c.peerMap))
+	for peerID, peerAddr := range c.peerMap {
+		peerIDs = append(peerIDs, peerID)
+		peerMap[peerID] = peerAddr
+	}
+	c.mu.RUnlock()
+
+	oldNode.Stop()
+	if oldTransport != nil {
+		_ = oldTransport.Close()
+	}
+	if oldStorage != nil {
+		_ = oldStorage.Close()
+	}
+	if oldStateMachine != nil {
+		if closer, ok := oldStateMachine.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+	}
+
+	newTrans, err := transport.NewTransport(transport.GrpcTransport, addr)
+	if err != nil {
+		t.Fatalf("failed to recreate gRPC transport for node %d: %v", id, err)
+	}
+
+	store, sm, err := storage.NewStorage(storage.LSMStorage, c.dataDir, id)
+	if err != nil {
+		t.Fatalf("failed to reload LSM storage for node %d: %v", id, err)
+	}
+
+	newRaft := raft.NewRaft(id, peerIDs, store, sm, newTrans, commitChan)
+	newRaft.SetSnapshotThreshold(longRunningSnapshotThreshold)
+	newTrans.SetPeers(peerMap)
+	newTrans.RegisterRaft(newRaft)
+	if err := newTrans.Start(); err != nil {
+		t.Fatalf("failed to restart gRPC transport for node %d: %v", id, err)
+	}
+
+	c.mu.Lock()
+	c.nodes[nodeIndex] = newRaft
+	c.transports[nodeIndex] = newTrans
+	c.storages[nodeIndex] = store
+	c.stateMachines[nodeIndex] = sm
+	c.mu.Unlock()
+
+	go newRaft.Run()
+	t.Logf("[故障恢复] Node %d restarted", id)
+}
+
 // getLeader 获取当前 Leader，超时时间更长以适应长时测试
 func (c *longRunningCluster) getLeader(t *testing.T) *raft.Raft {
 	timeout := time.NewTimer(30 * time.Second)
@@ -215,7 +341,7 @@ func (c *longRunningCluster) getLeader(t *testing.T) *raft.Raft {
 	for {
 		select {
 		case <-ticker.C:
-			for _, node := range c.nodes {
+			for _, node := range c.nodesSnapshot() {
 				if node.IsStopped() {
 					continue
 				}
@@ -239,7 +365,7 @@ func (c *longRunningCluster) waitForAllNodesReady(t *testing.T) {
 		select {
 		case <-ticker.C:
 			allReady := true
-			for _, node := range c.nodes {
+			for _, node := range c.nodesSnapshot() {
 				if node.State() == raft.Dead {
 					allReady = false
 					break
@@ -263,7 +389,7 @@ func (c *longRunningCluster) monitorLeaderChanges(ctx chan struct{}) {
 	for {
 		select {
 		case <-ticker.C:
-			for _, node := range c.nodes {
+			for _, node := range c.nodesSnapshot() {
 				if node.State() == raft.Leader {
 					if lastLeader != nil && lastLeader.ID() != node.ID() {
 						atomic.AddInt32(&c.leaderElections, 1)
@@ -305,23 +431,23 @@ func (c *longRunningCluster) sendRequestToAnyNode(cmd param.KVCommand, maxRetrie
 	var totalLatency time.Duration
 
 	// 初始随机选择一个节点
-	nodeIdx := rand.Intn(len(c.nodes))
-	node := c.nodes[nodeIdx]
+	nodeIdx := rand.Intn(c.nodeCount())
+	node := c.nodeAt(nodeIdx)
+	cmdBytes, _ := json.Marshal(cmd)
+	args := &param.ClientArgs{
+		ClientID:    rand.Int63(),
+		SequenceNum: rand.Int63(),
+		Command:     cmdBytes,
+	}
 
 	for retry := 0; retry < maxRetries; retry++ {
 		// 检查是否应该停止
 		select {
 		case <-stopCh:
-			return false, totalLatency, fmt.Errorf("test stopped")
+			return false, totalLatency, errLongRunningTestStopped
 		default:
 		}
 
-		cmdBytes, _ := json.Marshal(cmd)
-		args := &param.ClientArgs{
-			ClientID:    rand.Int63(),
-			SequenceNum: rand.Int63(),
-			Command:     cmdBytes,
-		}
 		reply := &param.ClientReply{}
 
 		start := time.Now()
@@ -335,26 +461,66 @@ func (c *longRunningCluster) sendRequestToAnyNode(cmd param.KVCommand, maxRetrie
 
 		// 如果收到 NotLeader 响应，使用 LeaderHint 重定向
 		if reply.NotLeader {
-			if reply.LeaderHint > 0 && reply.LeaderHint <= len(c.nodes) {
+			updatedLeader := false
+			if reply.LeaderHint > 0 && reply.LeaderHint <= c.nodeCount() {
 				// 使用 LeaderHint 定位新 Leader
-				node = c.nodes[reply.LeaderHint-1]
+				node = c.nodeAt(reply.LeaderHint - 1)
+				updatedLeader = true
 			} else {
 				// LeaderHint 无效，随机选择一个节点重试
-				node = c.nodes[rand.Intn(len(c.nodes))]
+				if leader := c.findLeader(); leader != nil {
+					node = leader
+					updatedLeader = true
+				} else {
+					node = c.nodeAt(rand.Intn(c.nodeCount()))
+				}
+			}
+			if !updatedLeader && !waitBeforeRetry(stopCh, retryBackoff(retry)) {
+				return false, totalLatency, errLongRunningTestStopped
 			}
 			continue
 		}
 
-		// 其他错误，直接返回
-		return false, totalLatency, err
+		// 其他错误或 leader 端暂时未完成 apply，按真实客户端语义继续重试。
+		node = c.findLeader()
+		if node == nil {
+			time.Sleep(100 * time.Millisecond)
+			node = c.nodeAt(rand.Intn(c.nodeCount()))
+		}
 	}
 
 	return false, totalLatency, fmt.Errorf("max retries exceeded")
 }
 
+func retryBackoff(retry int) time.Duration {
+	delay := time.Duration(retry+1) * 25 * time.Millisecond
+	if delay > 150*time.Millisecond {
+		return 150 * time.Millisecond
+	}
+	return delay
+}
+
+func waitBeforeRetry(stopCh <-chan struct{}, delay time.Duration) bool {
+	if delay <= 0 {
+		return true
+	}
+	if stopCh == nil {
+		time.Sleep(delay)
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-stopCh:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 // findLeader 遍历所有节点找到当前 Leader
 func (c *longRunningCluster) findLeader() *raft.Raft {
-	for _, node := range c.nodes {
+	for _, node := range c.nodesSnapshot() {
 		if node.State() == raft.Leader {
 			return node
 		}
@@ -364,23 +530,29 @@ func (c *longRunningCluster) findLeader() *raft.Raft {
 
 // getLeaderByID 根据 LeaderHint ID 获取 Leader 节点
 func (c *longRunningCluster) getLeaderByID(leaderID int) *raft.Raft {
-	if leaderID <= 0 || leaderID > len(c.nodes) {
+	if leaderID <= 0 || leaderID > c.nodeCount() {
 		return nil
 	}
-	return c.nodes[leaderID-1]
+	return c.nodeAt(leaderID - 1)
 }
 
 // sendRequestWithLeaderTracking 向当前 Leader 发送请求，自动跟踪 Leader 变化
 // 当收到 NotLeader 响应时，更新 currentLeader 并重试
 func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic.Value, cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, error) {
 	var totalLatency time.Duration
+	cmdBytes, _ := json.Marshal(cmd)
+	args := &param.ClientArgs{
+		ClientID:    rand.Int63(),
+		SequenceNum: rand.Int63(),
+		Command:     cmdBytes,
+	}
 
 	for retry := 0; retry < maxRetries; retry++ {
 		// 检查是否应该停止
 		if stopCh != nil {
 			select {
 			case <-stopCh:
-				return false, totalLatency, fmt.Errorf("test stopped")
+				return false, totalLatency, errLongRunningTestStopped
 			default:
 			}
 		}
@@ -398,12 +570,6 @@ func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic
 			leader = newLeader
 		}
 
-		cmdBytes, _ := json.Marshal(cmd)
-		args := &param.ClientArgs{
-			ClientID:    rand.Int63(),
-			SequenceNum: rand.Int63(),
-			Command:     cmdBytes,
-		}
 		reply := &param.ClientReply{}
 
 		start := time.Now()
@@ -417,15 +583,18 @@ func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic
 
 		// 如果收到 NotLeader 响应，使用 LeaderHint 更新 Leader
 		if reply.NotLeader {
-			if reply.LeaderHint > 0 && reply.LeaderHint <= len(c.nodes) {
-				newLeader := c.nodes[reply.LeaderHint-1]
+			updatedLeader := false
+			if reply.LeaderHint > 0 && reply.LeaderHint <= c.nodeCount() {
+				newLeader := c.nodeAt(reply.LeaderHint - 1)
 				if !newLeader.IsStopped() && newLeader.State() == raft.Leader {
 					currentLeader.Store(newLeader)
+					updatedLeader = true
 				} else {
 					// LeaderHint 无效或节点不可用，尝试重新查找
 					newLeader = c.findLeader()
 					if newLeader != nil {
 						currentLeader.Store(newLeader)
+						updatedLeader = true
 					}
 				}
 			} else {
@@ -433,13 +602,21 @@ func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic
 				newLeader := c.findLeader()
 				if newLeader != nil {
 					currentLeader.Store(newLeader)
+					updatedLeader = true
 				}
+			}
+			if !updatedLeader && !waitBeforeRetry(stopCh, retryBackoff(retry)) {
+				return false, totalLatency, errLongRunningTestStopped
 			}
 			continue
 		}
 
-		// 其他错误，直接返回
-		return false, totalLatency, err
+		// 其他错误或 leader 端暂时未完成 apply，按真实客户端语义继续重试。
+		newLeader := c.findLeader()
+		if newLeader != nil {
+			currentLeader.Store(newLeader)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	return false, totalLatency, fmt.Errorf("max retries exceeded")
@@ -447,10 +624,7 @@ func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic
 
 // getCurrentLeader 获取当前 Leader
 func (c *longRunningCluster) getCurrentLeader() *raft.Raft {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for _, node := range c.nodes {
+	for _, node := range c.nodesSnapshot() {
 		if node.State() == raft.Leader {
 			return node
 		}
@@ -458,59 +632,152 @@ func (c *longRunningCluster) getCurrentLeader() *raft.Raft {
 	return nil
 }
 
-// verifyDataConsistency 验证所有节点的数据一致性
+type observedValue struct {
+	value  string
+	exists bool
+}
+
+type consistencyTracker struct {
+	mu     sync.RWMutex
+	values map[string]observedValue
+	keys   []string
+}
+
+func newConsistencyTracker() *consistencyTracker {
+	return &consistencyTracker{
+		values: make(map[string]observedValue),
+		keys:   make([]string, 0),
+	}
+}
+
+func (t *consistencyTracker) recordSet(key, value string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.values[key]; !ok {
+		t.keys = append(t.keys, key)
+	}
+	t.values[key] = observedValue{value: value, exists: true}
+}
+
+func (t *consistencyTracker) recordDelete(key string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.values[key]; !ok {
+		t.keys = append(t.keys, key)
+	}
+	t.values[key] = observedValue{}
+}
+
+func (t *consistencyTracker) snapshot(limit int) map[string]observedValue {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if limit <= 0 || limit > len(t.keys) {
+		limit = len(t.keys)
+	}
+	result := make(map[string]observedValue, limit)
+	if limit == 0 {
+		return result
+	}
+
+	start := len(t.keys) - limit
+	for _, key := range t.keys[start:] {
+		result[key] = t.values[key]
+	}
+	return result
+}
+
+func readObserved(sm storage.StateMachine, key string) observedValue {
+	if sm == nil {
+		return observedValue{}
+	}
+	val, err := sm.Get(key)
+	if err != nil {
+		return observedValue{}
+	}
+	return observedValue{value: val, exists: true}
+}
+
+func (c *longRunningCluster) verifyExpectedConsistency(t *testing.T, expected map[string]observedValue) (bool, int64) {
+	return c.verifyExpectedConsistencyWithLog(t, expected, true)
+}
+
+func (c *longRunningCluster) verifyExpectedConsistencyWithLog(t *testing.T, expected map[string]observedValue, logMismatch bool) (bool, int64) {
+	if len(expected) == 0 {
+		return true, 0
+	}
+
+	mismatchCount := int64(0)
+	verifiedCount := int64(0)
+	for _, node := range c.nodesSnapshot() {
+		if node == nil || node.IsStopped() {
+			continue
+		}
+		sm := c.stateMachineByID(node.ID())
+		for key, want := range expected {
+			got := readObserved(sm, key)
+			verifiedCount++
+			if got.exists != want.exists || got.value != want.value {
+				if logMismatch && mismatchCount < 20 {
+					t.Logf("Expected mismatch: Node %d - Key '%s': expected=(exists=%t,value=%q), got=(exists=%t,value=%q)",
+						node.ID(), key, want.exists, want.value, got.exists, got.value)
+				}
+				mismatchCount++
+			}
+		}
+	}
+	return mismatchCount == 0, verifiedCount
+}
+
+func (c *longRunningCluster) waitForExpectedConsistency(t *testing.T, expected map[string]observedValue, timeout time.Duration) (bool, int64) {
+	deadline := time.Now().Add(timeout)
+	var verified int64
+	for time.Now().Before(deadline) {
+		consistent, count := c.verifyExpectedConsistencyWithLog(t, expected, false)
+		verified = count
+		if consistent {
+			return true, verified
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	consistent, count := c.verifyExpectedConsistency(t, expected)
+	return consistent, count
+}
+
+// verifyDataConsistency 验证所有存活节点的数据一致性，包括缺失/删除状态。
 func (c *longRunningCluster) verifyDataConsistency(t *testing.T, sampleKeys []string) (bool, int64) {
 	if len(sampleKeys) == 0 {
 		return true, 0
 	}
 
-	// 从 Leader 获取基准数据
-	var leader *raft.Raft
-	for _, node := range c.nodes {
-		if node.State() == raft.Leader {
-			leader = node
-			break
-		}
-	}
+	leader := c.findLeader()
 	if leader == nil {
 		t.Logf("Warning: No leader found during consistency check")
 		return true, 0
 	}
 
-	leaderSM := c.stateMachines[leader.ID()-1]
-	leaderData := make(map[string]string)
+	leaderSM := c.stateMachineByID(leader.ID())
+	leaderData := make(map[string]observedValue, len(sampleKeys))
 	for _, key := range sampleKeys {
-		val, err := leaderSM.Get(key)
-		if err == nil && val != "" {
-			leaderData[key] = val
-		}
+		leaderData[key] = readObserved(leaderSM, key)
 	}
 
 	mismatchCount := int64(0)
 	verifiedCount := int64(0)
 
-	// 检查所有 Follower 的数据
-	for _, node := range c.nodes {
-		if node.State() == raft.Leader {
+	for _, node := range c.nodesSnapshot() {
+		if node == nil || node.IsStopped() || node.State() == raft.Leader {
 			continue
 		}
-		sm := c.stateMachines[node.ID()-1]
+		sm := c.stateMachineByID(node.ID())
 
 		for key, leaderVal := range leaderData {
-			val, err := sm.Get(key)
-			if err != nil {
-				continue
-			}
+			val := readObserved(sm, key)
 			verifiedCount++
 
-			// 跳过已删除的键
-			if leaderVal == "" || val == "" {
-				continue
-			}
-
-			if val != leaderVal {
-				t.Logf("Data mismatch: Node %d - Key '%s': Leader='%s', Node='%s'",
-					node.ID(), key, leaderVal, val)
+			if val.exists != leaderVal.exists || val.value != leaderVal.value {
+				t.Logf("Data mismatch: Node %d - Key '%s': Leader=(exists=%t,value=%q), Node=(exists=%t,value=%q)",
+					node.ID(), key, leaderVal.exists, leaderVal.value, val.exists, val.value)
 				mismatchCount++
 			}
 		}
@@ -647,20 +914,20 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 	// 性能指标 - 使用 latencySampler 控制内存使用
 	const maxLatencySamples = 10000
 	var (
-		totalOps            int64
-		successOps          int64
-		failedOps           int64
-		writeOps            int64
-		readOps             int64
-		deleteOps           int64
-		bytesRead           int64
-		bytesWritten        int64
-		latencySampler      = newLatencySampler(maxLatencySamples)
-		writeLatencySampler = newLatencySampler(maxLatencySamples)
-		readLatencySampler  = newLatencySampler(maxLatencySamples)
+		totalOps             int64
+		successOps           int64
+		failedOps            int64
+		writeOps             int64
+		readOps              int64
+		deleteOps            int64
+		bytesRead            int64
+		bytesWritten         int64
+		latencySampler       = newLatencySampler(maxLatencySamples)
+		writeLatencySampler  = newLatencySampler(maxLatencySamples)
+		readLatencySampler   = newLatencySampler(maxLatencySamples)
 		deleteLatencySampler = newLatencySampler(maxLatencySamples)
-		keysForVerification []string
-		sampleKeysMutex     sync.Mutex
+		keysForVerification  []string
+		sampleKeysMutex      sync.Mutex
 	)
 
 	// 并发客户端模拟
@@ -687,13 +954,17 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 					r := rand.Float64()
 					var success bool
 					var latency time.Duration
+					var err error
 
 					if r < 0.6 { // 60% 写入操作
 						key := fmt.Sprintf("%s-key-%d-%d", clientPrefix, cid, rand.Intn(50000))
 						value := fmt.Sprintf("%s-val-%d", clientPrefix, rand.Intn(1000000))
 						cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-						success, latency, _ = c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						success, latency, err = c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						if errors.Is(err, errLongRunningTestStopped) {
+							return
+						}
 
 						atomic.AddInt64(&writeOps, 1)
 						writeLatencySampler.add(latency)
@@ -713,7 +984,10 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 						}
 
 						cmd := param.KVCommand{Op: param.OpGet, Key: key}
-						success, latency, _ = c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						success, latency, err = c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						if errors.Is(err, errLongRunningTestStopped) {
+							return
+						}
 
 						atomic.AddInt64(&readOps, 1)
 						readLatencySampler.add(latency)
@@ -724,7 +998,10 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 							key := localKeys[idx]
 							cmd := param.KVCommand{Op: param.OpDelete, Key: key}
 
-							success, latency, _ = c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+							success, latency, err = c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+							if errors.Is(err, errLongRunningTestStopped) {
+								return
+							}
 
 							atomic.AddInt64(&deleteOps, 1)
 							deleteLatencySampler.add(latency)
@@ -857,7 +1134,10 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 					value := fmt.Sprintf("value-%d-%d", cid, rand.Intn(10000000))
 					cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-					success, latency, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+					success, latency, err := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+					if errors.Is(err, errLongRunningTestStopped) {
+						return
+					}
 
 					atomic.AddInt64(&totalOps, 1)
 					if success {
@@ -966,7 +1246,10 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 						value := fmt.Sprintf("val-%d", rand.Intn(100000))
 						cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-						success, latency, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						success, latency, err := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						if errors.Is(err, errLongRunningTestStopped) {
+							return
+						}
 
 						if success {
 							atomic.AddInt64(&successOps, 1)
@@ -987,12 +1270,15 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 						}
 
 						cmd := param.KVCommand{Op: param.OpGet, Key: key}
-						success, latency, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						success, latency, err := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						if errors.Is(err, errLongRunningTestStopped) {
+							return
+						}
 
 						if success {
 							atomic.AddInt64(&successOps, 1)
 							l := currentLeader.Load().(*raft.Raft)
-							val, _ := c.stateMachines[l.ID()-1].Get(key)
+							val, _ := c.stateMachineByID(l.ID()).Get(key)
 							atomic.AddInt64(&bytesRead, int64(len(key)+len(val)))
 							latencySampler.add(latency)
 						} else {
@@ -1020,27 +1306,17 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 		},
 		func() {
 			if failureCount < 2 { // 最多触发2次故障
-				// 随机选择一个 Follower 节点停止
-				var victim *raft.Raft
-				for _, node := range c.nodes {
-					if node.State() != raft.Leader {
-						victim = node
+				victimIndex := -1
+				for _, node := range c.nodesSnapshot() {
+					if node != nil && !node.IsStopped() && node.State() != raft.Leader {
+						victimIndex = node.ID() - 1
 						break
 					}
 				}
 
-				if victim != nil {
-					t.Logf("[故障模拟] 停止节点 %d", victim.ID())
-					victim.Stop()
-
-					// 等待一段时间后恢复
-					go func(id int, node *raft.Raft) {
-						time.Sleep(30 * time.Second)
-						t.Logf("[故障模拟] 恢复节点 %d", id)
-
-						// 重新启动节点（简化处理：不完整重启）
-						// 实际生产环境中需要完整的状态恢复流程
-					}(victim.ID(), victim)
+				if victimIndex >= 0 {
+					t.Logf("[故障模拟] 重启节点 %d", victimIndex+1)
+					c.restartNode(t, victimIndex)
 					failureCount++
 				}
 			}
@@ -1061,6 +1337,208 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 		ErrorRate:         float64(failedOps) / float64(totalOps) * 100,
 		LeaderElections:   atomic.LoadInt32(&c.leaderElections),
 		DataConsistencyOK: true,
+	}
+
+	printLongRunningMetrics(t, &metrics)
+}
+
+// TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots 覆盖生产中的节点重启、快照和严格一致性场景。
+func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
+	duration := 10 * time.Minute
+	if testing.Short() {
+		duration = 1 * time.Minute
+	}
+
+	c := newLongRunningCluster(t, 3)
+	defer c.shutdown()
+
+	t.Logf("=== 10分钟一致性/重启/快照端到端测试 ===")
+	t.Logf("集群配置: 3节点, gRPC传输, LSM存储")
+
+	c.waitForAllNodesReady(t)
+	leader := c.getLeader(t)
+	t.Logf("集群就绪，Leader: Node %d", leader.ID())
+
+	currentLeader := &atomic.Value{}
+	currentLeader.Store(leader)
+
+	monitorCtx := make(chan struct{})
+	go c.monitorLeaderChanges(monitorCtx)
+	defer close(monitorCtx)
+
+	tracker := newConsistencyTracker()
+
+	warmupCount := 300
+	for i := 0; i < warmupCount; i++ {
+		key := fmt.Sprintf("consistency-warmup-%d", i)
+		value := fmt.Sprintf("warmup-value-%d", i)
+		cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
+		success, _, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, longRunningClientRetries, nil)
+		if success {
+			tracker.recordSet(key, value)
+		}
+	}
+	time.Sleep(3 * time.Second)
+
+	const maxLatencySamples = 10000
+	var (
+		totalOps       int64
+		successOps     int64
+		failedOps      int64
+		writeOps       int64
+		readOps        int64
+		deleteOps      int64
+		bytesRead      int64
+		bytesWritten   int64
+		snapshotCount  int32
+		restartCount   int32
+		latencySampler = newLatencySampler(maxLatencySamples)
+	)
+
+	numClients := 6
+	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(numClients)
+
+	for clientID := 0; clientID < numClients; clientID++ {
+		go func(cid int) {
+			defer wg.Done()
+			keySpace := 800
+
+			for {
+				select {
+				case <-stopCh:
+					return
+				default:
+				}
+
+				key := fmt.Sprintf("consistency-client-%d-key-%d", cid, rand.Intn(keySpace))
+				r := rand.Float64()
+				var (
+					success bool
+					latency time.Duration
+					err     error
+				)
+
+				switch {
+				case r < 0.55:
+					value := fmt.Sprintf("value-%d-%d", cid, rand.Int63())
+					cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
+					success, latency, err = c.sendRequestWithLeaderTracking(currentLeader, cmd, longRunningClientRetries, stopCh)
+					if errors.Is(err, errLongRunningTestStopped) {
+						return
+					}
+					atomic.AddInt64(&writeOps, 1)
+					if success {
+						tracker.recordSet(key, value)
+						atomic.AddInt64(&bytesWritten, int64(len(key)+len(value)))
+					}
+
+				case r < 0.85:
+					cmd := param.KVCommand{Op: param.OpGet, Key: key}
+					success, latency, err = c.sendRequestWithLeaderTracking(currentLeader, cmd, longRunningClientRetries, stopCh)
+					if errors.Is(err, errLongRunningTestStopped) {
+						return
+					}
+					atomic.AddInt64(&readOps, 1)
+					if success {
+						atomic.AddInt64(&bytesRead, int64(len(key)))
+					}
+
+				default:
+					cmd := param.KVCommand{Op: param.OpDelete, Key: key}
+					success, latency, err = c.sendRequestWithLeaderTracking(currentLeader, cmd, longRunningClientRetries, stopCh)
+					if errors.Is(err, errLongRunningTestStopped) {
+						return
+					}
+					atomic.AddInt64(&deleteOps, 1)
+					if success {
+						tracker.recordDelete(key)
+					}
+				}
+
+				atomic.AddInt64(&totalOps, 1)
+				if success {
+					atomic.AddInt64(&successOps, 1)
+					latencySampler.add(latency)
+				} else {
+					atomic.AddInt64(&failedOps, 1)
+				}
+			}
+		}(clientID)
+	}
+
+	runner := newTestRunner(duration, stopCh, &wg)
+	runner.runWithFailureInjection(t,
+		func(elapsed time.Duration) {
+			snapshotNodes, maxSnapshotIndex := c.snapshotStats()
+			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 重启: %d, 手动快照: %d, 快照节点: %d, 最大快照索引: %d, Leader切换: %d, 延迟样本: %d",
+				elapsed,
+				atomic.LoadInt64(&totalOps),
+				atomic.LoadInt64(&successOps),
+				atomic.LoadInt64(&failedOps),
+				atomic.LoadInt32(&restartCount),
+				atomic.LoadInt32(&snapshotCount),
+				snapshotNodes,
+				maxSnapshotIndex,
+				atomic.LoadInt32(&c.leaderElections),
+				latencySampler.count())
+		},
+		func() {
+			if atomic.LoadInt32(&restartCount) < 3 {
+				victimIndex := -1
+				for _, node := range c.nodesSnapshot() {
+					if node != nil && !node.IsStopped() && node.State() != raft.Leader {
+						victimIndex = node.ID() - 1
+						break
+					}
+				}
+				if victimIndex >= 0 {
+					t.Logf("[故障模拟] 重启 follower 节点 %d", victimIndex+1)
+					c.restartNode(t, victimIndex)
+					atomic.AddInt32(&restartCount, 1)
+				}
+			}
+
+			leader := c.getLeader(t)
+			currentLeader.Store(leader)
+			if leader.TakeSnapshot() {
+				atomic.AddInt32(&snapshotCount, 1)
+			}
+		})
+
+	expected := tracker.snapshot(1200)
+	finalConsistent, finalVerified := c.waitForExpectedConsistency(t, expected, 45*time.Second)
+	t.Logf("[最终严格一致性检查] 已验证: %d 条节点键组合, 结果: %v", finalVerified, finalConsistent)
+	if !finalConsistent {
+		t.Fatalf("strict consistency check failed after restarts and snapshots")
+	}
+	snapshotNodes, maxSnapshotIndex := c.snapshotStats()
+
+	metrics := LongRunningMetrics{
+		TestName:          "10分钟重启与快照严格一致性测试 (gRPC+LSM)",
+		Duration:          duration,
+		TotalOps:          totalOps,
+		SuccessOps:        successOps,
+		FailedOps:         failedOps,
+		WriteOps:          writeOps,
+		ReadOps:           readOps,
+		DeleteOps:         deleteOps,
+		BytesRead:         bytesRead,
+		BytesWritten:      bytesWritten,
+		LatencyP50:        percentileLong(latencySampler.getAll(), 50),
+		LatencyP95:        percentileLong(latencySampler.getAll(), 95),
+		LatencyP99:        percentileLong(latencySampler.getAll(), 99),
+		ThroughputOps:     float64(successOps) / duration.Seconds(),
+		WriteThroughput:   float64(writeOps) / duration.Seconds(),
+		ReadThroughput:    float64(readOps) / duration.Seconds(),
+		DeleteThroughput:  float64(deleteOps) / duration.Seconds(),
+		ErrorRate:         float64(failedOps) / float64(totalOps) * 100,
+		LeaderElections:   atomic.LoadInt32(&c.leaderElections),
+		DataConsistencyOK: finalConsistent,
+		KeysVerified:      finalVerified,
+		SnapshotCount:     snapshotNodes,
+		SnapshotMaxIndex:  maxSnapshotIndex,
 	}
 
 	printLongRunningMetrics(t, &metrics)
@@ -1135,7 +1613,10 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 				key := fmt.Sprintf("read-warmup-key-%d", rand.Intn(warmupCount))
 				cmd := param.KVCommand{Op: param.OpGet, Key: key}
 
-				success, latency, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+				success, latency, err := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+				if errors.Is(err, errLongRunningTestStopped) {
+					return
+				}
 
 				// 请求完成后再次检查是否应该停止
 				select {
@@ -1149,7 +1630,7 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 					atomic.AddInt64(&successOps, 1)
 					// 使用当前 Leader 获取数据大小
 					l := currentLeader.Load().(*raft.Raft)
-					val, _ := c.stateMachines[l.ID()-1].Get(key)
+					val, _ := c.stateMachineByID(l.ID()).Get(key)
 					atomic.AddInt64(&bytesRead, int64(len(key)+len(val)))
 					latencySampler.add(latency)
 				} else {
@@ -1219,12 +1700,12 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 	// 性能指标 - 使用 latencySampler 控制内存使用
 	const maxLatencySamples = 10000
 	var (
-		totalOps            int64
-		successOps          int64
-		failedOps           int64
-		writeOps            int64
-		deleteOps           int64
-		latencySampler      = newLatencySampler(maxLatencySamples)
+		totalOps             int64
+		successOps           int64
+		failedOps            int64
+		writeOps             int64
+		deleteOps            int64
+		latencySampler       = newLatencySampler(maxLatencySamples)
 		deleteLatencySampler = newLatencySampler(maxLatencySamples)
 	)
 
@@ -1258,7 +1739,10 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 						key := clientKeys[cid][idx]
 
 						cmd := param.KVCommand{Op: param.OpDelete, Key: key}
-						success, latency, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						success, latency, err := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						if errors.Is(err, errLongRunningTestStopped) {
+							return
+						}
 
 						atomic.AddInt64(&totalOps, 1)
 						if success {
@@ -1279,7 +1763,10 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 						value := fmt.Sprintf("val-%d", rand.Intn(10000))
 						cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-						success, latency, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						success, latency, err := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						if errors.Is(err, errLongRunningTestStopped) {
+							return
+						}
 
 						atomic.AddInt64(&totalOps, 1)
 						if success {
@@ -1389,6 +1876,10 @@ func printLongRunningMetrics(t *testing.T, metrics *LongRunningMetrics) {
 	t.Logf("----------------------------------------")
 	t.Logf("集群状态:")
 	t.Logf("  Leader 切换次数: %d", metrics.LeaderElections)
+	t.Logf("  快照节点数: %d", metrics.SnapshotCount)
+	if metrics.SnapshotMaxIndex > 0 {
+		t.Logf("  最大快照索引: %d", metrics.SnapshotMaxIndex)
+	}
 	t.Logf("  数据一致性: %v", metrics.DataConsistencyOK)
 	t.Logf("  已验证数据条数: %d", metrics.KeysVerified)
 	t.Logf("========================================\n")

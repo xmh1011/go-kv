@@ -193,6 +193,10 @@ func TestGetDataBlockFromFile(t *testing.T) {
 		assert.Equal(t, p.Key, loadedPairs[i].Key)
 		assert.Equal(t, p.Value, loadedPairs[i].Value)
 	}
+
+	loadedPairs, err = metaLoadedTable.GetDataBlockFromFile(table.filePath)
+	assert.NoError(t, err)
+	assert.Equal(t, len(pairs), len(loadedPairs), "repeated reads must not append duplicate DataBlock entries")
 }
 
 func TestGetKeyValuePairs(t *testing.T) {

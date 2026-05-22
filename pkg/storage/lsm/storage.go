@@ -23,6 +23,17 @@ const (
 	logKeyPrefix  = "log:"
 )
 
+const (
+	logEntryFormatMagic = "GLG1"
+
+	logCommandNil byte = iota
+	logCommandBytes
+	logCommandString
+	logCommandKV
+	logCommandConfigChange
+	logCommandClient
+)
+
 // StorageAdapter 实现了 storage.Storage 接口，
 // 使用 LSM 树来存储 Raft 的日志条目和元数据。
 type StorageAdapter struct {
@@ -118,6 +129,9 @@ func (s *StorageAdapter) getLogKey(index uint64) string {
 
 // SetState 原子地设置 HardState (currentTerm, votedFor)。
 func (s *StorageAdapter) SetState(state param.HardState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	data := make([]byte, 24)
 	binary.BigEndian.PutUint64(data[0:8], state.CurrentTerm)
 	binary.BigEndian.PutUint64(data[8:16], state.VotedFor)
@@ -132,6 +146,9 @@ func (s *StorageAdapter) SetState(state param.HardState) error {
 
 // GetState 获取最后保存的 HardState。
 func (s *StorageAdapter) GetState() (param.HardState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	var state param.HardState
 	val, err := s.db.Get(keyHardState)
 	if err != nil {
@@ -151,45 +168,225 @@ func (s *StorageAdapter) GetState() (param.HardState, error) {
 	return state, nil
 }
 
-// encodeLogEntry 使用自定义二进制编码: Term(8) + Index(8) + CmdLen(4) + CmdBytes
-// 其中 CmdBytes 仍使用 gob 编码 Command 字段（因为 Command 是 any 类型）
+// encodeLogEntry uses a compact binary format for Raft log entries and the
+// command shapes this storage layer is expected to persist.
 func encodeLogEntry(entry *param.LogEntry) ([]byte, error) {
-	// gob 编码 Command
-	var cmdBuf bytes.Buffer
-	if err := gob.NewEncoder(&cmdBuf).Encode(&entry.Command); err != nil {
+	cmdBytes, err := encodeLogCommand(entry.Command)
+	if err != nil {
 		return nil, err
 	}
-	cmdBytes := cmdBuf.Bytes()
 
-	// 二进制编码: Term(8) + Index(8) + CmdLen(4) + CmdBytes
-	buf := make([]byte, 8+8+4+len(cmdBytes))
-	binary.BigEndian.PutUint64(buf[0:8], entry.Term)
-	binary.BigEndian.PutUint64(buf[8:16], entry.Index)
-	binary.BigEndian.PutUint32(buf[16:20], uint32(len(cmdBytes)))
-	copy(buf[20:], cmdBytes)
+	buf := make([]byte, 4+8+8+4+len(cmdBytes))
+	copy(buf[:4], logEntryFormatMagic)
+	binary.BigEndian.PutUint64(buf[4:12], entry.Term)
+	binary.BigEndian.PutUint64(buf[12:20], entry.Index)
+	binary.BigEndian.PutUint32(buf[20:24], uint32(len(cmdBytes)))
+	copy(buf[24:], cmdBytes)
 	return buf, nil
 }
 
-// decodeLogEntry 解码自定义二进制格式的 LogEntry
-func decodeLogEntry(data []byte) (*param.LogEntry, error) {
-	if len(data) < 20 {
-		return nil, fmt.Errorf("invalid log entry data: too short (%d bytes)", len(data))
-	}
-
-	entry := &param.LogEntry{
-		Term:  binary.BigEndian.Uint64(data[0:8]),
-		Index: binary.BigEndian.Uint64(data[8:16]),
-	}
-	cmdLen := binary.BigEndian.Uint32(data[16:20])
-	if uint32(len(data)-20) < cmdLen {
-		return nil, fmt.Errorf("invalid log entry data: command truncated")
-	}
-
-	// gob 解码 Command
-	if err := gob.NewDecoder(bytes.NewReader(data[20 : 20+cmdLen])).Decode(&entry.Command); err != nil {
+func encodeLogCommand(command any) ([]byte, error) {
+	buf := make([]byte, 0, 64)
+	if err := appendLogCommand(&buf, command); err != nil {
 		return nil, err
 	}
-	return entry, nil
+	return buf, nil
+}
+
+func appendLogCommand(buf *[]byte, command any) error {
+	switch cmd := command.(type) {
+	case nil:
+		*buf = append(*buf, logCommandNil)
+	case []byte:
+		*buf = append(*buf, logCommandBytes)
+		appendBytes(buf, cmd)
+	case string:
+		*buf = append(*buf, logCommandString)
+		appendString(buf, cmd)
+	case param.KVCommand:
+		*buf = append(*buf, logCommandKV)
+		appendUint64(buf, uint64(cmd.Op))
+		appendString(buf, cmd.Key)
+		appendString(buf, cmd.Value)
+	case param.ConfigChangeCommand:
+		*buf = append(*buf, logCommandConfigChange)
+		appendUint64(buf, uint64(len(cmd.NewPeerIDs)))
+		for _, peerID := range cmd.NewPeerIDs {
+			appendUint64(buf, uint64(peerID))
+		}
+	case param.ClientCommand:
+		*buf = append(*buf, logCommandClient)
+		appendUint64(buf, uint64(cmd.ClientID))
+		appendUint64(buf, uint64(cmd.SequenceNum))
+		return appendLogCommand(buf, cmd.Command)
+	default:
+		return fmt.Errorf("unsupported log command type %T", command)
+	}
+	return nil
+}
+
+func appendUint64(buf *[]byte, value uint64) {
+	var scratch [8]byte
+	binary.BigEndian.PutUint64(scratch[:], value)
+	*buf = append(*buf, scratch[:]...)
+}
+
+func appendBytes(buf *[]byte, value []byte) {
+	appendUint64(buf, uint64(len(value)))
+	*buf = append(*buf, value...)
+}
+
+func appendString(buf *[]byte, value string) {
+	appendBytes(buf, []byte(value))
+}
+
+// decodeLogEntry decodes the current binary log-entry format.
+func decodeLogEntry(data []byte) (*param.LogEntry, error) {
+	if len(data) >= 4 && string(data[:4]) == logEntryFormatMagic {
+		return decodeBinaryLogEntry(data)
+	}
+	return nil, fmt.Errorf("invalid log entry data: missing %s magic", logEntryFormatMagic)
+}
+
+func decodeBinaryLogEntry(data []byte) (*param.LogEntry, error) {
+	if len(data) < 24 {
+		return nil, fmt.Errorf("invalid binary log entry data: too short (%d bytes)", len(data))
+	}
+
+	cmdLen := binary.BigEndian.Uint32(data[20:24])
+	if uint32(len(data)-24) < cmdLen {
+		return nil, fmt.Errorf("invalid binary log entry data: command truncated")
+	}
+
+	command, err := decodeLogCommand(data[24 : 24+cmdLen])
+	if err != nil {
+		return nil, err
+	}
+	return &param.LogEntry{
+		Term:    binary.BigEndian.Uint64(data[4:12]),
+		Index:   binary.BigEndian.Uint64(data[12:20]),
+		Command: command,
+	}, nil
+}
+
+func decodeLogCommand(data []byte) (any, error) {
+	cursor := logCommandCursor{data: data}
+	command, err := cursor.readCommand()
+	if err != nil {
+		return nil, err
+	}
+	if cursor.remaining() != 0 {
+		return nil, fmt.Errorf("invalid log command data: %d trailing bytes", cursor.remaining())
+	}
+	return command, nil
+}
+
+type logCommandCursor struct {
+	data []byte
+	off  int
+}
+
+func (c *logCommandCursor) remaining() int {
+	return len(c.data) - c.off
+}
+
+func (c *logCommandCursor) readCommand() (any, error) {
+	if c.remaining() < 1 {
+		return nil, fmt.Errorf("invalid log command data: missing type")
+	}
+	commandType := c.data[c.off]
+	c.off++
+
+	switch commandType {
+	case logCommandNil:
+		return nil, nil
+	case logCommandBytes:
+		return c.readBytes()
+	case logCommandString:
+		value, err := c.readString()
+		if err != nil {
+			return nil, err
+		}
+		return value, nil
+	case logCommandKV:
+		op, err := c.readUint64()
+		if err != nil {
+			return nil, err
+		}
+		key, err := c.readString()
+		if err != nil {
+			return nil, err
+		}
+		value, err := c.readString()
+		if err != nil {
+			return nil, err
+		}
+		return param.KVCommand{Op: param.OpType(op), Key: key, Value: value}, nil
+	case logCommandConfigChange:
+		count, err := c.readUint64()
+		if err != nil {
+			return nil, err
+		}
+		if count > uint64(c.remaining()/8) {
+			return nil, fmt.Errorf("invalid config change command: peer count %d exceeds payload", count)
+		}
+		peerIDs := make([]int, 0, int(count))
+		for i := uint64(0); i < count; i++ {
+			peerID, err := c.readUint64()
+			if err != nil {
+				return nil, err
+			}
+			peerIDs = append(peerIDs, int(peerID))
+		}
+		return param.ConfigChangeCommand{NewPeerIDs: peerIDs}, nil
+	case logCommandClient:
+		clientID, err := c.readUint64()
+		if err != nil {
+			return nil, err
+		}
+		sequenceNum, err := c.readUint64()
+		if err != nil {
+			return nil, err
+		}
+		nested, err := c.readCommand()
+		if err != nil {
+			return nil, err
+		}
+		return param.NewClientCommand(int64(clientID), int64(sequenceNum), nested), nil
+	default:
+		return nil, fmt.Errorf("unknown log command type %d", commandType)
+	}
+}
+
+func (c *logCommandCursor) readUint64() (uint64, error) {
+	if c.remaining() < 8 {
+		return 0, fmt.Errorf("invalid log command data: truncated uint64")
+	}
+	value := binary.BigEndian.Uint64(c.data[c.off : c.off+8])
+	c.off += 8
+	return value, nil
+}
+
+func (c *logCommandCursor) readBytes() ([]byte, error) {
+	length, err := c.readUint64()
+	if err != nil {
+		return nil, err
+	}
+	if length > uint64(c.remaining()) {
+		return nil, fmt.Errorf("invalid log command data: bytes truncated")
+	}
+	value := make([]byte, int(length))
+	copy(value, c.data[c.off:c.off+int(length)])
+	c.off += int(length)
+	return value, nil
+}
+
+func (c *logCommandCursor) readString() (string, error) {
+	value, err := c.readBytes()
+	if err != nil {
+		return "", err
+	}
+	return string(value), nil
 }
 
 // AppendEntries 追加一批日志条目。
@@ -236,6 +433,13 @@ func (s *StorageAdapter) AppendEntries(entries []param.LogEntry) error {
 
 // GetEntry 获取指定索引的日志条目。
 func (s *StorageAdapter) GetEntry(index uint64) (*param.LogEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if index < s.firstIndex || index > s.lastIndex {
+		return nil, nil
+	}
+
 	val, err := s.db.Get(s.getLogKey(index))
 	if err != nil {
 		return nil, err
@@ -251,6 +455,9 @@ func (s *StorageAdapter) TruncateLog(fromIndex uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if fromIndex < s.firstIndex {
+		fromIndex = s.firstIndex
+	}
 	if fromIndex > s.lastIndex {
 		return nil
 	}
@@ -299,6 +506,9 @@ func (s *StorageAdapter) LogSize() (int, error) {
 
 // SaveSnapshot 原子地保存快照数据和元数据。
 func (s *StorageAdapter) SaveSnapshot(snapshot *param.Snapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(snapshot); err != nil {
 		return err
@@ -312,6 +522,9 @@ func (s *StorageAdapter) SaveSnapshot(snapshot *param.Snapshot) error {
 
 // ReadSnapshot 读取最后保存的快照。
 func (s *StorageAdapter) ReadSnapshot() (*param.Snapshot, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	val, err := s.db.Get(keySnapshot)
 	if err != nil {
 		return nil, err
@@ -335,26 +548,24 @@ func (s *StorageAdapter) CompactLog(upToIndex uint64) error {
 		return nil
 	}
 
-	deleteTo := upToIndex
-	if deleteTo > s.lastIndex {
-		deleteTo = s.lastIndex
-	}
-
-	// 逐个删除
-	for i := s.firstIndex; i <= deleteTo; i++ {
-		key := s.getLogKey(i)
-		val, _ := s.db.Get(key)
-		if val != nil {
-			s.logSize -= len(val)
-		}
-		if err := s.db.Delete(key); err != nil {
-			return err
-		}
-	}
+	oldFirstIndex := s.firstIndex
+	oldLastIndex := s.lastIndex
+	deleteTo := min(upToIndex, oldLastIndex)
 
 	s.firstIndex = upToIndex + 1
 	if upToIndex >= s.lastIndex {
 		s.lastIndex = upToIndex
+		s.logSize = 0
+	} else if oldLastIndex >= oldFirstIndex {
+		totalEntries := oldLastIndex - oldFirstIndex + 1
+		compactedEntries := deleteTo - oldFirstIndex + 1
+		if totalEntries > 0 && compactedEntries > 0 {
+			compactedBytes := int((int64(s.logSize) * int64(compactedEntries)) / int64(totalEntries))
+			s.logSize -= compactedBytes
+			if s.logSize < 0 {
+				s.logSize = 0
+			}
+		}
 	}
 
 	return s.saveMetadata()

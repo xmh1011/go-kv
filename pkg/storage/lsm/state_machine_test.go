@@ -1,6 +1,7 @@
 package lsm
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"testing"
@@ -26,9 +27,9 @@ func TestStateMachineAdapter_Snapshot(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, snapData)
 
-	// 验证快照数据不为空
-	var files map[string][]byte
-	err = json.Unmarshal(snapData, &files)
+	// 验证快照数据不为空，并使用新的二进制归档格式。
+	assert.True(t, bytes.HasPrefix(snapData, lsmSnapshotMagic))
+	files, err := decodeSnapshotData(snapData)
 	assert.NoError(t, err)
 	// 至少应该有一个 SSTable (因为 GetSnapshot 会强制 Flush)
 	assert.NotEmpty(t, files)

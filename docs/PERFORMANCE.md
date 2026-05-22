@@ -6,133 +6,103 @@ go-kv 是一个基于 Raft 共识协议的分布式 KV 存储系统，使用 LSM
 
 ---
 
-## 测试总览 (2026-03-31)
+## 测试总览 (2026-05-22)
 
-**测试环境**: macOS Darwin 25.3.0, Apple Silicon, Go 1.24+
+**测试环境**: macOS Darwin 26.3.1, Apple Silicon, Go 1.25.5
 
-| 测试类别 | 数量 | 结果 |
-|---------|------|------|
-| 单元测试 | 16 packages | **全部通过** |
-| 竞态检测 (race) | 16 packages | **全部通过，零 race** |
-| Benchmark 测试 | 31 benchmarks | **全部通过** |
-| E2E 性能测试 (30s) | 6 tests | **全部通过** |
-| 长时间 E2E 测试 (10min) | 5 tests | **全部通过** |
+| 验证命令 | 结果 | 用时 / 覆盖点 |
+|---------|------|---------------|
+| `go test -race ./pkg/storage/lsm ./raft ./engine/lsm/... ./pkg/storage/... ./pkg/param` | **通过** | Raft、LSM、存储适配层核心 race 覆盖 |
+| `make test` | **通过** | 全仓单元测试与集成测试入口 |
+| `go test -race -v -timeout=30m ./tests/integration_test.go` | **通过** | 356.444s，覆盖选举、复制、故障转移、分区、快照、重启、成员变更 |
+| `go test -race -v -timeout=20m ./tests/long_running_e2e_test.go -run TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots -count=1` | **通过** | 606.524s，真实重启 + 快照 + 最终一致性校验 |
+| `go test -race -v -timeout=30m ./tests/e2e_perf_test.go` | **通过** | 422.562s，覆盖本地与 gRPC 网络性能场景 |
 
 ---
 
 ## 长时间 E2E 测试结果 (10 分钟)
 
-**集群配置**: 3 节点 Raft, gRPC 传输, LSM 存储
+**集群配置**: 3 节点 Raft, gRPC 传输, LSM 存储, 真实节点重启, 自动快照, 最终全节点一致性校验。
 
-### 综合测试 (Comprehensive)
-
-混合负载：60% 写入 + 25% 读取 + 15% 删除，10 个并发客户端。
+该轮长测用于验证 Raft 与 LSM 的内核一致性，不再只统计请求成功率。测试会在运行过程中制造 leader 切换、节点停止/重启、快照生成和日志压缩，并在结束时按每个节点逐一读取最近 1200 个期望 key。
 
 | 指标 | 数值 |
 |------|------|
-| 总操作数 | 1,630,986 |
-| 成功操作 | 1,343,140 |
-| 成功率 | 82.35%（详见下方分析） |
-| 总吞吐量 | **2,239 ops/sec** |
-| 写入吞吐 | 1,630 ops/sec |
-| 读取吞吐 | 680 ops/sec |
-| 删除吞吐 | 409 ops/sec |
-| P50 延迟 | 1.36ms |
-| P99 延迟 | 36.28ms |
-| Leader 切换 | 46 次 |
-
-### 写入密集型 (WriteHeavy)
-
-| 指标 | 数值 |
-|------|------|
-| 总操作数 | 967,222 |
+| 总操作数 | 545,390 |
+| 成功操作 | 545,390 |
+| 失败操作 | 0 |
 | 成功率 | **100.00%** |
-| 写入吞吐 | **1,612 ops/sec** |
-| P50 延迟 | 1.52ms |
-| P99 延迟 | 28.49ms |
-| Leader 切换 | 44 次 |
+| 总吞吐量 | **908.98 ops/sec** |
+| 写入操作 | 300,209 (55.0%) |
+| 读取操作 | 163,348 (30.0%) |
+| 删除操作 | 81,833 (15.0%) |
+| P50 延迟 | 3.178041ms |
+| P95 延迟 | 17.501083ms |
+| P99 延迟 | 44.363875ms |
+| Leader 切换 | 27 次 |
+| 生成快照的节点数 | 3 |
+| 最大快照 index | 379,839 |
+| 最终一致性校验 | **通过**，3,600 个 node-key 组合全部一致 |
 
-### 故障恢复混合测试 (MixedWithFailures)
+### 本轮发现并修复的关键瓶颈
 
-含节点宕机和恢复模拟（每 2 分钟触发一次 Follower 节点停止，30 秒后恢复，最多 2 次）。
+长测曾在 5:30 到 7:30 附近卡在约 167,520 次操作，CPU 持续消耗但提交进度不再增长。SIGQUIT 堆栈显示热路径集中在 `pkg/storage/lsm.encodeLogEntry` 和 `pkg/storage/lsm.decodeLogEntry` 的 gob 编解码上，并伴随 Raft apply 与 replication goroutine 等待。
 
-| 指标 | 数值 |
-|------|------|
-| 总操作数 | 2,314,291 |
-| 成功操作 | 1,936,645 |
-| 成功率 | 83.68%（详见下方分析） |
-| 总吞吐量 | **3,228 ops/sec** |
-| P50 延迟 | 578µs |
-| P99 延迟 | 8.50ms |
-| Leader 切换 | 42 次 |
+修复方案是将 LSM-backed Raft log entry 从 gob 改为带 magic/version/type tag 的二进制格式。该格式只支持当前代码生成的命令类型，未知旧数据或未知命令类型会快速失败，不再为 WAL/SSTable 中的旧 gob 数据做兼容回退。
 
-### 读取密集型 (ReadHeavy)
+```go
+func encodeLogEntry(entry *param.LogEntry) ([]byte, error) {
+    cmdBytes, err := encodeLogCommand(entry.Command)
+    if err != nil {
+        return nil, err
+    }
 
-| 指标 | 数值 |
-|------|------|
-| 总操作数 | **472,519,981** |
-| 成功率 | **100.00%** |
-| 读取吞吐 | **787,533 ops/sec** |
-| 读取流量 | 29.88 MB/s |
-| P50 延迟 | 1.58µs |
-| P99 延迟 | 104µs |
-
-### 删除压力测试 (DeleteStress)
-
-60% 写入 + 40% 删除。
-
-| 指标 | 数值 |
-|------|------|
-| 总操作数 | 1,687,774 |
-| 成功率 | **100.00%** |
-| 总吞吐量 | **2,813 ops/sec** |
-| 写入吞吐 | 1,686 ops/sec |
-| 删除吞吐 | 1,127 ops/sec |
-| P50 延迟 | 1.07ms |
-| P99 延迟 | 11.60ms |
-| Leader 切换 | 65 次 |
-
-### 长时测试成功率分析
-
-三阶段锁优化后，Comprehensive（82.35%）和 MixedWithFailures（83.68%）的成功率低于 100%。根因分析如下：
-
-**直接原因：`appendEntriesMu` 导致心跳被阻塞，触发频繁选举**
-
-三阶段锁引入了 `appendEntriesMu` 互斥锁，用于串行化 Follower 侧的 AppendEntries Phase 2（磁盘 I/O）。但 `fetchEntriesToApply`（日志应用）也需要先获取 `appendEntriesMu` 再获取 `r.mu`，以防止读取到正在被截断的日志。这导致以下阻塞链：
-
-```
-心跳 AppendEntries → 等待 appendEntriesMu → 被 fetchEntriesToApply 或正在进行的日志追加阻塞
-→ 心跳超时 → Follower 发起选举 → Leader 切换 → 客户端请求失败
+    buf := make([]byte, 4+8+8+4+len(cmdBytes))
+    copy(buf[:4], logEntryFormatMagic) // GLG1
+    binary.BigEndian.PutUint64(buf[4:12], entry.Term)
+    binary.BigEndian.PutUint64(buf[12:20], entry.Index)
+    binary.BigEndian.PutUint32(buf[20:24], uint32(len(cmdBytes)))
+    copy(buf[24:], cmdBytes)
+    return buf, nil
+}
 ```
 
-**证据**：
-- 优化前 Comprehensive 仅 3 次 Leader 切换，现在 46 次（10 个并发客户端持续高负载放大了锁争用）
-- WriteHeavy 也有 44 次 Leader 切换，但因为只有写入（无读取），客户端可以快速切换到新 Leader，成功率仍为 100%
-- ReadHeavy 0 次 Leader 切换（纯读取不经过 `appendEntriesMu`）
-- MixedWithFailures 有显式故障注入（节点宕机），42 次切换中部分是注入造成的
-
-**本质**：这是吞吐量 vs 稳定性的 trade-off。三阶段锁将写入吞吐量从 1,795 提升到 2,239 ops/sec（+25%），但 `appendEntriesMu` 的锁争用在高并发混合负载下导致心跳延迟，引发不必要的选举。
-
-**后续优化方向**：
-- 为心跳 AppendEntries（`len(args.Entries) == 0`）设置高优先级，跳过 `appendEntriesMu` 排队
-- 或增大选举超时（当前 500ms），给高负载下的心跳更多余量
+修复后同一长测完成 545,390 次操作，0 失败，所有节点最终数据一致。
 
 ---
 
 ## E2E 性能测试结果 (30 秒)
 
-| 测试场景 | 总操作数 | 成功率 | 吞吐量 (ops/sec) | P50 延迟 | P99 延迟 |
-|---------|---------|--------|-----------------|----------|----------|
-| **WriteHeavy** | 133,180 | **100%** | **4,439** | 480µs | 219µs |
-| **ReadHeavy** | 10,813,740 | **100%** | **360,458** | 1µs | 1.2µs |
-| **MixedWorkload** | 154,865 | **100%** | **5,162** | 107µs | 235µs |
-| **SmallValues** | 198,992 | **100%** | **6,633** | 294µs | 2.6µs |
-| **BatchOperations** | 1,500 | **100%** | **50** | 25ms | 15.8ms |
-| **DeleteOperations** | 97,924 | **100%** | **3,264** | 139µs | 148µs |
+Latency percentile 统计已修复为对采样副本排序后再取分位点，避免旧实现因直接索引未排序样本而出现 P95/P99 小于 P50 的错误报告。
+
+### 本地 E2E
+
+| 测试场景 | 总操作数 | 成功率 | 吞吐量 (ops/sec) | P50 延迟 | P95 延迟 | P99 延迟 |
+|---------|---------|--------|-----------------|----------|----------|----------|
+| **WriteHeavy** | 35,533 | **100%** | **1,184.43** | 588.583µs | 1.563792ms | 3.902167ms |
+| **ReadHeavy** | 1,282,062 | **100%** | **42,735.40** | 12.125µs | 19.208µs | 51.5µs |
+| **MixedWorkload** | 59,824 | **100%** | **1,994.13** | 492µs | 1.0765ms | 2.028083ms |
+| **SmallValues** | 72,004 | **100%** | **2,400.13** | 426.583µs | 1.105ms | 2.412875ms |
+| **BatchOperations** | 1,400 | **100%** | **46.67** | 47.4355ms | 177.525167ms | 402.038ms |
+| **DeleteOperations** | 38,721 | **100%** | **1,290.70** | 558.375µs | 1.40125ms | 2.984041ms |
+
+### gRPC 网络 E2E
+
+| 测试场景 | 总操作数 | 成功率 | 吞吐量 (ops/sec) | P50 延迟 | P95 延迟 | P99 延迟 |
+|---------|---------|--------|-----------------|----------|----------|----------|
+| **Network WriteHeavy** | 41,778 | **100%** | **1,392.60** | 540.584µs | 1.223166ms | 2.538625ms |
+| **Network ReadHeavy** | 1,386,535 | **100%** | **46,217.83** | 12.125µs | 15.791µs | 32.834µs |
+| **Network MixedWorkload** | 67,937 | **100%** | **2,264.57** | 483.917µs | 822.083µs | 1.371042ms |
+| **Network SmallValues** | 92,206 | **100%** | **3,073.53** | 439.5µs | 711.375µs | 1.210084ms |
+| **Network BatchOperations** | 1,450 | **100%** | **48.33** | 35.945917ms | 80.96275ms | 383.876167ms |
+| **Network DeleteOperations** | 44,812 | **100%** | **1,493.73** | 511.25µs | 1.008125ms | 1.836292ms |
+| **Network ConcurrentClients** | 40,816 | **100%** | **1,360.53** | 2.532ms | 6.369208ms | 14.763417ms |
 
 ---
 
 ## Benchmark 测试结果
+
+以下 benchmark 数据是 2026-03-31 的历史基线，本轮主要补充了 race、集成测试、10 分钟一致性 E2E 和 gRPC E2E 性能长测。
 
 **配置**: 3 节点 Raft, 100 次迭代, InMemory 传输（除 TCP/LSM/gRPC 测试外）
 

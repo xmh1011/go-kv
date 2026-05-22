@@ -211,7 +211,7 @@ func (r *Raft) getLastLogInfoForElection() (lastLogIndex uint64, lastLogTerm uin
 
 	// 如果日志不为空，则获取最后一条日志的任期。
 	if lastLogIndex > 0 {
-		lastLogTerm, err = r.getLogTerm(lastLogIndex)
+		lastLogTerm, err = r.getLogTermLocked(lastLogIndex)
 		if err != nil {
 			log.Errorf("[Election] Node %d failed to get last log term for election: %v", r.id, err)
 			return 0, 0, err
@@ -333,7 +333,7 @@ func (r *Raft) transitionToLeader(electionTerm uint64) {
 
 	// 再次确认自己仍然是本轮选举的候选人，防止因状态变更导致的问题。
 	if r.getState() == Candidate && r.currentTerm == electionTerm {
-		log.Infof("[Election] Node %d elected as Leader for term %d", r.id, r.currentTerm)
+		log.Debugf("[Election] Node %d elected as Leader for term %d", r.id, r.currentTerm)
 		r.setState(Leader)
 		r.initLeaderState()
 		// 初始化租约：新当选的 Leader 需要通过心跳确认后才能获得租约
@@ -386,7 +386,7 @@ func (r *Raft) sendVoteRequest(peerID int, term uint64, lastLogIndex uint64, las
 	// 只有在 VoteGranted 为 false 且 reply.Term > r.currentTerm 时，才需要退回。
 	// 对于 Pre-Vote，args.Term = r.currentTerm + 1。如果 reply.Term == args.Term 且 VoteGranted=true，这是好事。
 	if reply.Term > r.currentTerm && !reply.VoteGranted {
-		log.Infof("[Election] Node %d found higher term %d from peer %d, becomes Follower", r.id, reply.Term, peerID)
+		log.Debugf("[Election] Node %d found higher term %d from peer %d, becomes Follower", r.id, reply.Term, peerID)
 		// 注意：这里更新到 reply.Term
 		if err := r.becomeFollower(reply.Term); err != nil {
 			log.Errorf("[Election] Node %d failed to persist state: %v", r.id, err)
@@ -485,7 +485,7 @@ func (r *Raft) isLogUpToDate(candidateLastLogIndex, candidateLastLogTerm uint64)
 	// 从存储中获取本节点的最后一条日志信息。
 	localLastLogIndex := r.cachedLastLogIndex
 
-	localLastLogTerm, err := r.getLogTerm(localLastLogIndex)
+	localLastLogTerm, err := r.getLogTermLocked(localLastLogIndex)
 	if err != nil { // 检查 err 是否为 nil
 		log.Errorf("[Election] Node %d failed to get last log entry from store: %v", r.id, err)
 		return false, err

@@ -32,7 +32,7 @@ func (sm *StateMachine) Apply(entry param.LogEntry) any {
 	// 假设 Command 是 json 序列化后的 KVCommand
 	var cmd param.KVCommand
 	// 实际应用中，需要更健壮的命令解析
-	if err := json.Unmarshal(entry.Command.([]byte), &cmd); err != nil {
+	if err := json.Unmarshal(param.UnwrapClientCommand(entry.Command).([]byte), &cmd); err != nil {
 		// 在真实场景中，应 panic 或记录严重错误，因为已提交的日志不应是无效的
 		panic(fmt.Sprintf("failed to unmarshal command: %v", err))
 	}

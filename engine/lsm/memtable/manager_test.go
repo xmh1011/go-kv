@@ -37,9 +37,9 @@ func TestMemTableBuilderInsertAndEviction(t *testing.T) {
 	})
 	assert.NotNil(t, evicted2, "second eviction should not be nil")
 
-	// 验证 IMemTable 数量不超过 maxIMemTableCount
+	// Flush 完成前，待 flush 的 IMemTable 仍必须留在可查询集合中。
 	all := manager.GetAll()
-	assert.LessOrEqual(t, len(all), config.Conf.LSM.MaxIMemTableCount, "should not exceed max count")
+	assert.Greater(t, len(all), config.Conf.LSM.MaxIMemTableCount, "pending flush imems should remain visible")
 
 	// 验证当前 MemTable 仍可写入
 	ok := manager.CanInsert(kv.KeyValuePair{Key: "z", Value: []byte("zzz")})
@@ -66,7 +66,7 @@ func TestInsertTriggersPromotion(t *testing.T) {
 	evicted, err = manager.Insert(kv.KeyValuePair{Key: "newKey", Value: []byte("newValue")})
 	assert.NoError(t, err)
 	assert.NotNil(t, evicted, "Should evict one IMemTable")
-	assert.Equal(t, 10, len(manager.GetAll()), "Should have ten IMemTable")
+	assert.GreaterOrEqual(t, len(manager.GetAll()), config.Conf.LSM.MaxIMemTableCount, "pending flush imems should remain searchable")
 
 	// 触发 promote 后再次 delete
 	evicted, err = manager.Delete("someKey")
@@ -76,6 +76,30 @@ func TestInsertTriggersPromotion(t *testing.T) {
 	val, found := manager.Search("someKey")
 	assert.True(t, found, "Deleted key tombstone should be found")
 	assert.Nil(t, val, "Deleted key should return nil")
+}
+
+func TestFlushCandidateRemainsSearchableUntilFlushCompletes(t *testing.T) {
+	tempDir := t.TempDir()
+	manager := NewMemTableManager(tempDir)
+
+	var candidate *IMemTable
+	var err error
+	for i := 0; i <= config.Conf.LSM.MaxIMemTableCount+1; i++ {
+		key := kv.Key(fmt.Sprintf("key-%03d", i))
+		value := kv.Value(make([]byte, config.Conf.LSM.MaxMemTableSize))
+		candidate, err = manager.Insert(kv.KeyValuePair{Key: key, Value: value})
+		assert.NoError(t, err)
+	}
+
+	assert.NotNil(t, candidate)
+
+	val, found := manager.Search("key-000")
+	assert.True(t, found, "flush candidate must remain searchable before SSTable flush completes")
+	assert.NotNil(t, val)
+
+	manager.CompleteFlush(candidate, true)
+	_, found = manager.Search("key-000")
+	assert.False(t, found, "flushed memtable can be removed after SSTable indexing completes")
 }
 
 func TestDeleteTriggersPromotion(t *testing.T) {
@@ -128,8 +152,7 @@ func TestRecoverSuccess(t *testing.T) {
 	assert.NotNil(t, manager.Mem)
 	assert.GreaterOrEqual(t, len(manager.IMems), 0)
 
-	// 确认 IMemTable 数量不超过 maxIMemTableCount
-	assert.LessOrEqual(t, len(manager.IMems), config.Conf.LSM.MaxIMemTableCount)
+	assert.GreaterOrEqual(t, len(manager.IMems), 4, "recovery should preserve WAL-backed immutable memtables")
 
 	// 检查 manager.Mem 的 id 是最后一个文件的 id
 	lastFile := mockCreateWalFile(t, tempDir, 100)

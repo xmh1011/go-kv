@@ -9,6 +9,7 @@ import (
 
 func init() {
 	gob.Register(KVCommand{})
+	gob.Register(ClientCommand{})
 	gob.Register(ConfigChangeCommand{})
 }
 
@@ -34,6 +35,37 @@ type ClientReply struct {
 	Result     any  // 命令执行后的返回值
 	NotLeader  bool // 如果当前节点不是 Leader，此项为 true
 	LeaderHint int  // 当前已知的 Leader ID，用于客户端重定向
+}
+
+// ClientCommand is the replicated form of a client write request. Keeping the
+// client identity in the log lets every node update duplicate-detection state
+// when the entry is applied, even if the original RPC times out.
+type ClientCommand struct {
+	ClientID    int64
+	SequenceNum int64
+	Command     any
+}
+
+func NewClientCommand(clientID, sequenceNum int64, command any) ClientCommand {
+	return ClientCommand{
+		ClientID:    clientID,
+		SequenceNum: sequenceNum,
+		Command:     command,
+	}
+}
+
+func UnwrapClientCommand(command any) any {
+	if wrapped, ok := command.(ClientCommand); ok {
+		return wrapped.Command
+	}
+	return command
+}
+
+func ClientCommandMetadata(command any) (clientID, sequenceNum int64, ok bool) {
+	if wrapped, ok := command.(ClientCommand); ok {
+		return wrapped.ClientID, wrapped.SequenceNum, true
+	}
+	return 0, 0, false
 }
 
 // ConfigChangeCommand holds the new list of peer IDs for a configuration change.

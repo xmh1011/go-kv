@@ -388,10 +388,10 @@ func TestClientRequest(t *testing.T) {
 
 				time.Sleep(50 * time.Millisecond)
 				r.mu.Lock()
-				notifyChan, ok := r.notifyApply[6]
+				notifyChans := r.notifyApply[6]
 				r.mu.Unlock()
-				if ok {
-					notifyChan <- "success-result"
+				if len(notifyChans) > 0 {
+					notifyChans[0] <- "success-result"
 				}
 
 				select {
@@ -714,7 +714,7 @@ func TestClientRequest_ReadWriteBranching(t *testing.T) {
 func TestWaitForAppliedLog_Timeout(t *testing.T) {
 	// --- Arrange ---
 	r := &Raft{
-		notifyApply: make(map[uint64]chan any),
+		notifyApply: make(map[uint64][]chan any),
 		mu:          sync.Mutex{},
 	}
 	testIndex := uint64(10)
@@ -738,6 +738,49 @@ func TestWaitForAppliedLog_Timeout(t *testing.T) {
 	_, exists := r.notifyApply[testIndex]
 	r.mu.Unlock()
 	assert.False(t, exists, "Notify channel for timed out index should be removed from the map")
+}
+
+func TestWaitForAppliedLogSupportsMultipleWaiters(t *testing.T) {
+	r := &Raft{
+		clientSessions: make(map[int64]int64),
+		notifyApply:    make(map[uint64][]chan any),
+	}
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	type waitResult struct {
+		result any
+		ok     bool
+	}
+	results := make(chan waitResult, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			result, ok := r.waitForAppliedLog(10, time.Second)
+			results <- waitResult{result: result, ok: ok}
+		}()
+	}
+
+	assert.Eventually(t, func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return len(r.notifyApply[10]) == 2
+	}, time.Second, 10*time.Millisecond)
+
+	r.completeAppliedEntry(10, "done", 99, 7, true)
+
+	for i := 0; i < 2; i++ {
+		select {
+		case got := <-results:
+			assert.True(t, got.ok)
+			assert.Equal(t, "done", got.result)
+		case <-time.After(time.Second):
+			t.Fatal("timeout waiting for apply waiter")
+		}
+	}
+
+	r.mu.Lock()
+	assert.Equal(t, int64(7), r.clientSessions[99])
+	assert.Empty(t, r.notifyApply)
+	r.mu.Unlock()
 }
 
 // TestRandomizedElectionTimeout 验证随机超时是否落在 [T, 2T) 区间内。
@@ -1141,6 +1184,60 @@ func TestLeaseRead_HeartbeatMode(t *testing.T) {
 	assert.True(t, reply.Success)
 	assert.Equal(t, "test-value", reply.Result)
 	waitForWaitGroup(t, &wg, time.Second)
+}
+
+func TestReadIndexDoesNotTimeoutWhenApplyCaughtUpBeforeTimerWake(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockTrans := transport.NewMockTransport(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
+
+	r := NewRaft(1, []int{2, 3}, mockStore, mockSM, mockTrans, nil)
+	r.currentTerm = 2
+	r.setState(Leader)
+	r.electionTimeout = 20 * time.Millisecond
+	r.commitIndex = 5
+	r.lastApplied = 4
+
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		r.mu.Lock()
+		r.lastApplied = 5
+		r.mu.Unlock()
+	}()
+
+	mockSM.EXPECT().Get("test-key").Return("test-value", nil).Times(1)
+
+	reply := &param.ClientReply{}
+	err := r.performReadAfterApply(param.KVCommand{Op: param.OpGet, Key: "test-key"}, reply, 5)
+
+	assert.NoError(t, err)
+	assert.True(t, reply.Success)
+	assert.Equal(t, "test-value", reply.Result)
+}
+
+func TestWaitForAppliedLogRechecksLastAppliedOnTimeout(t *testing.T) {
+	r := &Raft{
+		notifyApply: make(map[uint64][]chan any),
+	}
+
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		r.mu.Lock()
+		r.lastApplied = 7
+		r.mu.Unlock()
+	}()
+
+	result, ok := r.waitForAppliedLog(7, 20*time.Millisecond)
+
+	assert.True(t, ok)
+	assert.Nil(t, result)
+	assert.Empty(t, r.notifyApply)
 }
 
 func waitForWaitGroup(t *testing.T, wg *sync.WaitGroup, timeout time.Duration) {

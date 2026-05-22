@@ -214,6 +214,7 @@ func (t *SSTable) DecodeDataBlock(file *os.File) error {
 		log.Errorf("[SSTable] seek to IndexBlock position error: %s", err.Error())
 		return fmt.Errorf("seek to IndexBlock position failed: %w", err)
 	}
+	t.DataBlock = block.NewDataBlock()
 	if err := t.DataBlock.DecodeFrom(file, t.Footer.DataHandle.Size); err != nil {
 		log.Errorf("[SSTable] decode DataBlock from file error: %s", err.Error())
 		return fmt.Errorf("decode DataBlock failed: %w", err)

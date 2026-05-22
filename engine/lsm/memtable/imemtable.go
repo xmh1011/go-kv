@@ -55,6 +55,9 @@ func (t *IMemTable) ID() uint64 {
 }
 
 func (t *IMemTable) Clean() {
+	if t.wal == nil {
+		return
+	}
 	err := t.wal.DeleteFile()
 	if err != nil && !os.IsNotExist(err) {
 		log.Errorf("failed to clean WAL file %d: %s", t.id, err.Error())

@@ -185,6 +185,136 @@ func TestPrepareAppendEntriesArgs(t *testing.T) {
 	}
 }
 
+func TestPrepareAppendEntriesArgsRequestsSnapshotWhenNextIndexWasCompacted(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	r := &Raft{
+		id:                 1,
+		currentTerm:        5,
+		commitIndex:        10,
+		cachedLastLogIndex: 12,
+		store:              storage.NewMockStorage(ctrl),
+		nextIndex:          map[int]uint64{2: 10},
+		snapshot:           param.NewSnapshot(10, 4, []byte("snapshot")),
+	}
+
+	args, err := r.prepareAppendEntriesArgs(2)
+	assert.Nil(t, args)
+	assert.True(t, errors.Is(err, errPeerNeedsSnapshot))
+}
+
+func TestPrepareAppendEntriesArgsClampsNextIndexPastLocalTail(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockStore := storage.NewMockStorage(ctrl)
+	mockStore.EXPECT().GetEntry(uint64(12)).Return(&param.LogEntry{Term: 5, Index: 12}, nil).Times(1)
+
+	r := &Raft{
+		id:                 1,
+		currentTerm:        5,
+		commitIndex:        10,
+		cachedLastLogIndex: 12,
+		store:              mockStore,
+		nextIndex:          map[int]uint64{2: 15},
+	}
+
+	args, err := r.prepareAppendEntriesArgs(2)
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(13), r.nextIndex[2])
+	assert.Equal(t, uint64(12), args.PrevLogIndex)
+	assert.Empty(t, args.Entries)
+}
+
+func TestPrepareAppendEntriesArgsRequestsSnapshotWhenEntryWasCompactedInStorage(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockStore := storage.NewMockStorage(ctrl)
+
+	gomock.InOrder(
+		mockStore.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 5, Index: 10}, nil),
+		mockStore.EXPECT().GetEntry(uint64(11)).Return(nil, nil),
+		mockStore.EXPECT().ReadSnapshot().Return(param.NewSnapshot(11, 5, []byte("snapshot")), nil),
+	)
+
+	r := &Raft{
+		id:                 1,
+		currentTerm:        5,
+		commitIndex:        10,
+		cachedLastLogIndex: 12,
+		store:              mockStore,
+		nextIndex:          map[int]uint64{2: 11},
+	}
+
+	args, err := r.prepareAppendEntriesArgs(2)
+	assert.Nil(t, args)
+	assert.True(t, errors.Is(err, errPeerNeedsSnapshot))
+	assert.NotNil(t, r.snapshot)
+	assert.Equal(t, uint64(11), r.snapshot.LastIncludedIndex)
+}
+
+func TestPrepareAppendEntriesArgsRetriesWhenCachedTailIsStale(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockStore := storage.NewMockStorage(ctrl)
+
+	gomock.InOrder(
+		mockStore.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 5, Index: 10}, nil),
+		mockStore.EXPECT().GetEntry(uint64(11)).Return(nil, nil),
+		mockStore.EXPECT().ReadSnapshot().Return(nil, nil),
+		mockStore.EXPECT().FirstLogIndex().Return(uint64(1), nil),
+		mockStore.EXPECT().LastLogIndex().Return(uint64(10), nil),
+		mockStore.EXPECT().ReadSnapshot().Return(nil, nil),
+		mockStore.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 5, Index: 10}, nil),
+	)
+
+	r := &Raft{
+		id:                 1,
+		currentTerm:        5,
+		commitIndex:        10,
+		cachedLastLogIndex: 12,
+		store:              mockStore,
+		nextIndex:          map[int]uint64{2: 11},
+	}
+
+	args, err := r.prepareAppendEntriesArgs(2)
+	assert.Nil(t, args)
+	assert.True(t, errors.Is(err, errLocalLogUnavailable))
+	assert.Equal(t, uint64(10), r.cachedLastLogIndex)
+	assert.Equal(t, uint64(11), r.nextIndex[2])
+}
+
+func TestPrepareAppendEntriesArgsRewindsSparseLocalLogGap(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockStore := storage.NewMockStorage(ctrl)
+
+	gomock.InOrder(
+		mockStore.EXPECT().GetEntry(uint64(11)).Return(nil, nil),
+		mockStore.EXPECT().ReadSnapshot().Return(nil, nil),
+		mockStore.EXPECT().ReadSnapshot().Return(nil, nil),
+		mockStore.EXPECT().FirstLogIndex().Return(uint64(1), nil),
+		mockStore.EXPECT().LastLogIndex().Return(uint64(12), nil),
+		mockStore.EXPECT().ReadSnapshot().Return(nil, nil),
+		mockStore.EXPECT().GetEntry(uint64(12)).Return(&param.LogEntry{Term: 5, Index: 12}, nil),
+	)
+
+	r := &Raft{
+		id:                 1,
+		currentTerm:        5,
+		commitIndex:        10,
+		cachedLastLogIndex: 12,
+		store:              mockStore,
+		nextIndex:          map[int]uint64{2: 12},
+	}
+
+	args, err := r.prepareAppendEntriesArgs(2)
+	assert.Nil(t, args)
+	assert.True(t, errors.Is(err, errLocalLogUnavailable))
+	assert.Equal(t, uint64(10), r.cachedLastLogIndex)
+	assert.Equal(t, uint64(11), r.nextIndex[2])
+}
+
 func TestUpdateCommitIndex(t *testing.T) {
 	type state struct {
 		term        uint64
@@ -260,7 +390,7 @@ func TestUpdateCommitIndex(t *testing.T) {
 				store:              mockStore,
 				lastApplied:        tt.initialState.commitIndex,
 				stateMachine:       mockSM,
-				notifyApply:        make(map[uint64]chan any),
+				notifyApply:        make(map[uint64][]chan any),
 				mu:                 sync.Mutex{},
 			}
 			r.lastAppliedCond = sync.NewCond(&r.mu)
@@ -322,6 +452,18 @@ func TestApplyLogs(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:           "SkipsEntriesCoveredBySnapshot",
+			commitIndex:    12,
+			lastApplied:    10,
+			snapshotThresh: -1,
+			setupMocks: func(s *storage.MockStorage, sm *storage.MockStateMachine, done chan struct{}) {
+				s.EXPECT().GetEntry(uint64(11)).Return(nil, nil).Times(1)
+				s.EXPECT().ReadSnapshot().Return(param.NewSnapshot(12, 5, []byte("snap")), nil).Times(1)
+			},
+			expectedApplied: 12,
+			expectSnapshot:  false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -344,7 +486,7 @@ func TestApplyLogs(t *testing.T) {
 				snapshotThreshold:  tt.snapshotThresh,
 				store:              mockStore,
 				stateMachine:       mockSM,
-				notifyApply:        make(map[uint64]chan any),
+				notifyApply:        make(map[uint64][]chan any),
 				mu:                 sync.Mutex{},
 			}
 			r.lastAppliedCond = sync.NewCond(&r.mu)
@@ -415,7 +557,7 @@ func TestApplyLogsAdvancesLastAppliedAfterStateMachineApply(t *testing.T) {
 		snapshotThreshold:  -1,
 		store:              mockStore,
 		stateMachine:       sm,
-		notifyApply:        make(map[uint64]chan any),
+		notifyApply:        make(map[uint64][]chan any),
 	}
 	r.lastAppliedCond = sync.NewCond(&r.mu)
 
@@ -475,7 +617,7 @@ func TestProcessBatchCommitsSingleNodeEntry(t *testing.T) {
 		snapshotThreshold:  -1,
 		store:              mockStore,
 		stateMachine:       mockSM,
-		notifyApply:        make(map[uint64]chan any),
+		notifyApply:        make(map[uint64][]chan any),
 		nextIndex:          make(map[int]uint64),
 		matchIndex:         make(map[int]uint64),
 	}
@@ -503,6 +645,71 @@ func TestProcessBatchCommitsSingleNodeEntry(t *testing.T) {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		return r.lastApplied == 1
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestProcessBatchDeduplicatesPendingClientRequest(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	wrapped := param.NewClientCommand(10, 1, []byte("cmd"))
+	var storedEntry param.LogEntry
+
+	mockStore.EXPECT().
+		AppendEntries(gomock.Any()).
+		DoAndReturn(func(entries []param.LogEntry) error {
+			assert.Len(t, entries, 1)
+			storedEntry = entries[0]
+			assert.Equal(t, uint64(1), storedEntry.Index)
+			assert.Equal(t, wrapped, storedEntry.Command)
+			return nil
+		}).
+		Times(1)
+	mockStore.EXPECT().GetEntry(uint64(1)).DoAndReturn(func(uint64) (*param.LogEntry, error) {
+		return &storedEntry, nil
+	}).Times(2)
+	mockSM.EXPECT().Apply(gomock.Any()).Return("ok").Times(1)
+
+	r := &Raft{
+		id:                    1,
+		peerIDs:               []int{1},
+		currentTerm:           2,
+		cachedLastLogIndex:    0,
+		snapshotThreshold:     -1,
+		store:                 mockStore,
+		stateMachine:          mockSM,
+		clientSessions:        make(map[int64]int64),
+		pendingClientRequests: make(map[clientRequestKey]uint64),
+		pendingLogClients:     make(map[uint64]clientRequestKey),
+		notifyApply:           make(map[uint64][]chan any),
+		nextIndex:             make(map[int]uint64),
+		matchIndex:            make(map[int]uint64),
+	}
+	r.setState(Leader)
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	key := clientRequestKey{clientID: 10, sequenceNum: 1}
+	firstResult := make(chan proposalResult, 1)
+	secondResult := make(chan proposalResult, 1)
+	r.processBatch([]proposalRequest{
+		{command: wrapped, result: firstResult, clientKey: key, trackClient: true},
+		{command: wrapped, result: secondResult, clientKey: key, trackClient: true},
+	})
+
+	first := <-firstResult
+	second := <-secondResult
+	assert.True(t, first.ok)
+	assert.True(t, second.ok)
+	assert.Equal(t, uint64(1), first.index)
+	assert.Equal(t, uint64(1), second.index)
+
+	assert.Eventually(t, func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.lastApplied == 1 && r.clientSessions[10] == 1 && len(r.pendingClientRequests) == 0
 	}, time.Second, 10*time.Millisecond)
 }
 
@@ -1193,7 +1400,7 @@ func TestDispatchEntries(t *testing.T) {
 		notifyChan := make(chan any, 1)
 		r := &Raft{
 			stateMachine: mockSM,
-			notifyApply:  map[uint64]chan any{10: notifyChan},
+			notifyApply:  map[uint64][]chan any{10: []chan any{notifyChan}},
 			mu:           sync.Mutex{},
 		}
 		r.lastAppliedCond = sync.NewCond(&r.mu)
@@ -1225,4 +1432,40 @@ func TestDispatchEntries(t *testing.T) {
 		assert.True(t, r.inJointConsensus, "should enter joint consensus")
 		assert.Equal(t, cmd.NewPeerIDs, r.newPeerIDs)
 	})
+}
+
+func TestDispatchEntriesSkipsDuplicateClientCommand(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	notifyChan := make(chan any, 1)
+	clientKey := clientRequestKey{clientID: 7, sequenceNum: 3}
+	r := &Raft{
+		stateMachine:          mockSM,
+		clientSessions:        map[int64]int64{7: 3},
+		notifyApply:           map[uint64][]chan any{10: []chan any{notifyChan}},
+		pendingLogClients:     map[uint64]clientRequestKey{10: clientKey},
+		pendingClientRequests: map[clientRequestKey]uint64{clientKey: 10},
+		mu:                    sync.Mutex{},
+		commitChan:            make(chan param.CommitEntry, 1),
+	}
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	entry := param.LogEntry{
+		Command: param.NewClientCommand(7, 3, []byte(`{"op":2,"key":"k","value":"v"}`)),
+		Index:   10,
+	}
+
+	r.dispatchEntries([]param.LogEntry{entry})
+
+	select {
+	case <-notifyChan:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out waiting for duplicate notification")
+	}
+	assert.Equal(t, uint64(10), r.lastApplied)
+	assert.Empty(t, r.pendingLogClients)
+	assert.Empty(t, r.pendingClientRequests)
+	assert.Empty(t, r.commitChan)
 }

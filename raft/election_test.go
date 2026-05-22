@@ -230,6 +230,7 @@ func TestStartElection(t *testing.T) {
 			// 通用初始化 Mock (NewRaft 会调用)
 			mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
 			mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).AnyTimes()
+			mockStore.EXPECT().ReadSnapshot().Return(nil, nil).AnyTimes()
 
 			// 用于同步的工具
 			stateChangeCh := make(chan string, 10)
