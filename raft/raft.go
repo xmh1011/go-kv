@@ -432,6 +432,7 @@ func (r *Raft) handleLinearizableRead(cmd param.KVCommand, reply *param.ClientRe
 	if !r.confirmLeadership() {
 		reply.Success = false
 		reply.NotLeader = true
+		reply.Result = "read quorum timeout"
 		// 确认失败意味着可能发生了网络分区或已有新 Leader，
 		// 建议客户端重试。
 		return nil
@@ -975,6 +976,8 @@ func (r *Raft) finalizeClientReply(args *param.ClientArgs, reply *param.ClientRe
 		if !r.isLeader() {
 			reply.NotLeader = true
 			reply.LeaderHint = leaderID
+		} else {
+			reply.Result = "apply timeout"
 		}
 	}
 }

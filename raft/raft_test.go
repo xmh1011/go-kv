@@ -506,6 +506,7 @@ func TestHandleLinearizableRead(t *testing.T) {
 					}).AnyTimes()
 			},
 			expectedSuccess: false,
+			expectedResult:  "read quorum timeout",
 			expectedNotLdr:  true,
 		},
 		{

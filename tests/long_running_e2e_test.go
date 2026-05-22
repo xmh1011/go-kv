@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -47,6 +48,50 @@ type LongRunningMetrics struct {
 	SnapshotMaxIndex  uint64
 	WALSize           int64
 	MemTableFlushes   int32
+	FailureReasons    []FailureReasonCount
+}
+
+type FailureReasonCount struct {
+	Reason string
+	Count  int64
+}
+
+type failureStats struct {
+	mu     sync.Mutex
+	counts map[string]int64
+}
+
+func newFailureStats() *failureStats {
+	return &failureStats{counts: make(map[string]int64)}
+}
+
+func (fs *failureStats) record(reason string) {
+	if reason == "" {
+		reason = "unknown"
+	}
+	fs.mu.Lock()
+	fs.counts[reason]++
+	fs.mu.Unlock()
+}
+
+func (fs *failureStats) snapshot() []FailureReasonCount {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	reasons := make([]string, 0, len(fs.counts))
+	for reason := range fs.counts {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+
+	result := make([]FailureReasonCount, 0, len(reasons))
+	for _, reason := range reasons {
+		result = append(result, FailureReasonCount{
+			Reason: reason,
+			Count:  fs.counts[reason],
+		})
+	}
+	return result
 }
 
 const (
@@ -539,7 +584,13 @@ func (c *longRunningCluster) getLeaderByID(leaderID int) *raft.Raft {
 // sendRequestWithLeaderTracking 向当前 Leader 发送请求，自动跟踪 Leader 变化
 // 当收到 NotLeader 响应时，更新 currentLeader 并重试
 func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic.Value, cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, error) {
+	success, latency, _, err := c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, maxRetries, stopCh)
+	return success, latency, err
+}
+
+func (c *longRunningCluster) sendRequestWithLeaderTrackingDetailed(currentLeader *atomic.Value, cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, string, error) {
 	var totalLatency time.Duration
+	lastFailureReason := "max_retries_exceeded"
 	cmdBytes, _ := json.Marshal(cmd)
 	args := &param.ClientArgs{
 		ClientID:    rand.Int63(),
@@ -552,7 +603,7 @@ func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic
 		if stopCh != nil {
 			select {
 			case <-stopCh:
-				return false, totalLatency, errLongRunningTestStopped
+				return false, totalLatency, "stopped", errLongRunningTestStopped
 			default:
 			}
 		}
@@ -563,6 +614,7 @@ func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic
 			// 尝试重新查找 Leader
 			newLeader := c.findLeader()
 			if newLeader == nil {
+				lastFailureReason = "no_leader"
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
@@ -578,8 +630,10 @@ func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic
 		totalLatency += latency
 
 		if err == nil && reply.Success {
-			return true, totalLatency, nil
+			return true, totalLatency, "", nil
 		}
+
+		lastFailureReason = classifyClientFailure(err, reply)
 
 		// 如果收到 NotLeader 响应，使用 LeaderHint 更新 Leader
 		if reply.NotLeader {
@@ -606,7 +660,7 @@ func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic
 				}
 			}
 			if !updatedLeader && !waitBeforeRetry(stopCh, retryBackoff(retry)) {
-				return false, totalLatency, errLongRunningTestStopped
+				return false, totalLatency, "stopped", errLongRunningTestStopped
 			}
 			continue
 		}
@@ -619,7 +673,34 @@ func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	return false, totalLatency, fmt.Errorf("max retries exceeded")
+	return false, totalLatency, lastFailureReason, fmt.Errorf("max retries exceeded: %s", lastFailureReason)
+}
+
+func classifyClientFailure(err error, reply *param.ClientReply) string {
+	if err != nil {
+		return "client_request_error"
+	}
+	if reply == nil {
+		return "unknown_reply"
+	}
+
+	result, _ := reply.Result.(string)
+	switch result {
+	case "read quorum timeout":
+		return "read_quorum_timeout"
+	case "read timeout":
+		return "read_apply_timeout"
+	case "apply timeout":
+		return "apply_timeout"
+	}
+
+	if reply.NotLeader {
+		return "not_leader"
+	}
+	if result == "" {
+		return "unsuccessful_reply"
+	}
+	return "reply_" + strings.ReplaceAll(result, " ", "_")
 }
 
 // getCurrentLeader 获取当前 Leader
@@ -746,6 +827,10 @@ func (c *longRunningCluster) waitForExpectedConsistency(t *testing.T, expected m
 
 // verifyDataConsistency 验证所有存活节点的数据一致性，包括缺失/删除状态。
 func (c *longRunningCluster) verifyDataConsistency(t *testing.T, sampleKeys []string) (bool, int64) {
+	return c.verifyDataConsistencyWithLog(t, sampleKeys, true)
+}
+
+func (c *longRunningCluster) verifyDataConsistencyWithLog(t *testing.T, sampleKeys []string, logMismatch bool) (bool, int64) {
 	if len(sampleKeys) == 0 {
 		return true, 0
 	}
@@ -776,14 +861,32 @@ func (c *longRunningCluster) verifyDataConsistency(t *testing.T, sampleKeys []st
 			verifiedCount++
 
 			if val.exists != leaderVal.exists || val.value != leaderVal.value {
-				t.Logf("Data mismatch: Node %d - Key '%s': Leader=(exists=%t,value=%q), Node=(exists=%t,value=%q)",
-					node.ID(), key, leaderVal.exists, leaderVal.value, val.exists, val.value)
+				if logMismatch && mismatchCount < 40 {
+					t.Logf("Data mismatch: Node %d - Key '%s': Leader=(exists=%t,value=%q), Node=(exists=%t,value=%q)",
+						node.ID(), key, leaderVal.exists, leaderVal.value, val.exists, val.value)
+				}
 				mismatchCount++
 			}
 		}
 	}
 
 	return mismatchCount == 0, verifiedCount
+}
+
+func (c *longRunningCluster) waitForDataConsistency(t *testing.T, sampleKeys []string, timeout time.Duration) (bool, int64) {
+	deadline := time.Now().Add(timeout)
+	var verified int64
+	for time.Now().Before(deadline) {
+		consistent, count := c.verifyDataConsistencyWithLog(t, sampleKeys, false)
+		verified = count
+		if consistent {
+			return true, verified
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	consistent, count := c.verifyDataConsistency(t, sampleKeys)
+	return consistent, count
 }
 
 // ========== 生产环境 10分钟长时性能测试 ==========
@@ -901,7 +1004,7 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 		key := fmt.Sprintf("warmup-key-%d", i)
 		value := fmt.Sprintf("warmup-value-%d", i)
 		cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
-		success, _, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, nil)
+		success, _, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, longRunningClientRetries, nil)
 		if success {
 			warmupSuccess++
 		}
@@ -926,6 +1029,7 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 		writeLatencySampler  = newLatencySampler(maxLatencySamples)
 		readLatencySampler   = newLatencySampler(maxLatencySamples)
 		deleteLatencySampler = newLatencySampler(maxLatencySamples)
+		failures             = newFailureStats()
 		keysForVerification  []string
 		sampleKeysMutex      sync.Mutex
 	)
@@ -955,13 +1059,16 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 					var success bool
 					var latency time.Duration
 					var err error
+					var failureReason string
+					attempted := false
 
 					if r < 0.6 { // 60% 写入操作
 						key := fmt.Sprintf("%s-key-%d-%d", clientPrefix, cid, rand.Intn(50000))
 						value := fmt.Sprintf("%s-val-%d", clientPrefix, rand.Intn(1000000))
 						cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-						success, latency, err = c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						attempted = true
+						success, latency, failureReason, err = c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
@@ -969,9 +1076,8 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 						atomic.AddInt64(&writeOps, 1)
 						writeLatencySampler.add(latency)
 
-						localKeys = append(localKeys, key)
-
 						if success {
+							localKeys = append(localKeys, key)
 							atomic.AddInt64(&bytesWritten, int64(len(key)+len(value)))
 						}
 
@@ -984,7 +1090,8 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 						}
 
 						cmd := param.KVCommand{Op: param.OpGet, Key: key}
-						success, latency, err = c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						attempted = true
+						success, latency, failureReason, err = c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
@@ -993,31 +1100,37 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 						readLatencySampler.add(latency)
 
 					} else { // 15% 删除操作
-						if len(localKeys) > 0 {
-							idx := rand.Intn(len(localKeys))
-							key := localKeys[idx]
-							cmd := param.KVCommand{Op: param.OpDelete, Key: key}
+						if len(localKeys) == 0 {
+							continue
+						}
+						idx := rand.Intn(len(localKeys))
+						key := localKeys[idx]
+						cmd := param.KVCommand{Op: param.OpDelete, Key: key}
 
-							success, latency, err = c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
-							if errors.Is(err, errLongRunningTestStopped) {
-								return
-							}
+						attempted = true
+						success, latency, failureReason, err = c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
+						if errors.Is(err, errLongRunningTestStopped) {
+							return
+						}
 
-							atomic.AddInt64(&deleteOps, 1)
-							deleteLatencySampler.add(latency)
+						atomic.AddInt64(&deleteOps, 1)
+						deleteLatencySampler.add(latency)
 
-							if success {
-								localKeys = append(localKeys[:idx], localKeys[idx+1:]...)
-							}
+						if success {
+							localKeys = append(localKeys[:idx], localKeys[idx+1:]...)
 						}
 					}
 
+					if !attempted {
+						continue
+					}
 					atomic.AddInt64(&totalOps, 1)
 					if success {
 						atomic.AddInt64(&successOps, 1)
 						latencySampler.add(latency)
 					} else {
 						atomic.AddInt64(&failedOps, 1)
+						failures.record(failureReason)
 					}
 
 					// 周期性收集样本键用于一致性验证
@@ -1045,9 +1158,14 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 			elapsed, ops, success, failed, float64(success)/elapsed.Seconds(), latencySampler.count())
 	})
 
-	// 最终一致性检查
-	finalConsistent, finalVerified := c.verifyDataConsistency(t, keysForVerification)
+	sampleKeysMutex.Lock()
+	verificationKeys := append([]string(nil), keysForVerification...)
+	sampleKeysMutex.Unlock()
+
+	// 最终一致性检查：停止客户端后给 follower 留出追赶时间；超时仍不一致才判定失败。
+	finalConsistent, finalVerified := c.waitForDataConsistency(t, verificationKeys, 45*time.Second)
 	t.Logf("[最终一致性检查] 已验证: %d 条数据, 结果: %v", finalVerified, finalConsistent)
+	snapshotNodes, maxSnapshotIndex := c.snapshotStats()
 
 	// 输出测试结果
 	metrics := LongRunningMetrics{
@@ -1072,9 +1190,15 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 		LeaderElections:   atomic.LoadInt32(&c.leaderElections),
 		DataConsistencyOK: finalConsistent,
 		KeysVerified:      finalVerified,
+		SnapshotCount:     snapshotNodes,
+		SnapshotMaxIndex:  maxSnapshotIndex,
+		FailureReasons:    failures.snapshot(),
 	}
 
 	printLongRunningMetrics(t, &metrics)
+	if !finalConsistent {
+		t.Fatalf("comprehensive consistency check failed after waiting for followers to catch up")
+	}
 }
 
 // TestLongRunning_10Min_WriteHeavy 10分钟写入密集型测试
@@ -1849,6 +1973,12 @@ func printLongRunningMetrics(t *testing.T, metrics *LongRunningMetrics) {
 	t.Logf("  成功操作: %d", metrics.SuccessOps)
 	t.Logf("  失败操作: %d", metrics.FailedOps)
 	t.Logf("  成功率: %.2f%%", float64(metrics.SuccessOps)/float64(metrics.TotalOps)*100)
+	if len(metrics.FailureReasons) > 0 {
+		t.Logf("  失败原因:")
+		for _, reason := range metrics.FailureReasons {
+			t.Logf("    %s: %d", reason.Reason, reason.Count)
+		}
+	}
 	t.Logf("----------------------------------------")
 	t.Logf("操作类型分布:")
 	t.Logf("  写入操作: %d (%.1f%%)", metrics.WriteOps, float64(metrics.WriteOps)/float64(metrics.SuccessOps)*100)

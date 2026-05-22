@@ -535,6 +535,32 @@ func (sm *blockingApplyStateMachine) ApplySnapshot(snapshot []byte) error {
 	return nil
 }
 
+type blockingSnapshotStateMachine struct {
+	snapshotStarted     chan struct{}
+	releaseSnapshot     chan struct{}
+	snapshotStartedOnce sync.Once
+}
+
+func (sm *blockingSnapshotStateMachine) Apply(entry param.LogEntry) any {
+	return "applied"
+}
+
+func (sm *blockingSnapshotStateMachine) Get(key string) (string, error) {
+	return "", nil
+}
+
+func (sm *blockingSnapshotStateMachine) GetSnapshot() ([]byte, error) {
+	sm.snapshotStartedOnce.Do(func() {
+		close(sm.snapshotStarted)
+	})
+	<-sm.releaseSnapshot
+	return []byte("snapshot"), nil
+}
+
+func (sm *blockingSnapshotStateMachine) ApplySnapshot(snapshot []byte) error {
+	return nil
+}
+
 func TestApplyLogsAdvancesLastAppliedAfterStateMachineApply(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -588,6 +614,68 @@ func TestApplyLogsAdvancesLastAppliedAfterStateMachineApply(t *testing.T) {
 	r.mu.Lock()
 	assert.Equal(t, uint64(1), r.lastApplied)
 	r.mu.Unlock()
+}
+
+func TestApplyLogsReleasesApplyMuBeforeSnapshotExport(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	entry := &param.LogEntry{Term: 1, Index: 1, Command: "cmd"}
+	mockStore := storage.NewMockStorage(ctrl)
+	mockStore.EXPECT().GetEntry(uint64(1)).Return(entry, nil).Times(2)
+	mockStore.EXPECT().LogSize().Return(2, nil).Times(1)
+	mockStore.EXPECT().SaveSnapshot(gomock.Any()).Return(nil).Times(1)
+	mockStore.EXPECT().CompactLog(uint64(1)).Return(nil).Times(1)
+
+	sm := &blockingSnapshotStateMachine{
+		snapshotStarted: make(chan struct{}),
+		releaseSnapshot: make(chan struct{}),
+	}
+	r := &Raft{
+		id:                 1,
+		commitIndex:        1,
+		lastApplied:        0,
+		cachedLastLogIndex: 1,
+		snapshotThreshold:  1,
+		store:              mockStore,
+		stateMachine:       sm,
+		notifyApply:        make(map[uint64][]chan any),
+	}
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	applyDone := make(chan struct{})
+	go func() {
+		r.applyLogs()
+		close(applyDone)
+	}()
+
+	select {
+	case <-sm.snapshotStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for snapshot export to start")
+	}
+
+	applyMuAcquired := make(chan struct{})
+	go func() {
+		r.applyMu.Lock()
+		r.applyMu.Unlock()
+		close(applyMuAcquired)
+	}()
+
+	select {
+	case <-applyMuAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("applyMu stayed locked while snapshot export was blocked")
+	}
+
+	close(sm.releaseSnapshot)
+
+	select {
+	case <-applyDone:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for applyLogs to finish")
+	}
+	r.snapshotWG.Wait()
 }
 
 func TestProcessBatchCommitsSingleNodeEntry(t *testing.T) {
@@ -1373,6 +1461,58 @@ func TestSuccessfulAppendEntriesReplyDoesNotRegressPeerProgress(t *testing.T) {
 
 	assert.Equal(t, uint64(12), r.nextIndex[2])
 	assert.Equal(t, uint64(11), r.matchIndex[2])
+}
+
+func TestSuccessfulAppendEntriesRequestsNextBatchWhenPeerStillBehind(t *testing.T) {
+	r := &Raft{
+		id:                 1,
+		peerIDs:            []int{1, 2, 3, 4, 5},
+		nextIndex:          map[int]uint64{2: 10},
+		matchIndex:         map[int]uint64{2: 9},
+		cachedLastLogIndex: 50,
+	}
+	r.setState(Leader)
+
+	entries := make([]param.LogEntry, MaxEntriesPerAppendEntries)
+	for i := range entries {
+		entries[i] = param.LogEntry{Index: uint64(10 + i), Term: 1}
+	}
+	args := &param.AppendEntriesArgs{
+		PrevLogIndex: 9,
+		Entries:      entries,
+	}
+
+	shouldContinue := r.handleSuccessfulAppendEntries(2, args)
+
+	assert.True(t, shouldContinue)
+	assert.Equal(t, uint64(42), r.nextIndex[2])
+	assert.Equal(t, uint64(41), r.matchIndex[2])
+}
+
+func TestSuccessfulAppendEntriesDoesNotRequestNextBatchWhenPeerCaughtUp(t *testing.T) {
+	r := &Raft{
+		id:                 1,
+		peerIDs:            []int{1, 2, 3, 4, 5},
+		nextIndex:          map[int]uint64{2: 10},
+		matchIndex:         map[int]uint64{2: 9},
+		cachedLastLogIndex: 41,
+	}
+	r.setState(Leader)
+
+	entries := make([]param.LogEntry, MaxEntriesPerAppendEntries)
+	for i := range entries {
+		entries[i] = param.LogEntry{Index: uint64(10 + i), Term: 1}
+	}
+	args := &param.AppendEntriesArgs{
+		PrevLogIndex: 9,
+		Entries:      entries,
+	}
+
+	shouldContinue := r.handleSuccessfulAppendEntries(2, args)
+
+	assert.False(t, shouldContinue)
+	assert.Equal(t, uint64(42), r.nextIndex[2])
+	assert.Equal(t, uint64(41), r.matchIndex[2])
 }
 
 func TestFailedAppendEntriesReplyDoesNotBacktrackBelowMatchIndex(t *testing.T) {
