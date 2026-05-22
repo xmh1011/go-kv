@@ -14,8 +14,9 @@ go-kv 是一个基于 Raft 共识协议的分布式 KV 存储系统，使用 LSM
 |---------|------|---------------|
 | `go test -race ./pkg/storage/lsm ./raft ./engine/lsm/... ./pkg/storage/... ./pkg/param` | **通过** | Raft、LSM、存储适配层核心 race 覆盖 |
 | `make test` | **通过** | 全仓单元测试与集成测试入口 |
-| `go test -race -v -timeout=30m ./tests/integration_test.go` | **通过** | 356.444s，覆盖选举、复制、故障转移、分区、快照、重启、成员变更 |
+| `make integration-test` | **通过** | 356.522s，覆盖选举、复制、故障转移、分区、快照、重启、成员变更 |
 | `go test -race -v -timeout=20m ./tests/long_running_e2e_test.go -run TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots -count=1` | **通过** | 606.524s，真实重启 + 快照 + 最终一致性校验 |
+| `go test -race -v -timeout=25m ./tests/long_running_e2e_test.go -run '^TestLongRunning_10Min_Comprehensive$' -count=1` | **通过** | 607.73s，综合读写删、Leader 切换、快照、最终一致性校验 |
 | `go test -race -v -timeout=30m ./tests/e2e_perf_test.go` | **通过** | 422.562s，覆盖本地与 gRPC 网络性能场景 |
 
 ---
@@ -68,6 +69,41 @@ func encodeLogEntry(entry *param.LogEntry) ([]byte, error) {
 ```
 
 修复后同一长测完成 545,390 次操作，0 失败，所有节点最终数据一致。
+
+### 综合长测复验：复制追赶与一致性断言
+
+2026-05-22 的后续综合长测进一步覆盖了 ReadIndex 失败分类、Follower 快照后追赶、快照导出与 `lastApplied` 发布顺序，以及“最终一致性失败必须让测试失败”的断言。
+
+```bash
+go test -race -v -timeout=25m ./tests/long_running_e2e_test.go \
+  -run '^TestLongRunning_10Min_Comprehensive$' \
+  -count=1
+```
+
+| 指标 | 数值 |
+|------|------|
+| 总操作数 | 346,634 |
+| 成功操作 | 346,634 |
+| 失败操作 | 0 |
+| 成功率 | **100.00%** |
+| 总吞吐量 | **577.72 ops/sec** |
+| 写入操作 | 208,083 (60.0%) |
+| 读取操作 | 86,675 (25.0%) |
+| 删除操作 | 51,876 (15.0%) |
+| P50 延迟 | 9.786417ms |
+| P95 延迟 | 37.089209ms |
+| P99 延迟 | 85.199459ms |
+| Leader 切换 | 19 次 |
+| 生成快照的节点数 | 3 |
+| 最大快照 index | 260,109 |
+| 最终一致性校验 | **通过**，1,988 个 node-key 组合全部一致 |
+
+本轮修复点：
+
+1. 对 `read quorum timeout`、`read apply timeout`、`apply timeout`、`not leader` 等失败原因做分类统计，避免只看到聚合失败数。
+2. 客户端停止后先等待 Follower 追赶，超时仍不一致时调用 `t.Fatalf`，避免一致性失败被误报为通过。
+3. 成功的 `AppendEntries` 如果仍未追上 Leader，会立即触发下一批复制，不再受 100ms heartbeat 和 32 条批大小限制。
+4. 普通命令的状态机写入与 `lastApplied` 推进在同一个 `stateMachineMu` 临界区内完成，快照不会观察到“新数据 + 旧 LastIncludedIndex”的混合状态。
 
 ---
 
@@ -335,25 +371,32 @@ InMemory Storage 的 `GetEntry` 在 index 越界时返回 `(nil, ErrLogNotFound)
 ## 测试命令
 
 ```bash
-# 单元测试
-go test $(go list ./... | grep -v /tests) -count=1 -short
+# 单元测试（排除 tests/ 目录，生成 coverage.txt）
+make test
 
-# 单元测试 + 竞态检测
-go test -race $(go list ./... | grep -v /tests) -count=1 -short
+# 集成测试
+make integration-test
 
 # E2E 性能测试 (30s)
-go test ./tests/ -run TestE2E -short -v -timeout 600s
+make e2e-test
 
 # Benchmark 测试
-go test ./tests/ -run='^$' -bench=. -benchtime=100x -timeout 300s
+make bench-test
 
-# 10 分钟长时测试
-go test ./tests/ -run '^TestLongRunning_10Min_' -timeout 90m -v
+# 10 分钟长时测试（每个子场景都可能运行 10 分钟以上）
+make long-test
+
+# 单个综合长测复现命令
+go test -race -v -timeout=25m ./tests/long_running_e2e_test.go \
+  -run '^TestLongRunning_10Min_Comprehensive$' \
+  -count=1
 
 # 静态分析
 go vet ./...
 ```
 
+`go test -race ./... -short -count=1` 目前会进入 `tests` 包中的重量级集成场景，并可能在 Go 默认 10 分钟包级超时处失败。该通用工作流问题已单独追踪，推荐使用上面的 Makefile 分层入口运行验证。
+
 ---
 
-**最后更新**: 2026-03-31
+**最后更新**: 2026-05-22

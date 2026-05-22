@@ -266,7 +266,9 @@ func (r *Raft) processAppendEntriesReply(peerID int, args *param.AppendEntriesAr
 		}
 
 		if reply.Success {
-			r.handleSuccessfulAppendEntries(peerID, args)
+			if r.handleSuccessfulAppendEntries(peerID, args) {
+				go r.sendAppendEntries(peerID)
+			}
 		} else {
 			r.handleFailedAppendEntries(peerID, reply)
 		}
@@ -274,7 +276,7 @@ func (r *Raft) processAppendEntriesReply(peerID int, args *param.AppendEntriesAr
 }
 
 // handleSuccessfulAppendEntries 在收到成功的 AppendEntries 响应后更新 Leader 的状态。
-func (r *Raft) handleSuccessfulAppendEntries(peerID int, args *param.AppendEntriesArgs) {
+func (r *Raft) handleSuccessfulAppendEntries(peerID int, args *param.AppendEntriesArgs) bool {
 	newNextIndex := args.PrevLogIndex + uint64(len(args.Entries)) + 1
 	newMatchIndex := newNextIndex - 1
 	if newNextIndex > r.nextIndex[peerID] {
@@ -285,6 +287,12 @@ func (r *Raft) handleSuccessfulAppendEntries(peerID int, args *param.AppendEntri
 	}
 
 	r.updateCommitIndex()
+
+	// Continue streaming the next batch immediately while the peer is still
+	// behind. Relying only on the 100ms heartbeat loop limits catch-up to
+	// MaxEntriesPerAppendEntries per tick, which leaves snapshot-restored
+	// followers minutes behind under long-running write workloads.
+	return r.getState() == Leader && r.nextIndex[peerID] <= r.cachedLastLogIndex
 }
 
 // handleFailedAppendEntries 在收到失败的 AppendEntries 响应后调整 nextIndex。
@@ -732,11 +740,11 @@ func (r *Raft) startApplyLogsLocked() {
 // applyLogs 将已提交的日志应用到状态机。此函数会在后台 goroutine 中运行。
 func (r *Raft) applyLogs() {
 	r.applyMu.Lock()
-	defer r.applyMu.Unlock()
 
 	// 1. 从存储中获取所有需要应用的日志条目。
 	entriesToApply, lastAppliedBefore := r.fetchEntriesToApply()
 	if len(entriesToApply) == 0 {
+		r.applyMu.Unlock()
 		return
 	}
 
@@ -745,8 +753,10 @@ func (r *Raft) applyLogs() {
 
 	// 2. 遍历并分发每一条待应用的日志。
 	r.dispatchEntries(entriesToApply)
+	r.applyMu.Unlock()
 
-	// 3. 检查是否需要触发快照
+	// 3. 检查是否需要触发快照。快照导出可能会触发 LSM flush 和 SSTable
+	// 扫描，不能占用 applyMu，否则后续已提交日志会在快照期间无法进入应用流程。
 	r.TakeSnapshot()
 }
 
@@ -838,13 +848,16 @@ func (r *Raft) dispatchEntries(entries []param.LogEntry) {
 			// 配置变更不需要返回结果，客户端只关心 Success
 			result = nil
 		default:
-			// 普通命令：先应用状态机（不持有锁）
+			// 普通命令：状态机写入和 lastApplied 推进必须对快照原子可见。
+			// 否则快照可能捕获已经写入状态机、但 LastIncludedIndex 尚未覆盖的命令。
 			r.stateMachineMu.Lock()
 			result = r.stateMachine.Apply(appliedEntry)
+			r.completeAppliedEntry(entry.Index, result, clientID, sequenceNum, hasClient)
 			r.stateMachineMu.Unlock()
 
 			// 发送到 commitChan（不持有锁）
 			r.applyStateMachineCommand(appliedEntry)
+			continue
 		}
 
 		r.completeAppliedEntry(entry.Index, result, clientID, sequenceNum, hasClient)
