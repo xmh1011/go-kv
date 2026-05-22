@@ -626,27 +626,17 @@ func (t *Transport) InstallSnapshotStream(stream pb.RaftService_InstallSnapshotS
 
 		// 最后一个 chunk，完成快照安装
 		if chunk.Done {
-			// 将缓冲区分块发送给 Raft
-			chunkSize := 4 * 1024 * 1024 // 4MB chunks
-			var currentOffset uint64 = 0
+			if receivedBytes != totalSize {
+				return fmt.Errorf("snapshot stream ended at %d bytes, expected %d", receivedBytes, totalSize)
+			}
+
+			snapshotMetadata.Offset = 0
+			snapshotMetadata.Data = snapshotBuffer
+			snapshotMetadata.Done = true
 
 			reply := &param.InstallSnapshotReply{}
-
-			for currentOffset < uint64(len(snapshotBuffer)) {
-				chunkEnd := currentOffset + uint64(chunkSize)
-				if chunkEnd > uint64(len(snapshotBuffer)) {
-					chunkEnd = uint64(len(snapshotBuffer))
-				}
-
-				snapshotMetadata.Offset = currentOffset
-				snapshotMetadata.Data = snapshotBuffer[currentOffset:chunkEnd]
-				snapshotMetadata.Done = (chunkEnd == uint64(len(snapshotBuffer)))
-
-				if err := t.raft.InstallSnapshot(snapshotMetadata, reply); err != nil {
-					return fmt.Errorf("failed to install snapshot chunk at offset %d: %w", currentOffset, err)
-				}
-
-				currentOffset = chunkEnd
+			if err := t.raft.InstallSnapshot(snapshotMetadata, reply); err != nil {
+				return fmt.Errorf("failed to install snapshot: %w", err)
 			}
 
 			log.Debugf("[GRPCTransport] Snapshot installation completed: size=%d bytes", receivedBytes)
