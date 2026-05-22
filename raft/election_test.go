@@ -16,6 +16,34 @@ import (
 	"github.com/xmh1011/go-kv/pkg/transport"
 )
 
+func TestGetLastLogInfoForElectionRefreshesStaleCachedIndex(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	snapshot := param.NewSnapshot(5, 2, []byte("snapshot"))
+
+	gomock.InOrder(
+		mockStore.EXPECT().GetEntry(uint64(10)).Return(nil, nil),
+		mockStore.EXPECT().ReadSnapshot().Return(snapshot, nil),
+		mockStore.EXPECT().LastLogIndex().Return(uint64(5), nil),
+	)
+
+	r := &Raft{
+		id:                 3,
+		store:              mockStore,
+		snapshot:           snapshot,
+		cachedLastLogIndex: 10,
+	}
+
+	lastLogIndex, lastLogTerm, err := r.getLastLogInfoForElection()
+
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(5), lastLogIndex)
+	assert.Equal(t, uint64(2), lastLogTerm)
+	assert.Equal(t, uint64(5), r.cachedLastLogIndex)
+}
+
 func TestStartElection(t *testing.T) {
 	type state struct {
 		term               uint64

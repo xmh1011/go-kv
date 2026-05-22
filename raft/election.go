@@ -213,6 +213,18 @@ func (r *Raft) getLastLogInfoForElection() (lastLogIndex uint64, lastLogTerm uin
 	if lastLogIndex > 0 {
 		lastLogTerm, err = r.getLogTermLocked(lastLogIndex)
 		if err != nil {
+			if errors.Is(err, errLogEntryNotFound) {
+				log.Debugf("[Election] Node %d cached last log index %d is unavailable; refreshing from storage", r.id, lastLogIndex)
+				r.refreshCachedLastLogIndexLocked()
+				lastLogIndex = r.cachedLastLogIndex
+				if lastLogIndex == 0 {
+					return 0, 0, nil
+				}
+				lastLogTerm, err = r.getLogTermLocked(lastLogIndex)
+				if err == nil {
+					return lastLogIndex, lastLogTerm, nil
+				}
+			}
 			log.Errorf("[Election] Node %d failed to get last log term for election: %v", r.id, err)
 			return 0, 0, err
 		}
