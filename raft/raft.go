@@ -346,6 +346,7 @@ func (r *Raft) Stop() {
 
 	log.Debugf("[Core] Node %d received stop signal.", r.id)
 	r.setState(Dead)
+	r.abortPendingApplyWaitersLocked()
 
 	// 广播 lastAppliedCond，唤醒可能在等待的读请求
 	// 这样它们可以检测到节点已停止并退出
@@ -1274,6 +1275,7 @@ func (r *Raft) becomeFollower(newTerm uint64) error {
 	r.currentTerm = newTerm
 	r.setState(Follower)
 	r.votedFor = -1 // 进入新任期时，重置投票记录。
+	r.abortPendingApplyWaitersLocked()
 
 	// 每当我们成为 Follower（无论何种原因），
 	// 都应该重置选举计时器，并为下一次超时设置一个新的随机值。
@@ -1292,6 +1294,17 @@ func (r *Raft) becomeFollower(newTerm uint64) error {
 		return err
 	}
 	return nil
+}
+
+func (r *Raft) abortPendingApplyWaitersLocked() {
+	for index, waiters := range r.notifyApply {
+		for _, waiter := range waiters {
+			close(waiter)
+		}
+		delete(r.notifyApply, index)
+	}
+	clear(r.pendingClientRequests)
+	clear(r.pendingLogClients)
 }
 
 // waitForAppliedLog 等待一个特定索引的日志被状态机应用。
@@ -1371,7 +1384,10 @@ func (r *Raft) waitForAppliedLogMatching(index uint64, timeout time.Duration, ex
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
-	case result := <-notifyChan:
+	case result, ok := <-notifyChan:
+		if !ok {
+			return nil, false
+		}
 		log.Debugf("[Client] Notified that log index %d has been applied.", index)
 		if requireClientMatch {
 			r.mu.Lock()

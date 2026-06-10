@@ -3,6 +3,7 @@ package raft
 import (
 	"errors"
 	"math"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,37 @@ import (
 	memstorage "github.com/xmh1011/go-kv/pkg/storage/inmemory"
 	"github.com/xmh1011/go-kv/pkg/transport"
 )
+
+type preparedSnapshotStateMachine struct {
+	readStarted chan struct{}
+	releaseRead chan struct{}
+}
+
+func (sm *preparedSnapshotStateMachine) Apply(param.LogEntry) any {
+	return nil
+}
+
+func (sm *preparedSnapshotStateMachine) Get(string) (string, error) {
+	return "", nil
+}
+
+func (sm *preparedSnapshotStateMachine) GetSnapshot() ([]byte, error) {
+	close(sm.readStarted)
+	<-sm.releaseRead
+	return []byte("legacy-snapshot"), nil
+}
+
+func (sm *preparedSnapshotStateMachine) PrepareSnapshot() (func() ([]byte, error), error) {
+	return func() ([]byte, error) {
+		close(sm.readStarted)
+		<-sm.releaseRead
+		return []byte("prepared-snapshot"), nil
+	}, nil
+}
+
+func (sm *preparedSnapshotStateMachine) ApplySnapshot([]byte) error {
+	return nil
+}
 
 func TestTakeSnapshot(t *testing.T) {
 	type state struct {
@@ -159,6 +191,69 @@ func TestTakeSnapshot(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTakeSnapshotReleasesStateMachineMuForPreparedSnapshotRead(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	sm := &preparedSnapshotStateMachine{
+		readStarted: make(chan struct{}),
+		releaseRead: make(chan struct{}),
+	}
+
+	mockStore.EXPECT().LogSize().Return(1001, nil)
+	mockStore.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 3, Index: 10}, nil)
+	mockStore.EXPECT().SaveSnapshot(gomock.Any()).DoAndReturn(func(snapshot *param.Snapshot) error {
+		assert.Equal(t, []byte("prepared-snapshot"), snapshot.Data)
+		return nil
+	})
+	mockStore.EXPECT().CompactLog(uint64(10)).Return(nil)
+
+	r := &Raft{
+		id:                1,
+		store:             mockStore,
+		stateMachine:      sm,
+		snapshotThreshold: 1000,
+		lastApplied:       10,
+		notifyApply:       make(map[uint64][]chan any),
+	}
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+	r.setState(Leader)
+
+	result := make(chan bool, 1)
+	go func() {
+		result <- r.TakeSnapshot()
+	}()
+
+	select {
+	case <-sm.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for prepared snapshot read to start")
+	}
+
+	locked := make(chan struct{})
+	go func() {
+		r.stateMachineMu.Lock()
+		close(locked)
+		r.stateMachineMu.Unlock()
+	}()
+
+	select {
+	case <-locked:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("stateMachineMu remained locked during prepared snapshot file read")
+	}
+
+	close(sm.releaseRead)
+	select {
+	case ok := <-result:
+		assert.True(t, ok)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for TakeSnapshot to finish")
+	}
+	r.snapshotWG.Wait()
 }
 
 func TestTakeSnapshotReturnsWhileSnapshotAlreadyInProgress(t *testing.T) {

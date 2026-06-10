@@ -504,3 +504,18 @@ func (m *Manager) GetAllFiles() []string {
 	}
 	return allFiles
 }
+
+// HoldFilesSnapshot returns the current SSTable file list and holds the manager
+// read lock until the returned release function is called. This pins immutable
+// SSTable files against compaction removal while a Raft snapshot copies them.
+func (m *Manager) HoldFilesSnapshot() ([]string, func()) {
+	m.mu.RLock()
+
+	var allFiles []string
+	for _, tables := range m.levels {
+		for _, table := range tables {
+			allFiles = append(allFiles, table.FilePath())
+		}
+	}
+	return allFiles, m.mu.RUnlock
+}
