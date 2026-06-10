@@ -105,10 +105,31 @@ func TestValidateLongRunningMetricsRequiresConsistencyEvidence(t *testing.T) {
 	}
 }
 
+func TestValidateLongRunningMetricsRequiresOperationAccounting(t *testing.T) {
+	metrics := LongRunningMetrics{
+		TestName:          "read-heavy",
+		SuccessOps:        10,
+		ReadThroughput:    10,
+		DataConsistencyOK: true,
+		KeysVerified:      10,
+	}
+
+	err := validateLongRunningMetrics(metrics, longRunningValidationOptions{
+		RequireOperationAccounting: true,
+	})
+	if err == nil {
+		t.Fatal("expected missing operation accounting to be rejected")
+	}
+	if !strings.Contains(err.Error(), "operation accounting mismatch") {
+		t.Fatalf("expected operation accounting failure, got: %v", err)
+	}
+}
+
 type longRunningValidationOptions struct {
-	RequireNoFailedOps  bool
-	RequireConsistency  bool
-	RequireVerifiedKeys bool
+	RequireNoFailedOps         bool
+	RequireConsistency         bool
+	RequireVerifiedKeys        bool
+	RequireOperationAccounting bool
 }
 
 func validateLongRunningMetrics(metrics LongRunningMetrics, opts longRunningValidationOptions) error {
@@ -121,6 +142,13 @@ func validateLongRunningMetrics(metrics LongRunningMetrics, opts longRunningVali
 	}
 	if opts.RequireVerifiedKeys && metrics.KeysVerified == 0 {
 		return fmt.Errorf("%s consistency check verified zero keys", metrics.TestName)
+	}
+	if opts.RequireOperationAccounting {
+		accountedOps := metrics.WriteOps + metrics.ReadOps + metrics.DeleteOps
+		if accountedOps != metrics.SuccessOps {
+			return fmt.Errorf("%s operation accounting mismatch: write=%d read=%d delete=%d success=%d",
+				metrics.TestName, metrics.WriteOps, metrics.ReadOps, metrics.DeleteOps, metrics.SuccessOps)
+		}
 	}
 	return nil
 }
@@ -1873,6 +1901,7 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 		totalOps       int64
 		successOps     int64
 		failedOps      int64
+		readOps        int64
 		bytesRead      int64
 		latencySampler = newLatencySampler(maxLatencySamples)
 		failures       = newFailureStats()
@@ -1912,6 +1941,7 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 				}
 
 				atomic.AddInt64(&totalOps, 1)
+				atomic.AddInt64(&readOps, 1)
 				if success {
 					atomic.AddInt64(&successOps, 1)
 					// 使用当前 Leader 获取数据大小
@@ -1949,12 +1979,13 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 		TotalOps:          totalOps,
 		SuccessOps:        successOps,
 		FailedOps:         failedOps,
+		ReadOps:           readOps,
 		BytesRead:         bytesRead,
 		LatencyP50:        percentileLong(latencySampler.getAll(), 50),
 		LatencyP95:        percentileLong(latencySampler.getAll(), 95),
 		LatencyP99:        percentileLong(latencySampler.getAll(), 99),
 		ThroughputOps:     float64(successOps) / duration.Seconds(),
-		ReadThroughput:    float64(successOps) / duration.Seconds(),
+		ReadThroughput:    float64(readOps) / duration.Seconds(),
 		ErrorRate:         float64(failedOps) / float64(totalOps) * 100,
 		LeaderElections:   atomic.LoadInt32(&c.leaderElections),
 		DataConsistencyOK: finalConsistent,
@@ -1966,9 +1997,10 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 
 	printLongRunningMetrics(t, &metrics)
 	requireLongRunningMetrics(t, metrics, longRunningValidationOptions{
-		RequireNoFailedOps:  true,
-		RequireConsistency:  true,
-		RequireVerifiedKeys: true,
+		RequireNoFailedOps:         true,
+		RequireConsistency:         true,
+		RequireVerifiedKeys:        true,
+		RequireOperationAccounting: true,
 	})
 }
 
