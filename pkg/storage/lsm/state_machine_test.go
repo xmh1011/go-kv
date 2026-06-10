@@ -3,12 +3,15 @@ package lsm
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
 	"github.com/xmh1011/go-kv/engine/lsm/database"
+	"github.com/xmh1011/go-kv/pkg/config"
 	"github.com/xmh1011/go-kv/pkg/param"
 )
 
@@ -56,6 +59,45 @@ func TestStateMachineAdapter_Snapshot(t *testing.T) {
 	val, err = newAdapter.Get("k2")
 	assert.NoError(t, err)
 	assert.Equal(t, "v2", val)
+}
+
+func TestStateMachineAdapterSnapshotIncludesAllImmutableMemTables(t *testing.T) {
+	oldLSMConfig := config.Conf.LSM
+	config.Conf.LSM.MaxMemTableSize = 128
+	config.Conf.LSM.MaxIMemTableCount = 100
+	t.Cleanup(func() {
+		config.Conf.LSM = oldLSMConfig
+	})
+
+	db, dir := setupTestDB(t, "lsm_sm_snap_imems")
+	defer cleanupTestDB(t, dir)
+
+	adapter := NewStateMachineAdapter(db)
+	defer adapter.Close()
+
+	expected := make(map[string]string)
+	for i := 0; i < 8; i++ {
+		key := fmt.Sprintf("imem-key-%02d", i)
+		value := fmt.Sprintf("value-%02d-%s", i, strings.Repeat("x", 64))
+		expected[key] = value
+		adapter.Apply(param.LogEntry{Command: mustMarshal(param.KVCommand{Op: param.OpSet, Key: key, Value: value})})
+	}
+
+	snapData, err := adapter.GetSnapshot()
+	assert.NoError(t, err)
+
+	newDB, newDir := setupTestDB(t, "lsm_sm_snap_imems_restore")
+	defer cleanupTestDB(t, newDir)
+
+	newAdapter := NewStateMachineAdapter(newDB)
+	defer newAdapter.Close()
+	assert.NoError(t, newAdapter.ApplySnapshot(snapData))
+
+	for key, expectedValue := range expected {
+		got, err := newAdapter.Get(key)
+		assert.NoError(t, err, "key %s should be present after snapshot restore", key)
+		assert.Equal(t, expectedValue, got)
+	}
 }
 
 func setupTestDB(t *testing.T, name string) (*database.Database, string) {
