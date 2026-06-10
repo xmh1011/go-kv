@@ -95,6 +95,14 @@ type StateMachine interface {
 	ApplySnapshot(snapshot []byte) error
 }
 
+// PreparedSnapshotStateMachine can split snapshot generation into a short
+// state-machine-critical preparation step and a longer read/encode step.
+// Raft calls PrepareSnapshot while Apply is blocked, then runs the returned
+// function after releasing the state-machine lock.
+type PreparedSnapshotStateMachine interface {
+	PrepareSnapshot() (func() ([]byte, error), error)
+}
+
 func NewStorage(storageType, dataDir string, nodeID int) (Storage, StateMachine, error) {
 	nodeDir := fmt.Sprintf("%s/node-%d", dataDir, nodeID)
 	if err := os.MkdirAll(nodeDir, 0755); err != nil {

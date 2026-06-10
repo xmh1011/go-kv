@@ -90,6 +90,17 @@ func (lsm *StateMachineAdapter) Get(key string) (string, error) {
 // 3. 读取所有 SSTable 文件的内容。
 // 4. 将文件名（相对路径）和内容打包成长度前缀的二进制归档。
 func (lsm *StateMachineAdapter) GetSnapshot() ([]byte, error) {
+	readSnapshot, err := lsm.PrepareSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	return readSnapshot()
+}
+
+// PrepareSnapshot performs the short consistency-critical part of snapshot
+// creation. The returned function reads immutable SSTable files while they are
+// pinned, but it can run after Raft releases stateMachineMu.
+func (lsm *StateMachineAdapter) PrepareSnapshot() (func() ([]byte, error), error) {
 	log.Debug("[LSMAdapter] Creating snapshot...")
 
 	// 1. 强制 Flush
@@ -98,39 +109,43 @@ func (lsm *StateMachineAdapter) GetSnapshot() ([]byte, error) {
 		return nil, err
 	}
 
-	// 2. 获取所有 SSTable 文件列表
-	files := lsm.db.GetAllSSTables()
+	// 2. 获取所有 SSTable 文件列表，并 pin 住这些 immutable 文件直到读取完成。
+	files, releaseFiles := lsm.db.SSTables.HoldFilesSnapshot()
 	// dbRoot := lsm.db.Name()
 	// SSTable 路径是 dbRoot/sst
 	sstRoot := filepath.Join(lsm.db.Name(), "sst")
 
-	// 3. 读取文件内容
-	snapshotData := make(map[string][]byte)
-	for _, file := range files {
-		content, err := os.ReadFile(file)
+	return func() ([]byte, error) {
+		defer releaseFiles()
+
+		// 3. 读取文件内容
+		snapshotData := make(map[string][]byte)
+		for _, file := range files {
+			content, err := os.ReadFile(file)
+			if err != nil {
+				log.Errorf("[LSMAdapter] Failed to read file %s for snapshot: %v", file, err)
+				return nil, err
+			}
+			// 计算相对路径，例如 "0-level/1.sst"
+			relPath, err := filepath.Rel(sstRoot, file)
+			if err != nil {
+				log.Errorf("[LSMAdapter] Failed to get relative path for %s: %v", file, err)
+				return nil, err
+			}
+			snapshotData[relPath] = content
+		}
+
+		// 4. 序列化。避免 JSON 对 []byte 做 base64 编码，减少快照生成
+		// 在状态机锁内的 CPU 和内存放大。
+		data, err := encodeSnapshotData(snapshotData)
 		if err != nil {
-			log.Errorf("[LSMAdapter] Failed to read file %s for snapshot: %v", file, err)
+			log.Errorf("[LSMAdapter] Failed to encode snapshot data: %v", err)
 			return nil, err
 		}
-		// 计算相对路径，例如 "0-level/1.sst"
-		relPath, err := filepath.Rel(sstRoot, file)
-		if err != nil {
-			log.Errorf("[LSMAdapter] Failed to get relative path for %s: %v", file, err)
-			return nil, err
-		}
-		snapshotData[relPath] = content
-	}
 
-	// 4. 序列化。避免 JSON 对 []byte 做 base64 编码，减少快照生成
-	// 在状态机锁内的 CPU 和内存放大。
-	data, err := encodeSnapshotData(snapshotData)
-	if err != nil {
-		log.Errorf("[LSMAdapter] Failed to encode snapshot data: %v", err)
-		return nil, err
-	}
-
-	log.Debugf("[LSMAdapter] Snapshot created with %d files", len(files))
-	return data, nil
+		log.Debugf("[LSMAdapter] Snapshot created with %d files", len(files))
+		return data, nil
+	}, nil
 }
 
 // ApplySnapshot 应用快照来恢复状态机。

@@ -819,6 +819,60 @@ func TestWaitForAppliedLogRejectsOverwrittenClientCommand(t *testing.T) {
 	}
 }
 
+func TestBecomeFollowerAbortsPendingApplyWaiters(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockStore := storage.NewMockStorage(ctrl)
+	mockStore.EXPECT().
+		SetState(param.HardState{CurrentTerm: 2, VotedFor: math.MaxUint64}).
+		Return(nil)
+
+	clientKey := clientRequestKey{clientID: 101, sequenceNum: 7}
+	r := &Raft{
+		id:                    1,
+		currentTerm:           1,
+		votedFor:              1,
+		clientSessions:        make(map[int64]int64),
+		notifyApply:           make(map[uint64][]chan any),
+		pendingClientRequests: map[clientRequestKey]uint64{clientKey: 10},
+		pendingLogClients:     map[uint64]clientRequestKey{10: clientKey},
+		electionTimeout:       time.Second,
+		store:                 mockStore,
+	}
+	r.setState(Leader)
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	done := make(chan bool, 1)
+	go func() {
+		_, ok := r.waitForAppliedClientLog(10, time.Second, clientKey.clientID, clientKey.sequenceNum)
+		done <- ok
+	}()
+
+	assert.Eventually(t, func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return len(r.notifyApply[10]) == 1
+	}, time.Second, 10*time.Millisecond)
+
+	r.mu.Lock()
+	err := r.becomeFollower(2)
+	r.mu.Unlock()
+	assert.NoError(t, err)
+
+	select {
+	case ok := <-done:
+		assert.False(t, ok, "pending apply waiter should fail immediately after leader step-down")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("pending apply waiter was not released after leader step-down")
+	}
+
+	r.mu.Lock()
+	assert.Empty(t, r.notifyApply)
+	assert.Empty(t, r.pendingClientRequests)
+	assert.Empty(t, r.pendingLogClients)
+	r.mu.Unlock()
+}
+
 // TestRandomizedElectionTimeout 验证随机超时是否落在 [T, 2T) 区间内。
 func TestRandomizedElectionTimeout(t *testing.T) {
 	// 创建一个 Raft 实例以访问其上的常量

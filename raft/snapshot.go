@@ -7,6 +7,7 @@ import (
 
 	"github.com/xmh1011/go-kv/pkg/log"
 	"github.com/xmh1011/go-kv/pkg/param"
+	"github.com/xmh1011/go-kv/pkg/storage"
 )
 
 // InstallSnapshot 是 Follower 上的 RPC 处理函数，用于接收并安装 Leader 发来的快照。
@@ -140,8 +141,19 @@ func (r *Raft) TakeSnapshot() bool {
 	// 释放 Raft 锁。状态机锁继续持有到数据导出完成。
 	r.mu.Unlock()
 
-	snapshotData, err := r.stateMachine.GetSnapshot()
-	r.stateMachineMu.Unlock()
+	var snapshotData []byte
+	if prepared, ok := r.stateMachine.(storage.PreparedSnapshotStateMachine); ok {
+		readSnapshot, prepareErr := prepared.PrepareSnapshot()
+		r.stateMachineMu.Unlock()
+		if prepareErr != nil {
+			err = prepareErr
+		} else {
+			snapshotData, err = readSnapshot()
+		}
+	} else {
+		snapshotData, err = r.stateMachine.GetSnapshot()
+		r.stateMachineMu.Unlock()
+	}
 	if err != nil {
 		log.Errorf("[Snapshot] Node %d failed to get snapshot data: %v", r.id, err)
 		r.mu.Lock()
