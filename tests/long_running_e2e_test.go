@@ -1230,11 +1230,14 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 	// 性能指标 - 使用 latencySampler 控制内存使用
 	const maxLatencySamples = 10000
 	var (
-		totalOps       int64
-		successOps     int64
-		failedOps      int64
-		bytesWritten   int64
-		latencySampler = newLatencySampler(maxLatencySamples)
+		totalOps            int64
+		successOps          int64
+		failedOps           int64
+		bytesWritten        int64
+		latencySampler      = newLatencySampler(maxLatencySamples)
+		failures            = newFailureStats()
+		keysForVerification []string
+		sampleKeysMutex     sync.Mutex
 	)
 
 	numClients := 8
@@ -1258,7 +1261,7 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 					value := fmt.Sprintf("value-%d-%d", cid, rand.Intn(10000000))
 					cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-					success, latency, err := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+					success, latency, failureReason, err := c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
 					if errors.Is(err, errLongRunningTestStopped) {
 						return
 					}
@@ -1268,8 +1271,18 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 						atomic.AddInt64(&successOps, 1)
 						atomic.AddInt64(&bytesWritten, int64(len(key)+len(value)))
 						latencySampler.add(latency)
+
+						if opCount%100 == 0 {
+							sampleKeysMutex.Lock()
+							keysForVerification = append(keysForVerification, key)
+							if len(keysForVerification) > 1000 {
+								keysForVerification = keysForVerification[1:]
+							}
+							sampleKeysMutex.Unlock()
+						}
 					} else {
 						atomic.AddInt64(&failedOps, 1)
+						failures.record(failureReason)
 					}
 					opCount++
 				}
@@ -1289,12 +1302,21 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 			latencySampler.count())
 	})
 
+	sampleKeysMutex.Lock()
+	verificationKeys := append([]string(nil), keysForVerification...)
+	sampleKeysMutex.Unlock()
+
+	finalConsistent, finalVerified := c.waitForDataConsistency(t, verificationKeys, 45*time.Second)
+	t.Logf("[最终一致性检查] 已验证: %d 条数据, 结果: %v", finalVerified, finalConsistent)
+	snapshotNodes, maxSnapshotIndex := c.snapshotStats()
+
 	metrics := LongRunningMetrics{
 		TestName:          "10分钟写入密集型测试 (gRPC+LSM)",
 		Duration:          duration,
 		TotalOps:          totalOps,
 		SuccessOps:        successOps,
 		FailedOps:         failedOps,
+		WriteOps:          totalOps,
 		BytesWritten:      bytesWritten,
 		LatencyP50:        percentileLong(latencySampler.getAll(), 50),
 		LatencyP95:        percentileLong(latencySampler.getAll(), 95),
@@ -1303,10 +1325,23 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 		WriteThroughput:   float64(successOps) / duration.Seconds(),
 		ErrorRate:         float64(failedOps) / float64(totalOps) * 100,
 		LeaderElections:   atomic.LoadInt32(&c.leaderElections),
-		DataConsistencyOK: true,
+		DataConsistencyOK: finalConsistent,
+		KeysVerified:      finalVerified,
+		SnapshotCount:     snapshotNodes,
+		SnapshotMaxIndex:  maxSnapshotIndex,
+		FailureReasons:    failures.snapshot(),
 	}
 
 	printLongRunningMetrics(t, &metrics)
+	if failed := atomic.LoadInt64(&failedOps); failed > 0 {
+		t.Fatalf("write-heavy workload completed with %d failed writes", failed)
+	}
+	if finalVerified == 0 {
+		t.Fatalf("write-heavy consistency check verified zero keys")
+	}
+	if !finalConsistent {
+		t.Fatalf("write-heavy consistency check failed after waiting for followers to catch up")
+	}
 }
 
 // TestLongRunning_10Min_MixedWithFailures 10分钟带故障恢复的混合测试
