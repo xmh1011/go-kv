@@ -441,6 +441,76 @@ func TestUpdateCommitIndexRewindsLocalGapCandidate(t *testing.T) {
 	assert.Equal(t, uint64(12), r.nextIndex[2])
 }
 
+func TestMarkLocalLogGapDoesNotRewindBelowCommitIndex(t *testing.T) {
+	r := &Raft{
+		id:                 1,
+		commitIndex:        12,
+		cachedLastLogIndex: 13,
+		nextIndex:          map[int]uint64{2: 14},
+	}
+
+	r.markLocalLogGapLocked(2, 12)
+
+	assert.Equal(t, uint64(12), r.cachedLastLogIndex)
+	assert.Equal(t, uint64(13), r.nextIndex[2])
+	assert.Equal(t, uint64(12), r.commitIndex)
+}
+
+func TestFetchEntriesToApplyRefreshesStaleCachedTail(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	mockStore.EXPECT().LastLogIndex().Return(uint64(12), nil).Times(1)
+	mockStore.EXPECT().ReadSnapshot().Return(nil, nil).Times(1)
+	mockStore.EXPECT().GetEntry(uint64(12)).Return(&param.LogEntry{Term: 5, Index: 12, Command: "cmd2"}, nil).Times(2)
+	mockSM.EXPECT().Apply(gomock.Any()).Return("res2").Times(1)
+
+	r := &Raft{
+		id:                 1,
+		commitIndex:        12,
+		lastApplied:        11,
+		cachedLastLogIndex: 11,
+		snapshotThreshold:  -1,
+		store:              mockStore,
+		stateMachine:       mockSM,
+		notifyApply:        make(map[uint64][]chan any),
+		mu:                 sync.Mutex{},
+	}
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	r.applyLogs()
+
+	assert.Equal(t, uint64(12), r.commitIndex)
+	assert.Equal(t, uint64(12), r.cachedLastLogIndex)
+	assert.Equal(t, uint64(12), r.lastApplied)
+}
+
+func TestRefreshCachedLastLogIndexUsesNewerStoredSnapshot(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(167225), nil).Times(1)
+	mockStore.EXPECT().GetEntry(uint64(167225)).Return(nil, nil).Times(1)
+	mockStore.EXPECT().ReadSnapshot().Return(param.NewSnapshot(167225, 8, []byte("new-snapshot")), nil).Times(1)
+	mockStore.EXPECT().GetEntry(uint64(167224)).Times(0)
+
+	r := &Raft{
+		id:                 1,
+		store:              mockStore,
+		snapshot:           param.NewSnapshot(148649, 7, []byte("old-snapshot")),
+		cachedLastLogIndex: 167225,
+	}
+
+	r.refreshCachedLastLogIndexLocked()
+
+	assert.Equal(t, uint64(167225), r.cachedLastLogIndex)
+	assert.Equal(t, uint64(167225), r.snapshot.LastIncludedIndex)
+}
+
 func TestApplyLogs(t *testing.T) {
 	tests := []struct {
 		name            string
