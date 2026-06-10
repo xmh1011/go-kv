@@ -105,20 +105,26 @@ func (d *Database) Recover() error {
 // 这通常用于快照操作。
 func (d *Database) ForceFlush() error {
 	log.Debug("[Database] Force flushing MemTable to SSTable")
-	// 1. 强制 Promote
-	imem := d.MemTables.ForcePromote()
-	if imem == nil {
-		log.Debug("[Database] MemTable is empty, nothing to flush")
+	// 1. 强制 Promote 当前 MemTable。快照必须覆盖所有可读内存数据，
+	// 包括之前尚未因 IMemTable 数量超限而落盘的 immutable memtables。
+	d.MemTables.ForcePromote()
+
+	imems := d.MemTables.GetAll()
+	if len(imems) == 0 {
+		log.Debug("[Database] MemTables are empty, nothing to flush")
 		return nil
 	}
 
-	// 2. 刷新到 SSTable
-	if err := d.SSTables.CreateNewSSTable(imem); err != nil {
-		d.MemTables.CompleteFlush(imem, false)
-		log.Errorf("[Database] Create new sstable error: %s", err.Error())
-		return err
+	// 2. 按旧到新的顺序刷新到 SSTable。addTable 会把后写入的表放到
+	// Level 0 前面，因此最终查询顺序仍保持 newest-first。
+	for _, imem := range imems {
+		if err := d.SSTables.CreateNewSSTable(imem); err != nil {
+			d.MemTables.CompleteFlush(imem, false)
+			log.Errorf("[Database] Create new sstable error: %s", err.Error())
+			return err
+		}
+		d.MemTables.CompleteFlush(imem, true)
 	}
-	d.MemTables.CompleteFlush(imem, true)
 
 	log.Debug("[Database] Force flush completed")
 	return nil
