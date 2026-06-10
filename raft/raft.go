@@ -954,7 +954,13 @@ func (r *Raft) CommitClient(command any, clientID, sequenceNum int64, trackClien
 	// 等待命令被状态机成功应用，或等待超时。
 	// 使用 5 秒超时以应对高负载场景下的日志复制延迟
 	log.Debugf("[Client] Waiting for log index %d to be applied...", index)
-	result, ok := r.waitForAppliedLog(index, clientApplyTimeout)
+	var result any
+	var ok bool
+	if trackClient {
+		result, ok = r.waitForAppliedClientLog(index, clientApplyTimeout, clientID, sequenceNum)
+	} else {
+		result, ok = r.waitForAppliedLog(index, clientApplyTimeout)
+	}
 	if !ok && trackClient {
 		r.clearPendingClientRequest(index)
 	}
@@ -1291,10 +1297,22 @@ func (r *Raft) becomeFollower(newTerm uint64) error {
 // waitForAppliedLog 等待一个特定索引的日志被状态机应用。
 // 它通过一个注册在 notifyApply 映射中的 channel 来实现同步等待。
 func (r *Raft) waitForAppliedLog(index uint64, timeout time.Duration) (any, bool) {
+	return r.waitForAppliedLogMatching(index, timeout, clientRequestKey{}, false)
+}
+
+func (r *Raft) waitForAppliedClientLog(index uint64, timeout time.Duration, clientID, sequenceNum int64) (any, bool) {
+	return r.waitForAppliedLogMatching(index, timeout, clientRequestKey{clientID: clientID, sequenceNum: sequenceNum}, true)
+}
+
+func (r *Raft) waitForAppliedLogMatching(index uint64, timeout time.Duration, expected clientRequestKey, requireClientMatch bool) (any, bool) {
 	r.mu.Lock()
 
 	// 1. 第一次检查：如果日志已经应用，直接返回。
 	if r.lastApplied >= index {
+		if requireClientMatch && !r.isClientRequestAppliedLocked(expected) {
+			r.mu.Unlock()
+			return nil, false
+		}
 		r.mu.Unlock()
 		return nil, true
 	}
@@ -1320,6 +1338,10 @@ func (r *Raft) waitForAppliedLog(index uint64, timeout time.Duration) (any, bool
 			delete(r.notifyApply, index)
 		} else {
 			r.notifyApply[index] = waiters
+		}
+		if requireClientMatch && !r.isClientRequestAppliedLocked(expected) {
+			r.mu.Unlock()
+			return nil, false
 		}
 		r.mu.Unlock()
 		return nil, true
@@ -1351,10 +1373,30 @@ func (r *Raft) waitForAppliedLog(index uint64, timeout time.Duration) (any, bool
 	select {
 	case result := <-notifyChan:
 		log.Debugf("[Client] Notified that log index %d has been applied.", index)
+		if requireClientMatch {
+			r.mu.Lock()
+			matched := r.isClientRequestAppliedLocked(expected)
+			r.mu.Unlock()
+			if !matched {
+				return nil, false
+			}
+		}
 		return result, true
 	case <-timer.C:
 		r.mu.Lock()
 		applied := r.lastApplied >= index
+		if requireClientMatch {
+			matched := r.isClientRequestAppliedLocked(expected)
+			r.mu.Unlock()
+			if matched {
+				return nil, true
+			}
+			if applied {
+				return nil, false
+			}
+			log.Debugf("[Client] Timed out waiting for client request %d/%d at log index %d to be applied.", expected.clientID, expected.sequenceNum, index)
+			return nil, false
+		}
 		r.mu.Unlock()
 		if applied {
 			return nil, true
@@ -1362,6 +1404,11 @@ func (r *Raft) waitForAppliedLog(index uint64, timeout time.Duration) (any, bool
 		log.Debugf("[Client] Timed out waiting for log index %d to be applied.", index)
 		return nil, false
 	}
+}
+
+func (r *Raft) isClientRequestAppliedLocked(key clientRequestKey) bool {
+	lastSeq, exists := r.clientSessions[key.clientID]
+	return exists && key.sequenceNum <= lastSeq
 }
 
 func (r *Raft) clearPendingClientRequest(index uint64) {
