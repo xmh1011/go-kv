@@ -391,7 +391,7 @@ func TestClientRequest(t *testing.T) {
 				notifyChans := r.notifyApply[6]
 				r.mu.Unlock()
 				if len(notifyChans) > 0 {
-					notifyChans[0] <- "success-result"
+					r.completeAppliedEntry(6, "success-result", tt.args.ClientID, tt.args.SequenceNum, true)
 				}
 
 				select {
@@ -678,7 +678,8 @@ func TestClientRequest_ReadWriteBranching(t *testing.T) {
 
 		// 这里的期望现在可以正确匹配了，因为之前的 GetEntry(1) 不会拦截 GetEntry(2)
 		mockStore.EXPECT().GetEntry(uint64(1)).Return(&param.LogEntry{Term: 1, Index: 1}, nil).AnyTimes()
-		mockStore.EXPECT().GetEntry(uint64(2)).Return(&param.LogEntry{Command: setCmd, Term: 1, Index: 2}, nil).AnyTimes()
+		appliedCmd := param.NewClientCommand(args.ClientID, args.SequenceNum, setCmd)
+		mockStore.EXPECT().GetEntry(uint64(2)).Return(&param.LogEntry{Command: appliedCmd, Term: 1, Index: 2}, nil).AnyTimes()
 
 		mockSM.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
 
@@ -782,6 +783,40 @@ func TestWaitForAppliedLogSupportsMultipleWaiters(t *testing.T) {
 	assert.Equal(t, int64(7), r.clientSessions[99])
 	assert.Empty(t, r.notifyApply)
 	r.mu.Unlock()
+}
+
+func TestWaitForAppliedLogRejectsOverwrittenClientCommand(t *testing.T) {
+	r := &Raft{
+		clientSessions: make(map[int64]int64),
+		notifyApply:    make(map[uint64][]chan any),
+	}
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	type waitResult struct {
+		result any
+		ok     bool
+	}
+	results := make(chan waitResult, 1)
+	go func() {
+		result, ok := r.waitForAppliedClientLog(10, time.Second, 100, 1)
+		results <- waitResult{result: result, ok: ok}
+	}()
+
+	assert.Eventually(t, func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return len(r.notifyApply[10]) == 1
+	}, time.Second, 10*time.Millisecond)
+
+	r.completeAppliedEntry(10, "other-client-result", 200, 1, true)
+
+	select {
+	case got := <-results:
+		assert.False(t, got.ok)
+		assert.Nil(t, got.result)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for apply waiter")
+	}
 }
 
 // TestRandomizedElectionTimeout 验证随机超时是否落在 [T, 2T) 区间内。
