@@ -772,22 +772,32 @@ func (r *Raft) startApplyLogsLocked() {
 func (r *Raft) applyLogs() {
 	r.applyMu.Lock()
 
-	// 1. 从存储中获取所有需要应用的日志条目。
-	entriesToApply, lastAppliedBefore := r.fetchEntriesToApply()
-	if len(entriesToApply) == 0 {
-		r.applyMu.Unlock()
-		return
+	for {
+		// 1. 从存储中获取所有需要应用的日志条目。
+		entriesToApply, lastAppliedBefore := r.fetchEntriesToApply()
+		if len(entriesToApply) == 0 {
+			r.applyMu.Unlock()
+			return
+		}
+
+		endIndex := lastAppliedBefore + uint64(len(entriesToApply))
+		log.Debugf("[State Machine] Node %d applying %d entries from index %d to %d", r.id, len(entriesToApply), lastAppliedBefore+1, endIndex)
+
+		// 2. 遍历并分发每一条待应用的日志。
+		r.dispatchEntries(entriesToApply)
+
+		r.mu.Lock()
+		hasBacklog := r.commitIndex > r.lastApplied && r.lastApplied > lastAppliedBefore
+		r.mu.Unlock()
+		if !hasBacklog {
+			break
+		}
 	}
-
-	endIndex := lastAppliedBefore + uint64(len(entriesToApply))
-	log.Debugf("[State Machine] Node %d applying %d entries from index %d to %d", r.id, len(entriesToApply), lastAppliedBefore+1, endIndex)
-
-	// 2. 遍历并分发每一条待应用的日志。
-	r.dispatchEntries(entriesToApply)
 	r.applyMu.Unlock()
 
 	// 3. 检查是否需要触发快照。快照导出可能会触发 LSM flush 和 SSTable
-	// 扫描，不能占用 applyMu，否则后续已提交日志会在快照期间无法进入应用流程。
+	// 扫描。只有在当前已提交日志全部 apply 后才尝试快照，避免快照导出
+	// 排在 backlog 前面阻塞 lastApplied 追赶 ReadIndex。
 	r.TakeSnapshot()
 }
 
