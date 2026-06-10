@@ -56,6 +56,94 @@ type FailureReasonCount struct {
 	Count  int64
 }
 
+func TestValidateLongRunningMetricsRejectsHiddenFailures(t *testing.T) {
+	metrics := LongRunningMetrics{
+		TestName:          "read-heavy",
+		TotalOps:          10,
+		SuccessOps:        9,
+		FailedOps:         1,
+		DataConsistencyOK: true,
+		KeysVerified:      10,
+		FailureReasons: []FailureReasonCount{{
+			Reason: "apply_timeout",
+			Count:  1,
+		}},
+	}
+
+	err := validateLongRunningMetrics(metrics, longRunningValidationOptions{
+		RequireNoFailedOps:  true,
+		RequireConsistency:  true,
+		RequireVerifiedKeys: true,
+	})
+	if err == nil {
+		t.Fatal("expected hidden failed operations to be rejected")
+	}
+	if !strings.Contains(err.Error(), "1 failed operations") || !strings.Contains(err.Error(), "apply_timeout=1") {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+}
+
+func TestValidateLongRunningMetricsRequiresConsistencyEvidence(t *testing.T) {
+	metrics := LongRunningMetrics{
+		TestName:          "delete-stress",
+		TotalOps:          10,
+		SuccessOps:        10,
+		DataConsistencyOK: false,
+		KeysVerified:      0,
+	}
+
+	err := validateLongRunningMetrics(metrics, longRunningValidationOptions{
+		RequireNoFailedOps:  true,
+		RequireConsistency:  true,
+		RequireVerifiedKeys: true,
+	})
+	if err == nil {
+		t.Fatal("expected missing consistency evidence to be rejected")
+	}
+	if !strings.Contains(err.Error(), "consistency check failed") {
+		t.Fatalf("expected consistency failure, got: %v", err)
+	}
+}
+
+type longRunningValidationOptions struct {
+	RequireNoFailedOps  bool
+	RequireConsistency  bool
+	RequireVerifiedKeys bool
+}
+
+func validateLongRunningMetrics(metrics LongRunningMetrics, opts longRunningValidationOptions) error {
+	if opts.RequireNoFailedOps && metrics.FailedOps > 0 {
+		return fmt.Errorf("%s completed with %d failed operations (%s)",
+			metrics.TestName, metrics.FailedOps, formatFailureReasons(metrics.FailureReasons))
+	}
+	if opts.RequireConsistency && !metrics.DataConsistencyOK {
+		return fmt.Errorf("%s consistency check failed", metrics.TestName)
+	}
+	if opts.RequireVerifiedKeys && metrics.KeysVerified == 0 {
+		return fmt.Errorf("%s consistency check verified zero keys", metrics.TestName)
+	}
+	return nil
+}
+
+func requireLongRunningMetrics(t *testing.T, metrics LongRunningMetrics, opts longRunningValidationOptions) {
+	t.Helper()
+	if err := validateLongRunningMetrics(metrics, opts); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func formatFailureReasons(reasons []FailureReasonCount) string {
+	if len(reasons) == 0 {
+		return "no failure reason recorded"
+	}
+
+	parts := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		parts = append(parts, fmt.Sprintf("%s=%d", reason.Reason, reason.Count))
+	}
+	return strings.Join(parts, ", ")
+}
+
 type failureStats struct {
 	mu     sync.Mutex
 	counts map[string]int64
@@ -1375,10 +1463,14 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 		totalOps       int64
 		successOps     int64
 		failedOps      int64
+		writeOps       int64
+		readOps        int64
 		bytesRead      int64
 		bytesWritten   int64
 		latencySampler = newLatencySampler(maxLatencySamples)
+		failures       = newFailureStats()
 	)
+	tracker := newConsistencyTracker()
 
 	numClients := 5
 	stopCh := make(chan struct{})
@@ -1401,22 +1493,25 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 					r := rand.Float64()
 
 					if r < 0.7 { // 70% 写入
-						key := fmt.Sprintf("fail-test-key-%d-%d", cid, rand.Intn(20000))
+						key := fmt.Sprintf("fail-test-key-%d-%d", cid, len(localKeys))
 						value := fmt.Sprintf("val-%d", rand.Intn(100000))
 						cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-						success, latency, err := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						success, latency, failureReason, err := c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
+						atomic.AddInt64(&writeOps, 1)
 
 						if success {
 							atomic.AddInt64(&successOps, 1)
 							atomic.AddInt64(&bytesWritten, int64(len(key)+len(value)))
 							localKeys = append(localKeys, key)
+							tracker.recordSet(key, value)
 							latencySampler.add(latency)
 						} else {
 							atomic.AddInt64(&failedOps, 1)
+							failures.record(failureReason)
 						}
 						atomic.AddInt64(&totalOps, 1)
 
@@ -1429,10 +1524,11 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 						}
 
 						cmd := param.KVCommand{Op: param.OpGet, Key: key}
-						success, latency, err := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						success, latency, failureReason, err := c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
+						atomic.AddInt64(&readOps, 1)
 
 						if success {
 							atomic.AddInt64(&successOps, 1)
@@ -1442,6 +1538,7 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 							latencySampler.add(latency)
 						} else {
 							atomic.AddInt64(&failedOps, 1)
+							failures.record(failureReason)
 						}
 						atomic.AddInt64(&totalOps, 1)
 					}
@@ -1481,24 +1578,42 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 			}
 		})
 
+	expected := tracker.snapshot(1200)
+	finalConsistent, finalVerified := c.waitForExpectedConsistency(t, expected, 45*time.Second)
+	t.Logf("[最终严格一致性检查] 已验证: %d 条节点键组合, 结果: %v", finalVerified, finalConsistent)
+	snapshotNodes, maxSnapshotIndex := c.snapshotStats()
+
 	metrics := LongRunningMetrics{
 		TestName:          "10分钟带故障恢复的混合测试 (gRPC+LSM)",
 		Duration:          duration,
 		TotalOps:          totalOps,
 		SuccessOps:        successOps,
 		FailedOps:         failedOps,
+		WriteOps:          writeOps,
+		ReadOps:           readOps,
 		BytesRead:         bytesRead,
 		BytesWritten:      bytesWritten,
 		LatencyP50:        percentileLong(latencySampler.getAll(), 50),
 		LatencyP95:        percentileLong(latencySampler.getAll(), 95),
 		LatencyP99:        percentileLong(latencySampler.getAll(), 99),
 		ThroughputOps:     float64(successOps) / duration.Seconds(),
+		WriteThroughput:   float64(writeOps) / duration.Seconds(),
+		ReadThroughput:    float64(readOps) / duration.Seconds(),
 		ErrorRate:         float64(failedOps) / float64(totalOps) * 100,
 		LeaderElections:   atomic.LoadInt32(&c.leaderElections),
-		DataConsistencyOK: true,
+		DataConsistencyOK: finalConsistent,
+		KeysVerified:      finalVerified,
+		SnapshotCount:     snapshotNodes,
+		SnapshotMaxIndex:  maxSnapshotIndex,
+		FailureReasons:    failures.snapshot(),
 	}
 
 	printLongRunningMetrics(t, &metrics)
+	requireLongRunningMetrics(t, metrics, longRunningValidationOptions{
+		RequireNoFailedOps:  true,
+		RequireConsistency:  true,
+		RequireVerifiedKeys: true,
+	})
 }
 
 // TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots 覆盖生产中的节点重启、快照和严格一致性场景。
@@ -1552,6 +1667,7 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 		snapshotCount  int32
 		restartCount   int32
 		latencySampler = newLatencySampler(maxLatencySamples)
+		failures       = newFailureStats()
 	)
 
 	numClients := 6
@@ -1574,16 +1690,17 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 				key := fmt.Sprintf("consistency-client-%d-key-%d", cid, rand.Intn(keySpace))
 				r := rand.Float64()
 				var (
-					success bool
-					latency time.Duration
-					err     error
+					success       bool
+					latency       time.Duration
+					failureReason string
+					err           error
 				)
 
 				switch {
 				case r < 0.55:
 					value := fmt.Sprintf("value-%d-%d", cid, rand.Int63())
 					cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
-					success, latency, err = c.sendRequestWithLeaderTracking(currentLeader, cmd, longRunningClientRetries, stopCh)
+					success, latency, failureReason, err = c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
 					if errors.Is(err, errLongRunningTestStopped) {
 						return
 					}
@@ -1595,7 +1712,7 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 
 				case r < 0.85:
 					cmd := param.KVCommand{Op: param.OpGet, Key: key}
-					success, latency, err = c.sendRequestWithLeaderTracking(currentLeader, cmd, longRunningClientRetries, stopCh)
+					success, latency, failureReason, err = c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
 					if errors.Is(err, errLongRunningTestStopped) {
 						return
 					}
@@ -1606,7 +1723,7 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 
 				default:
 					cmd := param.KVCommand{Op: param.OpDelete, Key: key}
-					success, latency, err = c.sendRequestWithLeaderTracking(currentLeader, cmd, longRunningClientRetries, stopCh)
+					success, latency, failureReason, err = c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
 					if errors.Is(err, errLongRunningTestStopped) {
 						return
 					}
@@ -1622,6 +1739,7 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 					latencySampler.add(latency)
 				} else {
 					atomic.AddInt64(&failedOps, 1)
+					failures.record(failureReason)
 				}
 			}
 		}(clientID)
@@ -1669,9 +1787,6 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 	expected := tracker.snapshot(1200)
 	finalConsistent, finalVerified := c.waitForExpectedConsistency(t, expected, 45*time.Second)
 	t.Logf("[最终严格一致性检查] 已验证: %d 条节点键组合, 结果: %v", finalVerified, finalConsistent)
-	if !finalConsistent {
-		t.Fatalf("strict consistency check failed after restarts and snapshots")
-	}
 	snapshotNodes, maxSnapshotIndex := c.snapshotStats()
 
 	metrics := LongRunningMetrics{
@@ -1698,9 +1813,15 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 		KeysVerified:      finalVerified,
 		SnapshotCount:     snapshotNodes,
 		SnapshotMaxIndex:  maxSnapshotIndex,
+		FailureReasons:    failures.snapshot(),
 	}
 
 	printLongRunningMetrics(t, &metrics)
+	requireLongRunningMetrics(t, metrics, longRunningValidationOptions{
+		RequireNoFailedOps:  true,
+		RequireConsistency:  true,
+		RequireVerifiedKeys: true,
+	})
 }
 
 // TestLongRunning_10Min_ReadHeavy 10分钟读取密集型测试
@@ -1726,6 +1847,7 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 
 	// 预热大量数据
 	warmupCount := 1000
+	warmupKeys := make([]string, 0, warmupCount)
 	t.Logf("预热阶段: 写入 %d 条数据...", warmupCount)
 	warmupSuccess := 0
 	for i := 0; i < warmupCount; i++ {
@@ -1733,12 +1855,16 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 		value := fmt.Sprintf("read-warmup-value-%d", i)
 		cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 		// 预热阶段使用 nil stopCh，因为没有启动客户端
-		success, _, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, nil)
+		success, _, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, longRunningClientRetries, nil)
 		if success {
 			warmupSuccess++
+			warmupKeys = append(warmupKeys, key)
 		}
 	}
 	t.Logf("预热完成: %d/%d 成功，等待同步...", warmupSuccess, warmupCount)
+	if warmupSuccess != warmupCount {
+		t.Fatalf("read-heavy warmup wrote %d/%d keys", warmupSuccess, warmupCount)
+	}
 	time.Sleep(3 * time.Second)
 
 	// 性能指标 - 使用 latencySampler 控制内存使用
@@ -1749,6 +1875,7 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 		failedOps      int64
 		bytesRead      int64
 		latencySampler = newLatencySampler(maxLatencySamples)
+		failures       = newFailureStats()
 	)
 
 	numClients := 10
@@ -1772,7 +1899,7 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 				key := fmt.Sprintf("read-warmup-key-%d", rand.Intn(warmupCount))
 				cmd := param.KVCommand{Op: param.OpGet, Key: key}
 
-				success, latency, err := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+				success, latency, failureReason, err := c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
 				if errors.Is(err, errLongRunningTestStopped) {
 					return
 				}
@@ -1794,6 +1921,7 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 					latencySampler.add(latency)
 				} else {
 					atomic.AddInt64(&failedOps, 1)
+					failures.record(failureReason)
 				}
 			}
 		}(clientID)
@@ -1811,6 +1939,10 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 			latencySampler.count())
 	})
 
+	finalConsistent, finalVerified := c.waitForDataConsistency(t, warmupKeys, 45*time.Second)
+	t.Logf("[最终一致性检查] 已验证: %d 条数据, 结果: %v", finalVerified, finalConsistent)
+	snapshotNodes, maxSnapshotIndex := c.snapshotStats()
+
 	metrics := LongRunningMetrics{
 		TestName:          "10分钟读取密集型测试 (gRPC+LSM)",
 		Duration:          duration,
@@ -1825,10 +1957,19 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 		ReadThroughput:    float64(successOps) / duration.Seconds(),
 		ErrorRate:         float64(failedOps) / float64(totalOps) * 100,
 		LeaderElections:   atomic.LoadInt32(&c.leaderElections),
-		DataConsistencyOK: true,
+		DataConsistencyOK: finalConsistent,
+		KeysVerified:      finalVerified,
+		SnapshotCount:     snapshotNodes,
+		SnapshotMaxIndex:  maxSnapshotIndex,
+		FailureReasons:    failures.snapshot(),
 	}
 
 	printLongRunningMetrics(t, &metrics)
+	requireLongRunningMetrics(t, metrics, longRunningValidationOptions{
+		RequireNoFailedOps:  true,
+		RequireConsistency:  true,
+		RequireVerifiedKeys: true,
+	})
 }
 
 // TestLongRunning_10Min_DeleteStress 10分钟删除压力测试
@@ -1866,7 +2007,9 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 		deleteOps            int64
 		latencySampler       = newLatencySampler(maxLatencySamples)
 		deleteLatencySampler = newLatencySampler(maxLatencySamples)
+		failures             = newFailureStats()
 	)
+	tracker := newConsistencyTracker()
 
 	numClients := 8
 	stopCh := make(chan struct{})
@@ -1898,7 +2041,7 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 						key := clientKeys[cid][idx]
 
 						cmd := param.KVCommand{Op: param.OpDelete, Key: key}
-						success, latency, err := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						success, latency, failureReason, err := c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
@@ -1912,8 +2055,10 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 
 							// 移除已删除的键
 							clientKeys[cid] = append(clientKeys[cid][:idx], clientKeys[cid][idx+1:]...)
+							tracker.recordDelete(key)
 						} else {
 							atomic.AddInt64(&failedOps, 1)
+							failures.record(failureReason)
 							latencySampler.add(latency)
 						}
 					} else {
@@ -1922,7 +2067,7 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 						value := fmt.Sprintf("val-%d", rand.Intn(10000))
 						cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-						success, latency, err := c.sendRequestWithLeaderTracking(currentLeader, cmd, 3, stopCh)
+						success, latency, failureReason, err := c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
@@ -1932,8 +2077,10 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 							atomic.AddInt64(&successOps, 1)
 							atomic.AddInt64(&writeOps, 1)
 							clientKeys[cid] = append(clientKeys[cid], key)
+							tracker.recordSet(key, value)
 						} else {
 							atomic.AddInt64(&failedOps, 1)
+							failures.record(failureReason)
 						}
 						latencySampler.add(latency)
 					}
@@ -1956,6 +2103,11 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 			latencySampler.count())
 	})
 
+	expected := tracker.snapshot(1200)
+	finalConsistent, finalVerified := c.waitForExpectedConsistency(t, expected, 45*time.Second)
+	t.Logf("[最终严格一致性检查] 已验证: %d 条节点键组合, 结果: %v", finalVerified, finalConsistent)
+	snapshotNodes, maxSnapshotIndex := c.snapshotStats()
+
 	metrics := LongRunningMetrics{
 		TestName:          "10分钟删除压力测试 (gRPC+LSM)",
 		Duration:          duration,
@@ -1972,10 +2124,19 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 		DeleteThroughput:  float64(deleteOps) / duration.Seconds(),
 		ErrorRate:         float64(failedOps) / float64(totalOps) * 100,
 		LeaderElections:   atomic.LoadInt32(&c.leaderElections),
-		DataConsistencyOK: true,
+		DataConsistencyOK: finalConsistent,
+		KeysVerified:      finalVerified,
+		SnapshotCount:     snapshotNodes,
+		SnapshotMaxIndex:  maxSnapshotIndex,
+		FailureReasons:    failures.snapshot(),
 	}
 
 	printLongRunningMetrics(t, &metrics)
+	requireLongRunningMetrics(t, metrics, longRunningValidationOptions{
+		RequireNoFailedOps:  true,
+		RequireConsistency:  true,
+		RequireVerifiedKeys: true,
+	})
 }
 
 // percentileLong 计算长时测试的延迟百分位
