@@ -787,6 +787,51 @@ func TestApplyLogsReleasesApplyMuBeforeSnapshotExport(t *testing.T) {
 	r.snapshotWG.Wait()
 }
 
+func TestApplyLogsDrainsBacklogBeforeSnapshot(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	entry1 := &param.LogEntry{Term: 1, Index: 1, Command: "cmd1"}
+	entry2 := &param.LogEntry{Term: 1, Index: 2, Command: "cmd2"}
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	var r *Raft
+	gomock.InOrder(
+		mockStore.EXPECT().GetEntry(uint64(1)).Return(entry1, nil),
+		mockSM.EXPECT().Apply(*entry1).DoAndReturn(func(param.LogEntry) any {
+			r.mu.Lock()
+			r.commitIndex = 2
+			r.cachedLastLogIndex = 2
+			r.mu.Unlock()
+			return "applied-1"
+		}),
+		mockStore.EXPECT().GetEntry(uint64(2)).Return(entry2, nil),
+		mockSM.EXPECT().Apply(*entry2).Return("applied-2"),
+		mockStore.EXPECT().LogSize().Return(0, nil),
+	)
+
+	r = &Raft{
+		id:                 1,
+		commitIndex:        1,
+		lastApplied:        0,
+		cachedLastLogIndex: 1,
+		snapshotThreshold:  1,
+		store:              mockStore,
+		stateMachine:       mockSM,
+		notifyApply:        make(map[uint64][]chan any),
+	}
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	r.applyLogs()
+
+	r.mu.Lock()
+	assert.Equal(t, uint64(2), r.lastApplied)
+	assert.Equal(t, uint64(2), r.commitIndex)
+	r.mu.Unlock()
+}
+
 func TestProcessBatchCommitsSingleNodeEntry(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()

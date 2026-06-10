@@ -161,6 +161,35 @@ func TestTakeSnapshot(t *testing.T) {
 	}
 }
 
+func TestTakeSnapshotReturnsWhileSnapshotAlreadyInProgress(t *testing.T) {
+	r := &Raft{
+		isSnapshotting:    true,
+		snapshotThreshold: 1,
+	}
+
+	r.stateMachineMu.Lock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		assert.False(t, r.TakeSnapshot())
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		r.stateMachineMu.Unlock()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("TakeSnapshot remained blocked after releasing stateMachineMu")
+		}
+		t.Fatal("TakeSnapshot waited on stateMachineMu even though a snapshot was already in progress")
+	}
+
+	r.stateMachineMu.Unlock()
+}
+
 func TestInstallSnapshot(t *testing.T) {
 	type state struct {
 		term        uint64

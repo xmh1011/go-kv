@@ -99,9 +99,6 @@ func (r *Raft) InstallSnapshot(args *param.InstallSnapshotArgs, reply *param.Ins
 // TakeSnapshot 由上层应用（状态机）在合适的时候调用，以触发一次快照。
 // 为异步实现，避免阻塞 Raft 主循环。返回 true 表示已调度一次真实快照。
 func (r *Raft) TakeSnapshot() bool {
-	r.stateMachineMu.Lock()
-	defer r.stateMachineMu.Unlock()
-
 	r.mu.Lock()
 
 	// 1. 防止并发快照
@@ -111,29 +108,40 @@ func (r *Raft) TakeSnapshot() bool {
 	}
 
 	// 2. 检查日志大小是否满足阈值
+	threshold := r.snapshotThreshold
 	logSize, err := r.store.LogSize()
-	if err != nil || logSize < r.snapshotThreshold {
+	if err != nil || logSize < threshold {
 		r.mu.Unlock()
 		return false
 	}
 
-	log.Debugf("[Snapshot] Node %d log size %d exceeds threshold %d, preparing snapshot.", r.id, logSize, r.snapshotThreshold)
+	// Mark the snapshot before taking stateMachineMu. Repeated apply loops can
+	// then skip immediately instead of queueing behind an active snapshot export.
+	r.isSnapshotting = true
+	r.mu.Unlock()
+
+	log.Debugf("[Snapshot] Node %d log size %d exceeds threshold %d, preparing snapshot.", r.id, logSize, threshold)
+
+	r.stateMachineMu.Lock()
 
 	// 3. 【同步阶段】捕获快照元数据。此时 stateMachineMu 已阻止
 	// 新的 Apply 进入，因此 lastApplied 与随后导出的状态机数据一致。
+	r.mu.Lock()
 	snapshotIndex := r.lastApplied
 	snapshotTerm, err := r.getLogTermLocked(snapshotIndex)
 	if err != nil {
 		log.Errorf("[Snapshot] Node %d failed to get term at index %d: %v", r.id, snapshotIndex, err)
+		r.isSnapshotting = false
 		r.mu.Unlock()
+		r.stateMachineMu.Unlock()
 		return false
 	}
 
-	// 标记开始快照，并释放 Raft 锁。状态机锁继续持有到数据导出完成。
-	r.isSnapshotting = true
+	// 释放 Raft 锁。状态机锁继续持有到数据导出完成。
 	r.mu.Unlock()
 
 	snapshotData, err := r.stateMachine.GetSnapshot()
+	r.stateMachineMu.Unlock()
 	if err != nil {
 		log.Errorf("[Snapshot] Node %d failed to get snapshot data: %v", r.id, err)
 		r.mu.Lock()
