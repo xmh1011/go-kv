@@ -324,16 +324,16 @@ func (r *Raft) handleFailedAppendEntries(peerID int, reply *param.AppendEntriesR
 // 计算已在集群多数节点上成功复制的最高日志索引，并更新 Leader 自己的 commitIndex。
 // Raft 的安全规则规定，只有当前任期的日志才可以通过这种方式被提交。
 func (r *Raft) updateCommitIndex() {
-	newCommitIndex := r.findMajorityCommitIndex()
+	for {
+		newCommitIndex := r.findMajorityCommitIndex()
+		if newCommitIndex <= r.commitIndex {
+			return
+		}
 
-	if newCommitIndex > r.commitIndex {
 		term, err := r.getLogTermLocked(newCommitIndex)
 		if err != nil {
-			if errors.Is(err, errLogEntryNotFound) {
-				r.refreshCachedLastLogIndexLocked()
-				if newCommitIndex > r.cachedLastLogIndex {
-					return
-				}
+			if errors.Is(err, errLogEntryNotFound) && r.rewindCommitSearchPastLocalGapLocked(newCommitIndex) {
+				continue
 			}
 			log.Errorf("[Replication] Node %d failed to get term for new commit index %d: %v", r.id, newCommitIndex, err)
 			return
@@ -344,7 +344,35 @@ func (r *Raft) updateCommitIndex() {
 			r.commitIndex = newCommitIndex
 			r.startApplyLogsLocked()
 		}
+		return
 	}
+}
+
+func (r *Raft) rewindCommitSearchPastLocalGapLocked(missingIndex uint64) bool {
+	r.refreshCachedLastLogIndexLocked()
+	if missingIndex > r.cachedLastLogIndex {
+		return true
+	}
+	if missingIndex <= r.commitIndex {
+		return false
+	}
+
+	newLastIndex := missingIndex - 1
+	if r.snapshot != nil && newLastIndex < r.snapshot.LastIncludedIndex {
+		newLastIndex = r.snapshot.LastIncludedIndex
+	}
+	if newLastIndex >= r.cachedLastLogIndex {
+		return false
+	}
+
+	log.Warnf("[Replication] Node %d found local log gap at commit candidate %d; rewinding cached last log index from %d to %d", r.id, missingIndex, r.cachedLastLogIndex, newLastIndex)
+	r.cachedLastLogIndex = newLastIndex
+	for peerID, nextIndex := range r.nextIndex {
+		if nextIndex > r.cachedLastLogIndex+1 {
+			r.nextIndex[peerID] = r.cachedLastLogIndex + 1
+		}
+	}
+	return true
 }
 
 // findMajorityCommitIndex 计算可以被安全提交的最高日志索引。

@@ -402,6 +402,45 @@ func TestUpdateCommitIndex(t *testing.T) {
 	}
 }
 
+func TestUpdateCommitIndexRewindsLocalGapCandidate(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+	snapshot := param.NewSnapshot(10, 5, []byte("snap"))
+
+	mockStore.EXPECT().GetEntry(uint64(12)).Return(nil, nil).Times(1)
+	mockStore.EXPECT().ReadSnapshot().Return(snapshot, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(13), nil).Times(1)
+	mockStore.EXPECT().GetEntry(uint64(13)).Return(&param.LogEntry{Term: 5, Index: 13}, nil).Times(1)
+	mockStore.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11, Command: "cmd11"}, nil).AnyTimes()
+	mockSM.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
+
+	r := &Raft{
+		id:                 1,
+		peerIDs:            []int{2, 3},
+		currentTerm:        5,
+		commitIndex:        10,
+		lastApplied:        10,
+		cachedLastLogIndex: 12,
+		matchIndex:         map[int]uint64{2: 12, 3: 12},
+		nextIndex:          map[int]uint64{2: 14, 3: 12},
+		store:              mockStore,
+		stateMachine:       mockSM,
+		snapshot:           snapshot,
+		notifyApply:        make(map[uint64][]chan any),
+	}
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	r.updateCommitIndex()
+	time.Sleep(10 * time.Millisecond)
+
+	assert.Equal(t, uint64(11), r.commitIndex)
+	assert.Equal(t, uint64(11), r.cachedLastLogIndex)
+	assert.Equal(t, uint64(12), r.nextIndex[2])
+}
+
 func TestApplyLogs(t *testing.T) {
 	tests := []struct {
 		name            string
