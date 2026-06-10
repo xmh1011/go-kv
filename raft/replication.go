@@ -200,6 +200,9 @@ func (r *Raft) markLocalLogGapLocked(peerID int, missingIndex uint64) {
 	if r.snapshot != nil && newLastIndex < r.snapshot.LastIncludedIndex {
 		newLastIndex = r.snapshot.LastIncludedIndex
 	}
+	if newLastIndex < r.commitIndex {
+		newLastIndex = r.commitIndex
+	}
 	if newLastIndex < r.cachedLastLogIndex {
 		log.Debugf("[Replication] Node %d found local log gap at %d; rewinding cached last log index from %d to %d", r.id, missingIndex, r.cachedLastLogIndex, newLastIndex)
 		r.cachedLastLogIndex = newLastIndex
@@ -803,11 +806,17 @@ func (r *Raft) fetchEntriesToApply() ([]param.LogEntry, uint64) {
 		lastLogIndex := r.cachedLastLogIndex
 
 		if r.commitIndex > lastLogIndex {
-			log.Warnf("[Replication] Node %d commitIndex %d exceeds lastLogIndex %d, clamping", r.id, r.commitIndex, lastLogIndex)
-			r.commitIndex = lastLogIndex
+			r.refreshCachedLastLogIndexLocked()
+			lastLogIndex = r.cachedLastLogIndex
 		}
 
-		for i := r.lastApplied + 1; i <= r.commitIndex; i++ {
+		applyUntil := r.commitIndex
+		if applyUntil > lastLogIndex {
+			log.Errorf("[Replication] Node %d commitIndex %d exceeds refreshed lastLogIndex %d; preserving commit index and applying through local tail", r.id, r.commitIndex, lastLogIndex)
+			applyUntil = lastLogIndex
+		}
+
+		for i := r.lastApplied + 1; i <= applyUntil; i++ {
 			entry, err := r.store.GetEntry(i)
 			if err != nil || entry == nil {
 				if err == nil && r.advanceLastAppliedPastCompactedLogLocked(i) {

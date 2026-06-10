@@ -1462,6 +1462,9 @@ func (r *Raft) refreshCachedLastLogIndexLocked() {
 		}
 	}
 
+	missingStart := uint64(0)
+	missingCount := uint64(0)
+	checkedStoredSnapshot := snapshot == nil
 	for lastLogIndex > 0 {
 		if snapshot != nil && lastLogIndex <= snapshot.LastIncludedIndex {
 			break
@@ -1475,8 +1478,28 @@ func (r *Raft) refreshCachedLastLogIndexLocked() {
 		if entry != nil {
 			break
 		}
-		log.Warnf("[Raft] Last log index %d is missing from storage; rewinding cached last log index", lastLogIndex)
+		if !checkedStoredSnapshot {
+			checkedStoredSnapshot = true
+			if storedSnapshot, err := r.store.ReadSnapshot(); err == nil {
+				if storedSnapshot != nil && (snapshot == nil || storedSnapshot.LastIncludedIndex > snapshot.LastIncludedIndex) {
+					snapshot = storedSnapshot
+					r.snapshot = storedSnapshot
+					if lastLogIndex <= snapshot.LastIncludedIndex {
+						break
+					}
+				}
+			} else {
+				log.Errorf("[Raft] Failed to refresh snapshot while rewinding missing log tail: %v", err)
+			}
+		}
+		if missingStart == 0 {
+			missingStart = lastLogIndex
+		}
+		missingCount++
 		lastLogIndex--
+	}
+	if missingCount > 0 {
+		log.Warnf("[Raft] Last log index %d had %d missing trailing entries; rewound cached last log index to %d", missingStart, missingCount, lastLogIndex)
 	}
 
 	if snapshot != nil && lastLogIndex < snapshot.LastIncludedIndex {
