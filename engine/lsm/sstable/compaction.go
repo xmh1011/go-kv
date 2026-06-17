@@ -2,7 +2,9 @@ package sstable
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"os"
 
 	"github.com/xmh1011/go-kv/engine/lsm/kv"
 	"github.com/xmh1011/go-kv/pkg/log"
@@ -97,11 +99,16 @@ func (m *Manager) compactLevel(level int) error {
 			files = files[limit:]
 		}
 	}
-	allPairs, err := m.loadLevelData(files)
+	allPairs, err := m.loadLevelData(level, files)
 	if err != nil {
 		m.endCompactionLevels(compactingLevels)
 		log.Errorf("[Compaction] Load level %d data error: %s", level, err.Error())
 		return fmt.Errorf("load level %d data error: %w", level, err)
+	}
+	if len(allPairs) == 0 {
+		m.endCompactionLevels(compactingLevels)
+		log.Debugf("[Compaction] Level %d has no readable data after pruning stale metadata", level)
+		return nil
 	}
 
 	// 2. 加载重叠文件
@@ -202,21 +209,28 @@ func (m *Manager) endCompactionLevels(levels []int) {
 	m.compactionCond.Broadcast()
 }
 
-// loadLevelData 加载指定层级的所有键值对
-func (m *Manager) loadLevelData(files []string) ([]kv.KeyValuePair, error) {
+// loadLevelData 加载指定层级的所有键值对。
+// 如果元数据指向的 SSTable 文件已经不存在，说明内存目录和磁盘目录之间
+// 出现了陈旧目录项；此时清理该目录项并继续，避免后续 flush 永久卡死。
+func (m *Manager) loadLevelData(level int, files []string) ([]kv.KeyValuePair, error) {
 	allPairs := make([]kv.KeyValuePair, 0)
 
 	for _, path := range files {
 		sst, ok := m.getSSTableByPath(path)
 		if !ok {
+			if m.pruneMissingSSTableMetadata(path, level) {
+				continue
+			}
 			log.Errorf("[Compaction] Sstable not found for path: %s", path)
 			return nil, fmt.Errorf("sstable metadata not found for path %s", path)
 		}
 
-		pairs, err := sst.GetDataBlockFromFile(path)
+		pairs, ok, err := m.loadCompactionDataBlock(sst, path, level)
 		if err != nil {
-			log.Errorf("[Compaction] Decode sstable from file %s error: %s", path, err.Error())
-			return nil, fmt.Errorf("decode sstable from file %s error: %w", path, err)
+			return nil, err
+		}
+		if !ok {
+			continue
 		}
 
 		allPairs = append(allPairs, pairs...)
@@ -234,15 +248,21 @@ func (m *Manager) mergeNextLevelFiles(level int, minK, maxK kv.Key) ([]kv.KeyVal
 	for _, path := range nextLevelFiles {
 		sst, ok := m.getSSTableByPath(path)
 		if !ok {
+			if m.pruneMissingSSTableMetadata(path, level) {
+				continue
+			}
 			log.Errorf("[Compaction] Sstable not found for path: %s", path)
 			return nil, nil, fmt.Errorf("sstable metadata not found for path %s", path)
 		}
 
 		if overlapRange(minK, maxK, sst) {
-			pairs, err := sst.GetDataBlockFromFile(path)
+			pairs, ok, err := m.loadCompactionDataBlock(sst, path, level)
 			if err != nil {
 				log.Errorf("[Compaction] Load data blocks error: %v", err)
 				return nil, nil, err
+			}
+			if !ok {
+				continue
 			}
 			allPairs = append(allPairs, pairs...)
 			oldFiles = append(oldFiles, path)
@@ -250,6 +270,42 @@ func (m *Manager) mergeNextLevelFiles(level int, minK, maxK kv.Key) ([]kv.KeyVal
 	}
 
 	return allPairs, oldFiles, nil
+}
+
+func (m *Manager) loadCompactionDataBlock(sst *SSTable, path string, level int) ([]kv.KeyValuePair, bool, error) {
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			m.pruneMissingSSTableMetadata(path, level)
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("stat sstable file %s failed: %w", path, err)
+	}
+
+	pairs, err := sst.GetDataBlockFromFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			m.pruneMissingSSTableMetadata(path, level)
+			return nil, false, nil
+		}
+		log.Errorf("[Compaction] Decode sstable from file %s error: %s", path, err.Error())
+		return nil, false, fmt.Errorf("decode sstable from file %s error: %w", path, err)
+	}
+	return pairs, true, nil
+}
+
+func (m *Manager) pruneMissingSSTableMetadata(path string, level int) bool {
+	if _, err := os.Stat(path); err == nil {
+		return false
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	log.Warnf("[Compaction] Pruning stale SSTable metadata for missing file %s at level %d", path, level)
+	m.removeTableMetadataLocked(path, level)
+	return true
 }
 
 // getGlobalKeyRangeFromPairs 从键值对中计算全局 Key 范围

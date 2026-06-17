@@ -109,27 +109,36 @@ func (lsm *StateMachineAdapter) PrepareSnapshot() (func() ([]byte, error), error
 		return nil, err
 	}
 
-	// 2. 获取所有 SSTable 文件列表，并 pin 住这些 immutable 文件直到读取完成。
-	files, releaseFiles := lsm.db.SSTables.HoldFilesSnapshot()
+	// 2. Open all immutable SSTable files under the manager lock, then release
+	// the lock before reading file content. Open descriptors pin the immutable
+	// files while avoiding long stalls for later memtable flushes.
+	files, err := lsm.db.SSTables.OpenFilesSnapshot()
+	if err != nil {
+		return nil, err
+	}
 	// dbRoot := lsm.db.Name()
 	// SSTable 路径是 dbRoot/sst
 	sstRoot := filepath.Join(lsm.db.Name(), "sst")
 
 	return func() ([]byte, error) {
-		defer releaseFiles()
+		defer func() {
+			for _, file := range files {
+				_ = file.File.Close()
+			}
+		}()
 
 		// 3. 读取文件内容
 		snapshotData := make(map[string][]byte)
 		for _, file := range files {
-			content, err := os.ReadFile(file)
+			content, err := io.ReadAll(file.File)
 			if err != nil {
-				log.Errorf("[LSMAdapter] Failed to read file %s for snapshot: %v", file, err)
+				log.Errorf("[LSMAdapter] Failed to read file %s for snapshot: %v", file.Path, err)
 				return nil, err
 			}
 			// 计算相对路径，例如 "0-level/1.sst"
-			relPath, err := filepath.Rel(sstRoot, file)
+			relPath, err := filepath.Rel(sstRoot, file.Path)
 			if err != nil {
-				log.Errorf("[LSMAdapter] Failed to get relative path for %s: %v", file, err)
+				log.Errorf("[LSMAdapter] Failed to get relative path for %s: %v", file.Path, err)
 				return nil, err
 			}
 			snapshotData[relPath] = content

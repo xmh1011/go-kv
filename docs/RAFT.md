@@ -155,6 +155,27 @@ The leader then sends heartbeats. Heartbeats are just AppendEntries RPCs with no
 entries. They keep followers from starting elections and provide leadership
 confirmation for reads.
 
+The leader also proposes a no-op entry in its own term. This is a standard
+Raft safety technique: a leader cannot use replica counts alone to directly
+commit old-term entries. Once the no-op from the new term is committed, older
+entries before it become committed indirectly.
+
+```text
+transitionToLeader
+        |
+        v
+initialize nextIndex and matchIndex
+        |
+        v
+append current-term no-op
+        |
+        v
+replicate no-op and advance commitIndex after quorum
+```
+
+The no-op does not change user data. It is a leadership barrier that helps
+commit and apply progress resume correctly after leader changes.
+
 ## 8. Write Path
 
 Writes enter Raft through `ClientRequest`.
@@ -215,6 +236,11 @@ The follower checks:
 The implementation serializes follower-side disk mutation with
 `appendEntriesMu`. This prevents two concurrent AppendEntries calls from
 truncating and appending the log in conflicting ways.
+
+Receiving AppendEntries from a valid leader in the same term is still important.
+A node does not need to see a higher term before stepping down. If it is a
+candidate or stale leader and accepts the current-term leader, it must become a
+follower, refresh the leader hint, and abort stale client waiters.
 
 ## 10. Leader Replication Progress
 
@@ -467,6 +493,11 @@ newMatchIndex = newNextIndex - 1
 Failure replies move `nextIndex` backward using conflict information, but never
 below `matchIndex + 1`.
 
+When a successful reply advances `commitIndex`, the leader treats that as a
+replication signal. Followers need the new `LeaderCommit` value quickly; waiting
+for the next heartbeat can delay apply progress and ReadIndex completion under
+heavy restart or snapshot churn.
+
 ## 19. Apply, Client Retry, And ReadIndex Internals
 
 The apply path has two stages.
@@ -602,3 +633,6 @@ Before changing Raft behavior, ask:
 
 These questions catch most correctness regressions before they reach production
 style tests.
+
+For recent concrete failures and fixes, read
+[BUG_FIX_RETROSPECTIVE.md](BUG_FIX_RETROSPECTIVE.md).

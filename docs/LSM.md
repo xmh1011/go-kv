@@ -261,6 +261,12 @@ SSTable metadata updates must be atomic from a reader's point of view. Readers
 should see either the old set of files or the new set of files, not a half
 updated mixture.
 
+Compaction also distinguishes stale metadata from real corruption. If catalog
+metadata references a file that no longer exists, the manager prunes that stale
+entry and continues. If the file still exists but cannot be decoded, compaction
+returns an error. This keeps the engine strict about corrupt data while allowing
+self-healing for stale file catalog entries.
+
 ## 12. Raft Log Storage Adapter
 
 `pkg/storage/lsm/storage.go` implements `storage.Storage` on top of the LSM
@@ -324,6 +330,12 @@ Database.Get(key)
 
 State-machine snapshots are encoded as a binary archive of LSM files. The
 archive stores filenames and raw bytes with length prefixes.
+
+Snapshot export pins the SSTable files it plans to copy by opening them while
+holding the SSTable manager read lock. The exporter then reads from those open
+file descriptors. This protects snapshot creation from concurrent compaction:
+even if compaction removes a directory entry later, the already-open file
+descriptor still points at the bytes selected for the snapshot.
 
 ## 14. Recovery
 
@@ -505,6 +517,7 @@ or file encoding. They come from boundaries between modules:
 | SSTable lazy data decode | Repeated reads append duplicate decoded values. | Reset `DataBlock` before every decode. |
 | Raft truncate/reappend | Old log payload and new log payload share an index. | Replacing an existing log key subtracts old size and writes the new value. |
 | Raft compaction | Apply loop asks for a compacted committed entry. | Raft must either skip through a covering snapshot or fail loudly if no snapshot covers it. |
+| Compaction catalog cleanup | Metadata references a file that was already removed. | Prune missing-file metadata, but still fail existing corrupt files. |
 
 These guardrails should be mentioned in code reviews. They are correctness
 requirements, not performance details.
@@ -519,7 +532,12 @@ When modifying the LSM code, keep these invariants true:
 - Tombstones hide older values until it is safe to drop them.
 - SSTable decode resets reusable structures before filling them.
 - Compaction metadata updates are protected by manager locks.
+- Missing SSTable metadata can be pruned only after the physical file is
+  confirmed absent; existing corrupt files remain hard errors.
 - Raft log reads respect the logical `[firstIndex, lastIndex]` window.
 - Snapshot export and apply must not race with state-machine writes.
 
 Most storage bugs are violations of one of these invariants.
+
+For recent concrete failures and fixes, read
+[BUG_FIX_RETROSPECTIVE.md](BUG_FIX_RETROSPECTIVE.md).

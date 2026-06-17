@@ -11,6 +11,7 @@ func init() {
 	gob.Register(KVCommand{})
 	gob.Register(ClientCommand{})
 	gob.Register(ConfigChangeCommand{})
+	gob.Register(NoopCommand{})
 }
 
 // ClientArgs 封装了来自客户端的请求。
@@ -67,6 +68,11 @@ func ClientCommandMetadata(command any) (clientID, sequenceNum int64, ok bool) {
 	}
 	return 0, 0, false
 }
+
+// NoopCommand is an internal Raft entry with no state-machine side effect.
+// Leaders append one after election so entries from older terms can be safely
+// committed by a current-term log entry, as required by Raft.
+type NoopCommand struct{}
 
 // ConfigChangeCommand holds the new list of peer IDs for a configuration change.
 // This command is stored in a LogEntry to be replicated.

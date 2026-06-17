@@ -30,6 +30,8 @@ var errLocalLogUnavailable = errors.New("local log unavailable")
 //   - 处理响应: 根据 Follower 的响应来更新 nextIndex 和 matchIndex。
 //     如果 Follower 的日志与 Leader 不一致，它会根据响应中的冲突信息 (ConflictIndex, ConflictTerm) 回退 nextIndex 并重试，直到日志达成一致。
 func (r *Raft) sendAppendEntries(peerID int) {
+	defer r.finishAppendEntries(peerID)
+
 	// 1. 决定需要对该 Follower 执行哪种同步操作。
 	action := r.determineReplicationAction(peerID)
 
@@ -76,6 +78,46 @@ func (r *Raft) determineReplicationAction(peerID int) replicationAction {
 	return actionSendLogs
 }
 
+func (r *Raft) triggerAppendEntries(peerID int) {
+	r.mu.Lock()
+	shouldStart := r.triggerAppendEntriesLocked(peerID)
+	r.mu.Unlock()
+	if shouldStart {
+		go r.sendAppendEntries(peerID)
+	}
+}
+
+func (r *Raft) triggerAppendEntriesLocked(peerID int) bool {
+	if r.getState() != Leader {
+		return false
+	}
+	if r.replicating == nil {
+		r.replicating = make(map[int]bool)
+	}
+	if r.replicationPending == nil {
+		r.replicationPending = make(map[int]bool)
+	}
+	if r.replicating[peerID] {
+		r.replicationPending[peerID] = true
+		return false
+	}
+	r.replicating[peerID] = true
+	return true
+}
+
+func (r *Raft) finishAppendEntries(peerID int) {
+	r.mu.Lock()
+	if r.getState() == Leader && r.replicationPending[peerID] {
+		r.replicationPending[peerID] = false
+		r.mu.Unlock()
+		go r.sendAppendEntries(peerID)
+		return
+	}
+	delete(r.replicationPending, peerID)
+	delete(r.replicating, peerID)
+	r.mu.Unlock()
+}
+
 // replicateLogsToPeer 封装了向单个 Peer 发送 AppendEntries RPC 的流程。
 // 为了实现流水线，这个函数会异步地发起 RPC，而不是阻塞等待。
 //
@@ -101,21 +143,17 @@ func (r *Raft) replicateLogsToPeer(peerID int) {
 	savedCurrentTerm := r.currentTerm
 	r.mu.Unlock() // 在发起网络调用前解锁。
 
-	// 启动一个新的 goroutine 来实际发送 RPC 并处理响应。
-	// 这使得主复制循环（例如心跳循环）可以不必等待网络延迟，
-	// 而可以继续检查并发送下一批日志，从而实现流水线效果。
-	go func() {
-		reply := param.NewAppendEntriesReply()
-		if err := r.trans.SendAppendEntries(strconv.Itoa(peerID), args, reply); err != nil {
-			log.Debugf("[Log Replication] Node %d failed to send AppendEntries to %d: %s", r.id, peerID, err.Error())
-			return
-		}
+	reply := param.NewAppendEntriesReply()
+	if err := r.trans.SendAppendEntries(strconv.Itoa(peerID), args, reply); err != nil {
+		log.Debugf("[Log Replication] Node %d failed to send AppendEntries to %d: %s", r.id, peerID, err.Error())
+		return
+	}
 
-		// 在 RPC 完成后，在后台处理响应。
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		r.processAppendEntriesReply(peerID, args, reply, savedCurrentTerm)
-	}()
+	// 在 RPC 完成后处理响应。每个 peer 由 triggerAppendEntries 合并调度，
+	// 避免失败重试或心跳广播创建无限复制 goroutine。
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.processAppendEntriesReply(peerID, args, reply, savedCurrentTerm)
 }
 
 // MaxEntriesPerAppendEntries 限制单次 AppendEntries 发送的日志数量
@@ -270,7 +308,9 @@ func (r *Raft) processAppendEntriesReply(peerID int, args *param.AppendEntriesAr
 
 		if reply.Success {
 			if r.handleSuccessfulAppendEntries(peerID, args) {
-				go r.sendAppendEntries(peerID)
+				if r.triggerAppendEntriesLocked(peerID) {
+					go r.sendAppendEntries(peerID)
+				}
 			}
 		} else {
 			r.handleFailedAppendEntries(peerID, reply)
@@ -289,13 +329,18 @@ func (r *Raft) handleSuccessfulAppendEntries(peerID int, args *param.AppendEntri
 		r.matchIndex[peerID] = newMatchIndex
 	}
 
-	r.updateCommitIndex()
+	commitAdvanced := r.updateCommitIndex()
 
 	// Continue streaming the next batch immediately while the peer is still
 	// behind. Relying only on the 100ms heartbeat loop limits catch-up to
 	// MaxEntriesPerAppendEntries per tick, which leaves snapshot-restored
 	// followers minutes behind under long-running write workloads.
-	return r.getState() == Leader && r.nextIndex[peerID] <= r.cachedLastLogIndex
+	//
+	// Also send one more AppendEntries when this ACK advanced commitIndex, even
+	// if the peer is otherwise caught up. The ACK was for entries sent with the
+	// previous LeaderCommit value, so the follower may have the entry but not
+	// know it is committed yet.
+	return r.getState() == Leader && (r.nextIndex[peerID] <= r.cachedLastLogIndex || commitAdvanced)
 }
 
 // handleFailedAppendEntries 在收到失败的 AppendEntries 响应后调整 nextIndex。
@@ -320,17 +365,19 @@ func (r *Raft) handleFailedAppendEntries(peerID int, reply *param.AppendEntriesR
 	}
 	r.nextIndex[peerID] = nextIndex
 
-	go r.sendAppendEntries(peerID)
+	if r.triggerAppendEntriesLocked(peerID) {
+		go r.sendAppendEntries(peerID)
+	}
 }
 
 // updateCommitIndex 检查 Leader 是否可以推进其 commitIndex。
 // 计算已在集群多数节点上成功复制的最高日志索引，并更新 Leader 自己的 commitIndex。
 // Raft 的安全规则规定，只有当前任期的日志才可以通过这种方式被提交。
-func (r *Raft) updateCommitIndex() {
+func (r *Raft) updateCommitIndex() bool {
 	for {
 		newCommitIndex := r.findMajorityCommitIndex()
 		if newCommitIndex <= r.commitIndex {
-			return
+			return false
 		}
 
 		term, err := r.getLogTermLocked(newCommitIndex)
@@ -339,15 +386,16 @@ func (r *Raft) updateCommitIndex() {
 				continue
 			}
 			log.Errorf("[Replication] Node %d failed to get term for new commit index %d: %v", r.id, newCommitIndex, err)
-			return
+			return false
 		}
 
 		if term == r.currentTerm {
 			log.Debugf("[Log Replication] Node %d advances commitIndex to %d (term=%d)", r.id, newCommitIndex, r.currentTerm)
 			r.commitIndex = newCommitIndex
 			r.startApplyLogsLocked()
+			return true
 		}
-		return
+		return false
 	}
 }
 
@@ -645,6 +693,11 @@ func (r *Raft) findConflictAndPrepare(args *param.AppendEntriesArgs) (newEntries
 // 如果 Leader 的任期有效，返回 true；如果因任期过时而应立即拒绝，返回 false。
 func (r *Raft) handleTermAndHeartbeat(args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) bool {
 	reply.Term = r.currentTerm
+	if r.getState() == Dead {
+		reply.Success = false
+		return false
+	}
+
 	// 如果 Leader 的任期小于当前节点的任期，说明这是一个过时的 Leader，拒绝其请求。
 	if args.Term < r.currentTerm {
 		reply.Success = false
@@ -664,6 +717,8 @@ func (r *Raft) handleTermAndHeartbeat(args *param.AppendEntriesArgs, reply *para
 		reply.Term = r.currentTerm
 	}
 
+	r.acceptLeaderForCurrentTermLocked(args.LeaderID)
+
 	// 只要收到了来自当前（或更新后的）合法 Leader 的消息，就重置选举计时器。
 	// 这表明 Leader 仍然活跃，Follower 不需要发起新的选举。
 	r.electionResetEvent = time.Now()
@@ -671,6 +726,22 @@ func (r *Raft) handleTermAndHeartbeat(args *param.AppendEntriesArgs, reply *para
 	// 重置下一次的随机超时
 	r.currentElectionTimeout = r.randomizedElectionTimeout()
 	return true
+}
+
+func (r *Raft) acceptLeaderForCurrentTermLocked(leaderID int) {
+	r.knownLeaderID = leaderID
+	if r.getState() == Follower {
+		return
+	}
+
+	log.Debugf("[Log Replication] Node %d accepts leader %d for term %d and steps down from state %d", r.id, leaderID, r.currentTerm, r.getState())
+	r.setState(Follower)
+	r.abortPendingApplyWaitersLocked()
+	r.replicating = make(map[int]bool)
+	r.replicationPending = make(map[int]bool)
+	r.lastAck = make(map[int]time.Time)
+	r.lastLeadershipConfirm = time.Time{}
+	r.leaseUntil = time.Time{}
 }
 
 // checkLogConsistency 负责检查本地日志是否与 Leader 的日志保持一致。
@@ -889,6 +960,8 @@ func (r *Raft) dispatchEntries(entries []param.LogEntry) {
 		}
 
 		switch cmd := appliedEntry.Command.(type) {
+		case param.NoopCommand:
+			r.completeAppliedEntry(entry.Index, nil, clientID, sequenceNum, hasClient)
 		case param.ConfigChangeCommand:
 			// 配置变更命令，持有锁处理
 			r.applyConfigChange(cmd, entry.Index)

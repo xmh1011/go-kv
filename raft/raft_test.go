@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -68,13 +69,16 @@ func TestSubmit(t *testing.T) {
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
 
 				wg.Add(2) // 2 peers
+				var doneCounter int32
 				tr.EXPECT().SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).
 					DoAndReturn(func(id string, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
 						reply.Success = true
 						reply.Term = args.Term
-						wg.Done()
+						if atomic.AddInt32(&doneCounter, 1) <= 2 {
+							wg.Done()
+						}
 						return nil
-					}).Times(2)
+					}).AnyTimes()
 			},
 			expectedIndex: 6,
 			expectedTerm:  2,
@@ -125,6 +129,7 @@ func TestSubmit(t *testing.T) {
 				r.setState(Follower)
 			} else {
 				r = NewRaft(1, peerIDs, mockStore, mockSM, mockTrans, nil)
+				defer r.Stop()
 				r.currentTerm = tt.initialState.term
 				r.setState(tt.initialState.state)
 				if r.getState() == Leader {
@@ -190,13 +195,16 @@ func TestChangeConfig(t *testing.T) {
 
 				// 4 unique peers: 2, 3, 4, 5 (1 is self)
 				wg.Add(4)
+				var doneCounter int32
 				tr.EXPECT().SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).
 					DoAndReturn(func(id string, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
 						reply.Success = true
 						reply.Term = args.Term
-						wg.Done()
+						if atomic.AddInt32(&doneCounter, 1) <= 4 {
+							wg.Done()
+						}
 						return nil
-					}).Times(4)
+					}).AnyTimes()
 			},
 			expectedIndex: 11,
 			expectedTerm:  3,
@@ -242,6 +250,7 @@ func TestChangeConfig(t *testing.T) {
 				r.setState(Leader)
 			} else {
 				r = NewRaft(1, currentPeers, mockStore, mockSM, mockTrans, nil)
+				defer r.Stop()
 				r.currentTerm = tt.initialState.term
 				r.setState(tt.initialState.state)
 				lastLogIndex := uint64(10)
@@ -1048,6 +1057,7 @@ func TestTimeoutResets(t *testing.T) {
 
 		assert.True(t, reply.Success, "Heartbeat should have been accepted")
 		assert.NotEqual(t, 12345, r.currentElectionTimeout, "Timeout should be reset on heartbeat")
+		assert.Equal(t, 2, r.knownLeaderID, "heartbeat should refresh the known leader hint")
 	})
 
 	// 2. 测试投票时 (grantVote)
@@ -1095,6 +1105,76 @@ func TestTimeoutResets(t *testing.T) {
 		assert.Equal(t, uint64(6), r.currentTerm)
 		assert.NotEqual(t, 12345, r.currentElectionTimeout, "Timeout should be reset on becomeFollower")
 	})
+}
+
+func TestAppendEntriesSameTermLeaderDemotesCandidate(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
+
+	r := NewRaft(1, []int{1, 2, 3}, mockStore, nil, nil, nil)
+	r.currentTerm = 5
+	r.votedFor = 1
+	r.setState(Candidate)
+
+	reply := &param.AppendEntriesReply{}
+	err := r.AppendEntries(&param.AppendEntriesArgs{
+		Term:         5,
+		LeaderID:     2,
+		PrevLogIndex: 0,
+	}, reply)
+
+	assert.NoError(t, err)
+	assert.True(t, reply.Success)
+	assert.Equal(t, Follower, r.getState())
+	assert.Equal(t, uint64(5), r.currentTerm)
+	assert.Equal(t, 1, r.votedFor, "same-term step-down must not reset the persisted vote")
+	assert.Equal(t, 2, r.knownLeaderID)
+}
+
+func TestAppendEntriesSameTermLeaderDemotesStaleLeaderAndReleasesWaiters(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
+
+	waiter := make(chan any)
+	clientKey := clientRequestKey{clientID: 11, sequenceNum: 7}
+	r := NewRaft(1, []int{1, 2, 3}, mockStore, nil, nil, nil)
+	r.currentTerm = 5
+	r.votedFor = 1
+	r.notifyApply[10] = []chan any{waiter}
+	r.pendingClientRequests[clientKey] = 10
+	r.pendingLogClients[10] = clientKey
+	r.setState(Leader)
+
+	reply := &param.AppendEntriesReply{}
+	err := r.AppendEntries(&param.AppendEntriesArgs{
+		Term:         5,
+		LeaderID:     2,
+		PrevLogIndex: 0,
+	}, reply)
+
+	assert.NoError(t, err)
+	assert.True(t, reply.Success)
+	assert.Equal(t, Follower, r.getState())
+	assert.Equal(t, uint64(5), r.currentTerm)
+	assert.Equal(t, 1, r.votedFor, "same-term step-down must not reset the persisted vote")
+	assert.Equal(t, 2, r.knownLeaderID)
+	assert.Empty(t, r.notifyApply)
+	assert.Empty(t, r.pendingClientRequests)
+	assert.Empty(t, r.pendingLogClients)
+	select {
+	case _, ok := <-waiter:
+		assert.False(t, ok, "stale leader waiters should be released")
+	default:
+		t.Fatal("stale leader waiter was not released")
+	}
 }
 
 // helper function 构造一个 "get" 命令

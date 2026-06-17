@@ -244,6 +244,26 @@ func (c *cluster) restartNode(t *testing.T, nodeIndex int) {
 	t.Logf("Node %d restarted.", id)
 }
 
+func (c *cluster) waitForStateMachineValue(t *testing.T, nodeIndex int, key, expected string, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	var lastValue string
+	var lastErr error
+	for time.Now().Before(deadline) {
+		value, err := c.stateMachines[nodeIndex].Get(key)
+		if err == nil && value == expected {
+			return
+		}
+		lastValue = value
+		lastErr = err
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	t.Fatalf("node %d did not observe %s=%q within %v; last value=%q, last error=%v",
+		nodeIndex+1, key, expected, timeout, lastValue, lastErr)
+}
+
 // TestCluster_ElectionAndReplication 测试基本的选举和日志复制功能。
 // 验证集群能否选出 Leader，以及 Leader 写入的数据能否复制到所有 Follower。
 func TestCluster_ElectionAndReplication(t *testing.T) {
@@ -787,9 +807,7 @@ func TestCluster_Persistence_Restart(t *testing.T) {
 				t.Logf("Cluster stabilized, new leader: %d", newLeader.ID())
 
 				// 3. 验证数据恢复
-				val, err := c.stateMachines[leaderID-1].Get(key)
-				assert.NoError(t, err)
-				assert.Equal(t, value, val, "Restarted node lost its state machine data!")
+				c.waitForStateMachineValue(t, leaderID-1, key, value, 5*time.Second)
 
 				lastIndex, _ := c.storages[leaderID-1].LastLogIndex()
 				assert.Greater(t, lastIndex, uint64(0), "Restarted node lost its Raft logs!")
@@ -801,11 +819,7 @@ func TestCluster_Persistence_Restart(t *testing.T) {
 				assert.NoError(t, err)
 				assert.True(t, reply.Success)
 
-				time.Sleep(1 * time.Second)
-
-				val2, err := c.stateMachines[leaderID-1].Get(key2)
-				assert.NoError(t, err)
-				assert.Equal(t, "v2", val2)
+				c.waitForStateMachineValue(t, leaderID-1, key2, "v2", 5*time.Second)
 			})
 		}
 	}

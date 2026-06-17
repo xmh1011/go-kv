@@ -125,6 +125,24 @@ func TestValidateLongRunningMetricsRequiresOperationAccounting(t *testing.T) {
 	}
 }
 
+func TestLongRunningStopGateDoesNotCancelIssuedRequest(t *testing.T) {
+	stopCh := make(chan struct{})
+	close(stopCh)
+
+	if !shouldStopBeforeRequest(stopCh, false) {
+		t.Fatal("expected stop signal to cancel before a request is issued")
+	}
+	if shouldStopBeforeRequest(stopCh, true) {
+		t.Fatal("stop signal must not cancel an already issued request")
+	}
+	if !waitBeforeRetryAfterIssued(stopCh, 0, true) {
+		t.Fatal("issued requests should keep retrying despite stop signal")
+	}
+	if waitBeforeRetryAfterIssued(stopCh, time.Millisecond, false) {
+		t.Fatal("not-yet-issued requests should still honor stop signal")
+	}
+}
+
 type longRunningValidationOptions struct {
 	RequireNoFailedOps         bool
 	RequireConsistency         bool
@@ -590,6 +608,7 @@ func (c *longRunningCluster) sendRequest(node *raft.Raft, cmd param.KVCommand) (
 // 3. 如果节点是 Follower，返回 NotLeader + LeaderHint，客户端重定向
 func (c *longRunningCluster) sendRequestToAnyNode(cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, error) {
 	var totalLatency time.Duration
+	requestIssued := false
 
 	// 初始随机选择一个节点
 	nodeIdx := rand.Intn(c.nodeCount())
@@ -602,16 +621,17 @@ func (c *longRunningCluster) sendRequestToAnyNode(cmd param.KVCommand, maxRetrie
 	}
 
 	for retry := 0; retry < maxRetries; retry++ {
-		// 检查是否应该停止
-		select {
-		case <-stopCh:
+		// Stop only gates new operations. Once this client identity has been
+		// sent, keep retrying it so the test's expected-value model cannot miss
+		// an operation that commits after shutdown starts.
+		if shouldStopBeforeRequest(stopCh, requestIssued) {
 			return false, totalLatency, errLongRunningTestStopped
-		default:
 		}
 
 		reply := &param.ClientReply{}
 
 		start := time.Now()
+		requestIssued = true
 		err := node.ClientRequest(args, reply)
 		latency := time.Since(start)
 		totalLatency += latency
@@ -636,7 +656,7 @@ func (c *longRunningCluster) sendRequestToAnyNode(cmd param.KVCommand, maxRetrie
 					node = c.nodeAt(rand.Intn(c.nodeCount()))
 				}
 			}
-			if !updatedLeader && !waitBeforeRetry(stopCh, retryBackoff(retry)) {
+			if !updatedLeader && !waitBeforeRetryAfterIssued(stopCh, retryBackoff(retry), requestIssued) {
 				return false, totalLatency, errLongRunningTestStopped
 			}
 			continue
@@ -679,6 +699,26 @@ func waitBeforeRetry(stopCh <-chan struct{}, delay time.Duration) bool {
 	}
 }
 
+func shouldStopBeforeRequest(stopCh <-chan struct{}, requestIssued bool) bool {
+	if stopCh == nil || requestIssued {
+		return false
+	}
+	select {
+	case <-stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+func waitBeforeRetryAfterIssued(stopCh <-chan struct{}, delay time.Duration, requestIssued bool) bool {
+	if requestIssued {
+		time.Sleep(delay)
+		return true
+	}
+	return waitBeforeRetry(stopCh, delay)
+}
+
 // findLeader 遍历所有节点找到当前 Leader
 func (c *longRunningCluster) findLeader() *raft.Raft {
 	for _, node := range c.nodesSnapshot() {
@@ -705,23 +745,26 @@ func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic
 }
 
 func (c *longRunningCluster) sendRequestWithLeaderTrackingDetailed(currentLeader *atomic.Value, cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, string, error) {
+	return c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, rand.Int63(), rand.Int63(), cmd, maxRetries, stopCh)
+}
+
+func (c *longRunningCluster) sendRequestWithClientLeaderTrackingDetailed(currentLeader *atomic.Value, clientID, sequenceNum int64, cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, string, error) {
 	var totalLatency time.Duration
 	lastFailureReason := "max_retries_exceeded"
+	requestIssued := false
 	cmdBytes, _ := json.Marshal(cmd)
 	args := &param.ClientArgs{
-		ClientID:    rand.Int63(),
-		SequenceNum: rand.Int63(),
+		ClientID:    clientID,
+		SequenceNum: sequenceNum,
 		Command:     cmdBytes,
 	}
 
 	for retry := 0; retry < maxRetries; retry++ {
-		// 检查是否应该停止
-		if stopCh != nil {
-			select {
-			case <-stopCh:
-				return false, totalLatency, "stopped", errLongRunningTestStopped
-			default:
-			}
+		// Stop only gates new operations. Once the command has been sent, keep
+		// retrying the same client request so a late Raft commit is still
+		// reflected in the long-running consistency tracker.
+		if shouldStopBeforeRequest(stopCh, requestIssued) {
+			return false, totalLatency, "stopped", errLongRunningTestStopped
 		}
 
 		// 获取当前 Leader
@@ -741,6 +784,7 @@ func (c *longRunningCluster) sendRequestWithLeaderTrackingDetailed(currentLeader
 		reply := &param.ClientReply{}
 
 		start := time.Now()
+		requestIssued = true
 		err := leader.ClientRequest(args, reply)
 		latency := time.Since(start)
 		totalLatency += latency
@@ -775,7 +819,7 @@ func (c *longRunningCluster) sendRequestWithLeaderTrackingDetailed(currentLeader
 					updatedLeader = true
 				}
 			}
-			if !updatedLeader && !waitBeforeRetry(stopCh, retryBackoff(retry)) {
+			if !updatedLeader && !waitBeforeRetryAfterIssued(stopCh, retryBackoff(retry), requestIssued) {
 				return false, totalLatency, "stopped", errLongRunningTestStopped
 			}
 			continue
@@ -941,6 +985,52 @@ func (c *longRunningCluster) waitForExpectedConsistency(t *testing.T, expected m
 	return consistent, count
 }
 
+func (c *longRunningCluster) waitForClusterBarrier(t *testing.T, currentLeader *atomic.Value, label string, timeout time.Duration) bool {
+	t.Helper()
+
+	now := time.Now().UnixNano()
+	key := fmt.Sprintf("__go_kv_long_barrier_%s_%d", label, now)
+	value := fmt.Sprintf("barrier-%s-%d", label, now)
+	cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
+
+	success, _, failureReason, err := c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, now, 1, cmd, longRunningClientRetries*2, nil)
+	if err != nil || !success {
+		t.Logf("[最终屏障同步] 写入失败: label=%s reason=%s err=%v", label, failureReason, err)
+		return false
+	}
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		allApplied := true
+		for _, node := range c.nodesSnapshot() {
+			if node == nil || node.IsStopped() {
+				continue
+			}
+			got := readObserved(c.stateMachineByID(node.ID()), key)
+			if got.exists != true || got.value != value {
+				allApplied = false
+				break
+			}
+		}
+		if allApplied {
+			return true
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	for _, node := range c.nodesSnapshot() {
+		if node == nil || node.IsStopped() {
+			continue
+		}
+		got := readObserved(c.stateMachineByID(node.ID()), key)
+		if got.exists != true || got.value != value {
+			t.Logf("[最终屏障同步] 节点 %d 未应用 barrier: expected=(exists=true,value=%q), got=(exists=%t,value=%q)",
+				node.ID(), value, got.exists, got.value)
+		}
+	}
+	return false
+}
+
 // verifyDataConsistency 验证所有存活节点的数据一致性，包括缺失/删除状态。
 func (c *longRunningCluster) verifyDataConsistency(t *testing.T, sampleKeys []string) (bool, int64) {
 	return c.verifyDataConsistencyWithLog(t, sampleKeys, true)
@@ -1082,14 +1172,19 @@ func (r *testRunner) runWithFailureInjection(t *testing.T, onProgress func(elaps
 	}
 }
 
+func skipLongRunningE2EInShortMode(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping long-running E2E test in short mode; run explicit TestLongRunning_10Min_* tests without -short")
+	}
+}
+
 // TestLongRunning_10Min_Comprehensive 10分钟综合性能测试
 // 模拟生产环境：使用 gRPC + LSM，三节点集群，混合读写删除操作
 // 客户端可以向任意节点发送请求，自动处理 NotLeader 重定向
 func TestLongRunning_10Min_Comprehensive(t *testing.T) {
+	skipLongRunningE2EInShortMode(t)
 	duration := 10 * time.Minute
-	if testing.Short() {
-		duration = 1 * time.Minute
-	}
 
 	c := newLongRunningCluster(t, 3)
 	defer c.shutdown()
@@ -1120,7 +1215,7 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 		key := fmt.Sprintf("warmup-key-%d", i)
 		value := fmt.Sprintf("warmup-value-%d", i)
 		cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
-		success, _, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, longRunningClientRetries, nil)
+		success, _, _, _ := c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, 1000, int64(i+1), cmd, longRunningClientRetries, nil)
 		if success {
 			warmupSuccess++
 		}
@@ -1163,6 +1258,8 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 			defer wg.Done()
 
 			clientPrefix := fmt.Sprintf("client-%d", cid)
+			requestClientID := int64(10000 + cid)
+			requestSeq := int64(0)
 			localKeys := make([]string, 0)
 
 			for {
@@ -1184,7 +1281,8 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 						cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
 						attempted = true
-						success, latency, failureReason, err = c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
+						requestSeq++
+						success, latency, failureReason, err = c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, requestClientID, requestSeq, cmd, longRunningClientRetries, stopCh)
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
@@ -1207,7 +1305,8 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 
 						cmd := param.KVCommand{Op: param.OpGet, Key: key}
 						attempted = true
-						success, latency, failureReason, err = c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
+						requestSeq++
+						success, latency, failureReason, err = c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, requestClientID, requestSeq, cmd, longRunningClientRetries, stopCh)
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
@@ -1224,7 +1323,8 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 						cmd := param.KVCommand{Op: param.OpDelete, Key: key}
 
 						attempted = true
-						success, latency, failureReason, err = c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
+						requestSeq++
+						success, latency, failureReason, err = c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, requestClientID, requestSeq, cmd, longRunningClientRetries, stopCh)
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
@@ -1312,18 +1412,18 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 	}
 
 	printLongRunningMetrics(t, &metrics)
-	if !finalConsistent {
-		t.Fatalf("comprehensive consistency check failed after waiting for followers to catch up")
-	}
+	requireLongRunningMetrics(t, metrics, longRunningValidationOptions{
+		RequireNoFailedOps:  true,
+		RequireConsistency:  true,
+		RequireVerifiedKeys: true,
+	})
 }
 
 // TestLongRunning_10Min_WriteHeavy 10分钟写入密集型测试
 // 客户端可以向任意节点发送请求，自动处理 NotLeader 重定向
 func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
+	skipLongRunningE2EInShortMode(t)
 	duration := 10 * time.Minute
-	if testing.Short() {
-		duration = 1 * time.Minute
-	}
 
 	c := newLongRunningCluster(t, 3)
 	defer c.shutdown()
@@ -1366,6 +1466,8 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 	for clientID := 0; clientID < numClients; clientID++ {
 		go func(cid int) {
 			defer wg.Done()
+			requestClientID := int64(20000 + cid)
+			requestSeq := int64(0)
 			opCount := int64(0)
 
 			for {
@@ -1377,7 +1479,8 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 					value := fmt.Sprintf("value-%d-%d", cid, rand.Intn(10000000))
 					cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-					success, latency, failureReason, err := c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
+					requestSeq++
+					success, latency, failureReason, err := c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, requestClientID, requestSeq, cmd, longRunningClientRetries, stopCh)
 					if errors.Is(err, errLongRunningTestStopped) {
 						return
 					}
@@ -1462,10 +1565,8 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 
 // TestLongRunning_10Min_MixedWithFailures 10分钟带故障恢复的混合测试
 func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
+	skipLongRunningE2EInShortMode(t)
 	duration := 10 * time.Minute
-	if testing.Short() {
-		duration = 1 * time.Minute
-	}
 
 	c := newLongRunningCluster(t, 3)
 	defer c.shutdown()
@@ -1511,6 +1612,8 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 	for clientID := 0; clientID < numClients; clientID++ {
 		go func(cid int) {
 			defer wg.Done()
+			requestClientID := int64(30000 + cid)
+			requestSeq := int64(0)
 			localKeys := make([]string, 0)
 
 			for {
@@ -1525,7 +1628,8 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 						value := fmt.Sprintf("val-%d", rand.Intn(100000))
 						cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-						success, latency, failureReason, err := c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
+						requestSeq++
+						success, latency, failureReason, err := c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, requestClientID, requestSeq, cmd, longRunningClientRetries, stopCh)
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
@@ -1552,7 +1656,8 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 						}
 
 						cmd := param.KVCommand{Op: param.OpGet, Key: key}
-						success, latency, failureReason, err := c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
+						requestSeq++
+						success, latency, failureReason, err := c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, requestClientID, requestSeq, cmd, longRunningClientRetries, stopCh)
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
@@ -1607,7 +1712,10 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 		})
 
 	expected := tracker.snapshot(1200)
+	barrierOK := c.waitForClusterBarrier(t, currentLeader, "mixed_failures", 45*time.Second)
+	t.Logf("[最终屏障同步] 结果: %v", barrierOK)
 	finalConsistent, finalVerified := c.waitForExpectedConsistency(t, expected, 45*time.Second)
+	finalConsistent = barrierOK && finalConsistent
 	t.Logf("[最终严格一致性检查] 已验证: %d 条节点键组合, 结果: %v", finalVerified, finalConsistent)
 	snapshotNodes, maxSnapshotIndex := c.snapshotStats()
 
@@ -1646,10 +1754,8 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 
 // TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots 覆盖生产中的节点重启、快照和严格一致性场景。
 func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
+	skipLongRunningE2EInShortMode(t)
 	duration := 10 * time.Minute
-	if testing.Short() {
-		duration = 1 * time.Minute
-	}
 
 	c := newLongRunningCluster(t, 3)
 	defer c.shutdown()
@@ -1675,7 +1781,7 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 		key := fmt.Sprintf("consistency-warmup-%d", i)
 		value := fmt.Sprintf("warmup-value-%d", i)
 		cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
-		success, _, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, longRunningClientRetries, nil)
+		success, _, _, _ := c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, 4000, int64(i+1), cmd, longRunningClientRetries, nil)
 		if success {
 			tracker.recordSet(key, value)
 		}
@@ -1706,6 +1812,8 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 	for clientID := 0; clientID < numClients; clientID++ {
 		go func(cid int) {
 			defer wg.Done()
+			requestClientID := int64(40000 + cid)
+			requestSeq := int64(0)
 			keySpace := 800
 
 			for {
@@ -1728,7 +1836,8 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 				case r < 0.55:
 					value := fmt.Sprintf("value-%d-%d", cid, rand.Int63())
 					cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
-					success, latency, failureReason, err = c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
+					requestSeq++
+					success, latency, failureReason, err = c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, requestClientID, requestSeq, cmd, longRunningClientRetries, stopCh)
 					if errors.Is(err, errLongRunningTestStopped) {
 						return
 					}
@@ -1740,7 +1849,8 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 
 				case r < 0.85:
 					cmd := param.KVCommand{Op: param.OpGet, Key: key}
-					success, latency, failureReason, err = c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
+					requestSeq++
+					success, latency, failureReason, err = c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, requestClientID, requestSeq, cmd, longRunningClientRetries, stopCh)
 					if errors.Is(err, errLongRunningTestStopped) {
 						return
 					}
@@ -1751,7 +1861,8 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 
 				default:
 					cmd := param.KVCommand{Op: param.OpDelete, Key: key}
-					success, latency, failureReason, err = c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
+					requestSeq++
+					success, latency, failureReason, err = c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, requestClientID, requestSeq, cmd, longRunningClientRetries, stopCh)
 					if errors.Is(err, errLongRunningTestStopped) {
 						return
 					}
@@ -1813,7 +1924,10 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 		})
 
 	expected := tracker.snapshot(1200)
+	barrierOK := c.waitForClusterBarrier(t, currentLeader, "consistency_restarts", 45*time.Second)
+	t.Logf("[最终屏障同步] 结果: %v", barrierOK)
 	finalConsistent, finalVerified := c.waitForExpectedConsistency(t, expected, 45*time.Second)
+	finalConsistent = barrierOK && finalConsistent
 	t.Logf("[最终严格一致性检查] 已验证: %d 条节点键组合, 结果: %v", finalVerified, finalConsistent)
 	snapshotNodes, maxSnapshotIndex := c.snapshotStats()
 
@@ -1854,10 +1968,8 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 
 // TestLongRunning_10Min_ReadHeavy 10分钟读取密集型测试
 func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
+	skipLongRunningE2EInShortMode(t)
 	duration := 10 * time.Minute
-	if testing.Short() {
-		duration = 1 * time.Minute
-	}
 
 	c := newLongRunningCluster(t, 3)
 	defer c.shutdown()
@@ -1883,7 +1995,7 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 		value := fmt.Sprintf("read-warmup-value-%d", i)
 		cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 		// 预热阶段使用 nil stopCh，因为没有启动客户端
-		success, _, _ := c.sendRequestWithLeaderTracking(currentLeader, cmd, longRunningClientRetries, nil)
+		success, _, _, _ := c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, 5000, int64(i+1), cmd, longRunningClientRetries, nil)
 		if success {
 			warmupSuccess++
 			warmupKeys = append(warmupKeys, key)
@@ -1917,6 +2029,8 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 	for clientID := 0; clientID < numClients; clientID++ {
 		go func(cid int) {
 			defer wg.Done()
+			requestClientID := int64(50000 + cid)
+			requestSeq := int64(0)
 			for {
 				// 先检查是否应该停止
 				select {
@@ -1928,7 +2042,8 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 				key := fmt.Sprintf("read-warmup-key-%d", rand.Intn(warmupCount))
 				cmd := param.KVCommand{Op: param.OpGet, Key: key}
 
-				success, latency, failureReason, err := c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
+				requestSeq++
+				success, latency, failureReason, err := c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, requestClientID, requestSeq, cmd, longRunningClientRetries, stopCh)
 				if errors.Is(err, errLongRunningTestStopped) {
 					return
 				}
@@ -2006,10 +2121,8 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 
 // TestLongRunning_10Min_DeleteStress 10分钟删除压力测试
 func TestLongRunning_10Min_DeleteStress(t *testing.T) {
+	skipLongRunningE2EInShortMode(t)
 	duration := 10 * time.Minute
-	if testing.Short() {
-		duration = 1 * time.Minute
-	}
 
 	c := newLongRunningCluster(t, 3)
 	defer c.shutdown()
@@ -2059,6 +2172,8 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 	for clientID := 0; clientID < numClients; clientID++ {
 		go func(cid int) {
 			defer wg.Done()
+			requestClientID := int64(60000 + cid)
+			requestSeq := int64(0)
 			opCount := int64(0)
 
 			for {
@@ -2073,7 +2188,8 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 						key := clientKeys[cid][idx]
 
 						cmd := param.KVCommand{Op: param.OpDelete, Key: key}
-						success, latency, failureReason, err := c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
+						requestSeq++
+						success, latency, failureReason, err := c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, requestClientID, requestSeq, cmd, longRunningClientRetries, stopCh)
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
@@ -2099,7 +2215,8 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 						value := fmt.Sprintf("val-%d", rand.Intn(10000))
 						cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
 
-						success, latency, failureReason, err := c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, longRunningClientRetries, stopCh)
+						requestSeq++
+						success, latency, failureReason, err := c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, requestClientID, requestSeq, cmd, longRunningClientRetries, stopCh)
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
@@ -2136,7 +2253,10 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 	})
 
 	expected := tracker.snapshot(1200)
+	barrierOK := c.waitForClusterBarrier(t, currentLeader, "delete_stress", 45*time.Second)
+	t.Logf("[最终屏障同步] 结果: %v", barrierOK)
 	finalConsistent, finalVerified := c.waitForExpectedConsistency(t, expected, 45*time.Second)
+	finalConsistent = barrierOK && finalConsistent
 	t.Logf("[最终严格一致性检查] 已验证: %d 条节点键组合, 结果: %v", finalVerified, finalConsistent)
 	snapshotNodes, maxSnapshotIndex := c.snapshotStats()
 

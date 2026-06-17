@@ -346,6 +346,9 @@ or consensus problems, use the implementation-focused design documents:
 | SSTable file format | [LSM.md](LSM.md) | The physical file order, footer layout, lazy DataBlock loading, and index/value pairing. |
 | LSM file catalog | [LSM.md](LSM.md) | How Level 0 ordering, sparse indexes, compaction metadata, and recovery interact. |
 | Raft log storage in LSM | [LSM.md](LSM.md) | The `meta:*` keys, fixed-width `log:*` keys, and `GLG1` binary log format. |
+| Running the system | [USAGE.md](USAGE.md) | Build, local cluster startup, CLI commands, configuration, testing, and release tags. |
+| Long-test evidence | [PERFORMANCE.md](PERFORMANCE.md) | Latest 10-minute E2E results, consistency gates, and reproduction commands. |
+| Failure analysis | [BUG_FIX_RETROSPECTIVE.md](BUG_FIX_RETROSPECTIVE.md) | Root causes, Raft/LSM principles, and lessons from the latest core fixes. |
 
 If an E2E test exposes a consistency bug, start from these maps before changing
 code. Most serious failures come from a broken boundary between Raft progress,

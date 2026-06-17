@@ -316,5 +316,8 @@ make long-test
 | SSTable 文件格式 | [LSM.zh-CN.md](LSM.zh-CN.md) | 物理文件顺序、footer 布局、DataBlock 懒加载、index/value 配对。 |
 | LSM 文件目录 | [LSM.zh-CN.md](LSM.zh-CN.md) | Level 0 顺序、稀疏索引、compaction 元数据和恢复之间的关系。 |
 | LSM 中的 Raft 日志 | [LSM.zh-CN.md](LSM.zh-CN.md) | `meta:*` key、固定宽度 `log:*` key 和 `GLG1` 二进制日志格式。 |
+| 运行系统 | [USAGE.zh-CN.md](USAGE.zh-CN.md) | 构建、本地集群、CLI、配置、测试和 release tag。 |
+| 长测证据 | [PERFORMANCE.zh-CN.md](PERFORMANCE.zh-CN.md) | 最新 10 分钟 E2E 结果、一致性门禁和复现命令。 |
+| 故障复盘 | [BUG_FIX_RETROSPECTIVE.zh-CN.md](BUG_FIX_RETROSPECTIVE.zh-CN.md) | 最新内核修复的根因、Raft/LSM 原理和经验。 |
 
 如果端到端测试暴露一致性 bug，应先按这张地图定位问题边界，再改代码。严重问题通常来自 Raft 复制进度、snapshot compaction 和 LSM 可见性之间的边界被破坏。

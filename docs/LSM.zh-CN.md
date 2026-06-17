@@ -239,6 +239,8 @@ Compaction 将某一层 SSTable 合并到下一层。
 
 从读者视角看，SSTable 元数据更新必须是原子的。读者应该看到旧文件集合或新文件集合，而不是半更新状态。
 
+Compaction 还要区分 stale metadata 和真实文件损坏。如果内存目录引用的文件已经不存在，manager 会剪掉这个过期元数据并继续。如果文件存在但无法解码，compaction 仍然返回错误。这样既保持对真实损坏的严格性，又允许文件目录中的 stale entry 自恢复。
+
 ## 12. Raft 日志存储适配器
 
 `pkg/storage/lsm/storage.go` 基于 LSM 实现 `storage.Storage`。
@@ -299,6 +301,8 @@ Database.Get(key)
 ```
 
 状态机快照编码为 LSM 文件的二进制归档。归档中使用长度前缀保存文件名和原始字节。
+
+Snapshot 导出会在持有 SSTable manager read lock 时打开所有准备复制的 SSTable 文件，之后从这些已打开的 fd 读取数据。这可以抵抗并发 compaction：即使 compaction 随后删除了目录项，已打开 fd 仍然指向 snapshot 选择的文件内容。
 
 ## 14. 恢复
 
@@ -458,6 +462,7 @@ firstIndex <= 可见日志索引 <= lastIndex
 | SSTable 懒加载 | 重复读取追加重复 value。 | 每次 decode 前 reset `DataBlock`。 |
 | Raft truncate/reappend | 同一 index 上旧日志 payload 和新日志 payload 混用。 | 重写已有 log key 时先扣除旧大小，再写新值。 |
 | Raft compaction | apply loop 读取已被压缩的 committed entry。 | Raft 必须通过覆盖该 index 的 snapshot 跳过；没有覆盖 snapshot 时才应明显失败。 |
+| Compaction 目录清理 | 元数据引用已经删除的文件。 | 缺失文件可以剪掉元数据，但存在且损坏的文件仍然是硬错误。 |
 
 这些防线在 review 中必须被当作正确性要求，而不是性能细节。
 
@@ -471,7 +476,10 @@ firstIndex <= 可见日志索引 <= lastIndex
 - Tombstone 必须遮蔽旧值，直到可以安全丢弃。
 - SSTable decode 在填充可复用结构前必须 reset。
 - Compaction 元数据更新受 manager lock 保护。
+- 只有确认物理 SSTable 文件不存在时，才能剪掉 missing-file 元数据；存在但损坏的文件仍然必须报错。
 - Raft 日志读取必须遵守逻辑 `[firstIndex, lastIndex]` 窗口。
 - 快照导出和应用不能与状态机写入并发冲突。
 
 大多数存储 bug 都是这些不变量之一被破坏。
+
+近期具体故障和修复过程见 [BUG_FIX_RETROSPECTIVE.zh-CN.md](BUG_FIX_RETROSPECTIVE.zh-CN.md)。
