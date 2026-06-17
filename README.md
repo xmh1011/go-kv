@@ -30,6 +30,7 @@ Start with the high-level design document if you are new to the codebase.
 | Raft design | [docs/RAFT.md](docs/RAFT.md) | [docs/RAFT.zh-CN.md](docs/RAFT.zh-CN.md) |
 | LSM-tree design | [docs/LSM.md](docs/LSM.md) | [docs/LSM.zh-CN.md](docs/LSM.zh-CN.md) |
 | Usage guide | [docs/USAGE.md](docs/USAGE.md) | [docs/USAGE.zh-CN.md](docs/USAGE.zh-CN.md) |
+| Go SDK reference | [docs/SDK.md](docs/SDK.md) | [docs/SDK.zh-CN.md](docs/SDK.zh-CN.md) |
 | Performance report | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | [docs/PERFORMANCE.zh-CN.md](docs/PERFORMANCE.zh-CN.md) |
 | Bug fix retrospective | [docs/BUG_FIX_RETROSPECTIVE.md](docs/BUG_FIX_RETROSPECTIVE.md) | [docs/BUG_FIX_RETROSPECTIVE.zh-CN.md](docs/BUG_FIX_RETROSPECTIVE.zh-CN.md) |
 
@@ -275,8 +276,9 @@ If you are new to the project, read the docs in this order:
 2. [Raft design](docs/RAFT.md)
 3. [LSM-tree design](docs/LSM.md)
 4. [Usage guide](docs/USAGE.md)
-5. [Performance report](docs/PERFORMANCE.md)
-6. [Bug fix retrospective](docs/BUG_FIX_RETROSPECTIVE.md)
-7. The tests in `tests/integration_test.go` and `tests/long_running_e2e_test.go`
+5. [Go SDK reference](docs/SDK.md)
+6. [Performance report](docs/PERFORMANCE.md)
+7. [Bug fix retrospective](docs/BUG_FIX_RETROSPECTIVE.md)
+8. The tests in `tests/integration_test.go` and `tests/long_running_e2e_test.go`
 
 The tests are often the easiest way to understand how the modules work together.
