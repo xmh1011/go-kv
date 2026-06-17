@@ -24,6 +24,7 @@ English documentation: [README.md](README.md)
 | Raft 设计 | [docs/RAFT.md](docs/RAFT.md) | [docs/RAFT.zh-CN.md](docs/RAFT.zh-CN.md) |
 | LSM-tree 设计 | [docs/LSM.md](docs/LSM.md) | [docs/LSM.zh-CN.md](docs/LSM.zh-CN.md) |
 | 使用指南 | [docs/USAGE.md](docs/USAGE.md) | [docs/USAGE.zh-CN.md](docs/USAGE.zh-CN.md) |
+| Go SDK 接口文档 | [docs/SDK.md](docs/SDK.md) | [docs/SDK.zh-CN.md](docs/SDK.zh-CN.md) |
 | 性能报告 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | [docs/PERFORMANCE.zh-CN.md](docs/PERFORMANCE.zh-CN.md) |
 | Bug 修复复盘 | [docs/BUG_FIX_RETROSPECTIVE.md](docs/BUG_FIX_RETROSPECTIVE.md) | [docs/BUG_FIX_RETROSPECTIVE.zh-CN.md](docs/BUG_FIX_RETROSPECTIVE.zh-CN.md) |
 
@@ -259,8 +260,9 @@ Raft 存储工厂支持三种模式：
 2. [Raft 设计](docs/RAFT.zh-CN.md)
 3. [LSM-tree 设计](docs/LSM.zh-CN.md)
 4. [使用指南](docs/USAGE.zh-CN.md)
-5. [性能报告](docs/PERFORMANCE.zh-CN.md)
-6. [Bug 修复复盘](docs/BUG_FIX_RETROSPECTIVE.zh-CN.md)
-7. `tests/integration_test.go` 和 `tests/long_running_e2e_test.go`
+5. [Go SDK 接口文档](docs/SDK.zh-CN.md)
+6. [性能报告](docs/PERFORMANCE.zh-CN.md)
+7. [Bug 修复复盘](docs/BUG_FIX_RETROSPECTIVE.zh-CN.md)
+8. `tests/integration_test.go` 和 `tests/long_running_e2e_test.go`
 
 测试通常是理解不同模块如何协作的最好入口。

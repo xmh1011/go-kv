@@ -347,6 +347,7 @@ or consensus problems, use the implementation-focused design documents:
 | LSM file catalog | [LSM.md](LSM.md) | How Level 0 ordering, sparse indexes, compaction metadata, and recovery interact. |
 | Raft log storage in LSM | [LSM.md](LSM.md) | The `meta:*` keys, fixed-width `log:*` keys, and `GLG1` binary log format. |
 | Running the system | [USAGE.md](USAGE.md) | Build, local cluster startup, CLI commands, configuration, testing, and release tags. |
+| Go SDK usage | [SDK.md](SDK.md) | Application-facing packages, client calls, command types, transport setup, and retry semantics. |
 | Long-test evidence | [PERFORMANCE.md](PERFORMANCE.md) | Latest 10-minute E2E results, consistency gates, and reproduction commands. |
 | Failure analysis | [BUG_FIX_RETROSPECTIVE.md](BUG_FIX_RETROSPECTIVE.md) | Root causes, Raft/LSM principles, and lessons from the latest core fixes. |
 

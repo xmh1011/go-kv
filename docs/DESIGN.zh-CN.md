@@ -317,6 +317,7 @@ make long-test
 | LSM 文件目录 | [LSM.zh-CN.md](LSM.zh-CN.md) | Level 0 顺序、稀疏索引、compaction 元数据和恢复之间的关系。 |
 | LSM 中的 Raft 日志 | [LSM.zh-CN.md](LSM.zh-CN.md) | `meta:*` key、固定宽度 `log:*` key 和 `GLG1` 二进制日志格式。 |
 | 运行系统 | [USAGE.zh-CN.md](USAGE.zh-CN.md) | 构建、本地集群、CLI、配置、测试和 release tag。 |
+| Go SDK 使用 | [SDK.zh-CN.md](SDK.zh-CN.md) | 应用侧包、client 调用、命令类型、transport 设置和重试语义。 |
 | 长测证据 | [PERFORMANCE.zh-CN.md](PERFORMANCE.zh-CN.md) | 最新 10 分钟 E2E 结果、一致性门禁和复现命令。 |
 | 故障复盘 | [BUG_FIX_RETROSPECTIVE.zh-CN.md](BUG_FIX_RETROSPECTIVE.zh-CN.md) | 最新内核修复的根因、Raft/LSM 原理和经验。 |
 
