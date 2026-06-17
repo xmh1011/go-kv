@@ -2,10 +2,14 @@ package database
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/xmh1011/go-kv/pkg/config"
 )
 
 // TestDatabasePutGetDelete 测试 Put、Get 和 Delete 的功能
@@ -133,6 +137,67 @@ func TestDatabaseRecoveryKeepsNewestLevel0Value(t *testing.T) {
 	val, err := db2.Get("key")
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("value2"), val)
+}
+
+func TestDatabaseCompactionPreservesLatestValueAcrossFlushes(t *testing.T) {
+	oldLSMConfig := config.Conf.LSM
+	config.Conf.LSM.MaxMemTableSize = 256
+	config.Conf.LSM.MaxSSTableSize = 512
+	config.Conf.LSM.MaxIMemTableCount = 1
+	config.Conf.LSM.LevelSizeBase = 2
+	defer func() {
+		config.Conf.LSM = oldLSMConfig
+	}()
+
+	tmpDir := t.TempDir()
+	db := Open(tmpDir)
+
+	rng := rand.New(rand.NewSource(42))
+	expected := make(map[string][]byte)
+	for i := 0; i < 3000; i++ {
+		key := fmt.Sprintf("key-%02d", rng.Intn(32))
+		if rng.Intn(100) < 30 {
+			require.NoError(t, db.Delete(key))
+			expected[key] = nil
+		} else {
+			value := []byte(fmt.Sprintf("value-%04d-%d", i, rng.Int63()))
+			require.NoError(t, db.Put(key, value))
+			expected[key] = append([]byte(nil), value...)
+		}
+
+		if i%50 == 0 {
+			require.NoError(t, db.ForceFlush())
+		}
+	}
+	require.NoError(t, db.ForceFlush())
+	db.SSTables.WaitForCompactions()
+
+	for key, want := range expected {
+		got, err := db.Get(key)
+		require.NoError(t, err)
+		if want == nil {
+			assert.Nil(t, got, "key %s should be deleted before restart", key)
+			continue
+		}
+		assert.Equal(t, want, got, "key %s should keep latest value before restart", key)
+	}
+
+	db.Close()
+
+	reopened := Open(tmpDir)
+	defer reopened.Close()
+	require.NoError(t, reopened.Recover())
+	reopened.SSTables.WaitForCompactions()
+
+	for key, want := range expected {
+		got, err := reopened.Get(key)
+		require.NoError(t, err)
+		if want == nil {
+			assert.Nil(t, got, "key %s should be deleted after restart", key)
+			continue
+		}
+		assert.Equal(t, want, got, "key %s should keep latest value after restart", key)
+	}
 }
 
 func TestDatabaseRecoveryOnEmpty(t *testing.T) {

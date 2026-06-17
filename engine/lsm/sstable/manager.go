@@ -45,6 +45,14 @@ type Manager struct {
 	levelSizeBase   int
 }
 
+// SnapshotFile is an opened immutable SSTable file captured for snapshot export.
+// The open file descriptor pins the file content while compaction is free to
+// update the manager catalog after OpenFilesSnapshot returns.
+type SnapshotFile struct {
+	Path string
+	File *os.File
+}
+
 func NewSSTableManager(sstPath string) *Manager {
 	minLevel := config.Conf.LSM.MinSSTableLevel
 	maxLevel := config.Conf.LSM.MaxSSTableLevel
@@ -74,6 +82,34 @@ func NewSSTableManager(sstPath string) *Manager {
 	}
 	mgr.compactionCond = sync.NewCond(&mgr.mu)
 	return mgr
+}
+
+// OpenFilesSnapshot opens the current SSTable files while holding the manager
+// read lock, then returns with the lock released. SSTable files are immutable,
+// so open file descriptors can be read safely even if later compaction removes
+// the original paths.
+func (m *Manager) OpenFilesSnapshot() ([]SnapshotFile, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	files := make([]SnapshotFile, 0)
+	for _, tables := range m.levels {
+		for _, table := range tables {
+			path := table.FilePath()
+			file, err := os.Open(path)
+			if err != nil {
+				for _, opened := range files {
+					_ = opened.File.Close()
+				}
+				return nil, fmt.Errorf("open snapshot sstable %s: %w", path, err)
+			}
+			files = append(files, SnapshotFile{
+				Path: path,
+				File: file,
+			})
+		}
+	}
+	return files, nil
 }
 
 // CreateNewSSTable 将 imem 数据构建为 SSTable，写入到磁盘，然后将其元数据添加到内存中。

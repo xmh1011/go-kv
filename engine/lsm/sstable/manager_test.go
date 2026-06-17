@@ -49,6 +49,32 @@ func TestSSTableManagerCreateNewSSTable(t *testing.T) {
 	assert.True(t, os.IsNotExist(err), "WAL 文件应被 Clean 删除")
 }
 
+func TestSSTableManagerOpenFilesSnapshotReleasesManagerLock(t *testing.T) {
+	tmp := t.TempDir()
+
+	mem := memtable.NewMemTable(1, tmp)
+	assert.NoError(t, mem.Insert(kv.KeyValuePair{Key: "key1", Value: []byte("value1")}))
+	imem := memtable.NewIMemTable(mem)
+
+	ResetIDGenerator()
+	manager := NewSSTableManager(tmp)
+	assert.NoError(t, manager.CreateNewSSTable(imem))
+
+	files, err := manager.OpenFilesSnapshot()
+	assert.NoError(t, err)
+	defer func() {
+		for _, file := range files {
+			_ = file.File.Close()
+		}
+	}()
+	assert.Len(t, files, 1)
+
+	if !manager.mu.TryLock() {
+		t.Fatal("OpenFilesSnapshot kept the manager lock while callers read files")
+	}
+	manager.mu.Unlock()
+}
+
 func TestSSTableManagerSearch(t *testing.T) {
 	// 1. 创建临时目录和测试数据
 	dir := t.TempDir()
@@ -354,6 +380,50 @@ func TestRemoveTableMetadataCleansStaleLevelEntries(t *testing.T) {
 
 	assert.Empty(t, manager.getFilesByLevel(1))
 	assert.Empty(t, manager.sparseIndexes[0])
+	assert.NotContains(t, manager.totalMap[1], path)
+}
+
+func TestLoadLevelDataPrunesMissingCurrentLevelSSTable(t *testing.T) {
+	tmpDir := t.TempDir()
+	manager := NewSSTableManager(tmpDir)
+
+	path := filepath.Join(sstableLevelPath(0, tmpDir), "1170.sst")
+	manager.addTable(&SSTable{
+		id:       1170,
+		level:    0,
+		Header:   block.NewHeader("a", "z"),
+		filePath: path,
+	})
+
+	pairs, err := manager.loadLevelData(0, []string{path})
+
+	assert.NoError(t, err)
+	assert.Empty(t, pairs)
+	assert.Empty(t, manager.getFilesByLevel(0))
+	assert.NotContains(t, manager.fileIndex, path)
+	assert.NotContains(t, manager.totalMap[0], path)
+}
+
+func TestMergeNextLevelFilesPrunesMissingOverlappingSSTable(t *testing.T) {
+	tmpDir := t.TempDir()
+	manager := NewSSTableManager(tmpDir)
+
+	path := filepath.Join(sstableLevelPath(1, tmpDir), "1171.sst")
+	manager.addTable(&SSTable{
+		id:       1171,
+		level:    1,
+		Header:   block.NewHeader("a", "z"),
+		filePath: path,
+	})
+
+	pairs, oldFiles, err := manager.mergeNextLevelFiles(1, "b", "c")
+
+	assert.NoError(t, err)
+	assert.Empty(t, pairs)
+	assert.Empty(t, oldFiles)
+	assert.Empty(t, manager.getFilesByLevel(1))
+	assert.Empty(t, manager.sparseIndexes[0])
+	assert.NotContains(t, manager.fileIndex, path)
 	assert.NotContains(t, manager.totalMap[1], path)
 }
 

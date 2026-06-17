@@ -142,6 +142,23 @@ matchIndex[peer] = 0
 
 随后 leader 发送心跳。心跳就是不带 entries 的 AppendEntries。它用于阻止 follower 发起选举，也用于读请求的 leader 确认。
 
+Leader 还会在自己的任期追加一条 no-op entry。这是 Raft 中常见的安全技巧：leader 不能只靠复制数量直接提交旧任期 entry。只有当新任期 no-op 被提交后，它之前的旧任期 entry 才能被间接提交。
+
+```text
+transitionToLeader
+        |
+        v
+初始化 nextIndex 和 matchIndex
+        |
+        v
+追加当前任期 no-op
+        |
+        v
+复制 no-op，多数派确认后推进 commitIndex
+```
+
+no-op 不修改用户数据，它是 leadership barrier，用来保证 leader 切换后 commit 和 apply 进度能正确恢复。
+
 ## 8. 写路径
 
 写请求从 `ClientRequest` 进入 Raft：
@@ -199,6 +216,8 @@ Follower 会检查：
 - follower `commitIndex` 是否推进到 leader commit。
 
 实现中使用 `appendEntriesMu` 串行化 follower 侧磁盘修改，避免并发 AppendEntries 同时截断和追加日志导致冲突。
+
+同任期收到合法 leader 的 AppendEntries 也很重要。节点不需要等到更高 term 才降级。如果 candidate 或旧 leader 接受了当前任期 leader，就必须转为 follower，刷新 leader hint，并终止旧的客户端等待者。
 
 ## 10. Leader 复制进度
 
@@ -420,6 +439,8 @@ newMatchIndex = newNextIndex - 1
 
 失败响应会利用冲突信息回退 `nextIndex`，但不能低于 `matchIndex + 1`。
 
+成功响应如果推进了 `commitIndex`，leader 会把它当作新的复制信号。Follower 需要尽快收到新的 `LeaderCommit`；如果只等下一次 heartbeat，在重启或快照 churn 下会放大 apply 和 ReadIndex 延迟。
+
 ## 19. Apply、客户端重试和 ReadIndex 内部细节
 
 Apply 路径分两段。
@@ -542,3 +563,5 @@ Raft 是并发系统。主要规则：
 7. 是否通过 race 测试和真实多节点 E2E？
 
 这些问题能提前发现大部分正确性回归。
+
+近期具体故障和修复过程见 [BUG_FIX_RETROSPECTIVE.zh-CN.md](BUG_FIX_RETROSPECTIVE.zh-CN.md)。

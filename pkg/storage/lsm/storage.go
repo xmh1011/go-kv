@@ -32,6 +32,7 @@ const (
 	logCommandKV
 	logCommandConfigChange
 	logCommandClient
+	logCommandNoop
 )
 
 // StorageAdapter 实现了 storage.Storage 接口，
@@ -219,6 +220,8 @@ func appendLogCommand(buf *[]byte, command any) error {
 		appendUint64(buf, uint64(cmd.ClientID))
 		appendUint64(buf, uint64(cmd.SequenceNum))
 		return appendLogCommand(buf, cmd.Command)
+	case param.NoopCommand:
+		*buf = append(*buf, logCommandNoop)
 	default:
 		return fmt.Errorf("unsupported log command type %T", command)
 	}
@@ -353,6 +356,8 @@ func (c *logCommandCursor) readCommand() (any, error) {
 			return nil, err
 		}
 		return param.NewClientCommand(int64(clientID), int64(sequenceNum), nested), nil
+	case logCommandNoop:
+		return param.NoopCommand{}, nil
 	default:
 		return nil, fmt.Errorf("unknown log command type %d", commandType)
 	}

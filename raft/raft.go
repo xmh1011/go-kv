@@ -124,6 +124,11 @@ type Raft struct {
 	matchIndex map[int]uint64
 	lastAck    map[int]time.Time // 跟踪 Leader 收到的每个 peer 的最后 ACK 时间
 
+	// Per-peer replication scheduling. At most one replication worker may be
+	// active for a follower; extra triggers are coalesced into a pending bit.
+	replicating        map[int]bool
+	replicationPending map[int]bool
+
 	// --- 客户端交互状态 ---
 	clientSessions        map[int64]int64
 	pendingClientRequests map[clientRequestKey]uint64
@@ -165,6 +170,8 @@ func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.
 		shutdownChan:          make(chan struct{}),
 		proposalCh:            make(chan proposalRequest, proposalChSize),
 		lastAck:               make(map[int]time.Time),
+		replicating:           make(map[int]bool),
+		replicationPending:    make(map[int]bool),
 		pendingClientRequests: make(map[clientRequestKey]uint64),
 		pendingLogClients:     make(map[uint64]clientRequestKey),
 		snapshotThreshold:     -1, // 默认禁用自动快照
@@ -399,9 +406,10 @@ func (r *Raft) handleLinearizableRead(cmd param.KVCommand, reply *param.ClientRe
 
 	// 1. 检查是否为 Leader
 	if r.getState() != Leader {
+		leaderHint := r.knownLeaderID
 		r.mu.Unlock()
 		reply.NotLeader = true
-		reply.LeaderHint = r.knownLeaderID
+		reply.LeaderHint = leaderHint
 		return nil
 	}
 
@@ -924,12 +932,16 @@ func (r *Raft) proposeToLog(command any) (param.LogEntry, error) {
 // preHandleClientRequest 封装了所有在提交日志前需要进行的前置检查。
 // 返回值 bool 表示是否应继续处理该请求。
 func (r *Raft) preHandleClientRequest(args *param.ClientArgs, reply *param.ClientReply) bool {
-	if !r.isLeader() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.getState() != Leader {
 		reply.NotLeader = true
 		reply.LeaderHint = r.knownLeaderID
 		return false
 	}
-	if r.isDuplicateRequest(args.ClientID, args.SequenceNum) {
+	if lastSeq, exists := r.clientSessions[args.ClientID]; exists && args.SequenceNum <= lastSeq {
+		log.Debugf("[Client] Duplicate request detected from client %d (seq: %d)", args.ClientID, args.SequenceNum)
 		reply.Success = true // 对于重复请求，直接返回成功。
 		return false
 	}
@@ -946,7 +958,7 @@ func (r *Raft) CommitClient(command any, clientID, sequenceNum int64, trackClien
 	index, _, isLeader, alreadyApplied := r.submit(command, clientID, sequenceNum, trackClient)
 	if !isLeader {
 		// 在提交过程中，可能失去了 Leader 地位。
-		return nil, false, r.knownLeaderID
+		return nil, false, r.currentLeaderHint()
 	}
 	if alreadyApplied {
 		return nil, true, r.id
@@ -966,6 +978,12 @@ func (r *Raft) CommitClient(command any, clientID, sequenceNum int64, trackClien
 		r.clearPendingClientRequest(index)
 	}
 	return result, ok, r.id
+}
+
+func (r *Raft) currentLeaderHint() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.knownLeaderID
 }
 
 // finalizeClientReply 负责根据执行结果，最终构建给客户端的响应。
@@ -1184,7 +1202,7 @@ func (r *Raft) processBatch(batch []proposalRequest) {
 		if peerID == r.id {
 			continue
 		}
-		go r.sendAppendEntries(peerID)
+		r.triggerAppendEntries(peerID)
 	}
 }
 
@@ -1243,7 +1261,7 @@ func (r *Raft) ChangeConfig(newPeerIDs []int) (uint64, uint64, bool) {
 		if peerID == r.id {
 			continue
 		}
-		go r.sendAppendEntries(peerID)
+		r.triggerAppendEntries(peerID)
 	}
 
 	return newLogEntry.Index, newLogEntry.Term, true
@@ -1276,6 +1294,8 @@ func (r *Raft) becomeFollower(newTerm uint64) error {
 	r.setState(Follower)
 	r.votedFor = -1 // 进入新任期时，重置投票记录。
 	r.abortPendingApplyWaitersLocked()
+	r.replicating = make(map[int]bool)
+	r.replicationPending = make(map[int]bool)
 
 	// 每当我们成为 Follower（无论何种原因），
 	// 都应该重置选举计时器，并为下一次超时设置一个新的随机值。
@@ -1448,6 +1468,8 @@ func (r *Raft) initLeaderState() {
 
 	r.nextIndex = make(map[int]uint64)
 	r.matchIndex = make(map[int]uint64)
+	r.replicating = make(map[int]bool)
+	r.replicationPending = make(map[int]bool)
 	for _, peerID := range r.getAllPeerIDs() {
 		if peerID == r.id {
 			continue
@@ -1562,6 +1584,8 @@ func (r *Raft) broadcastHeartbeat() {
 		if peerID == r.id {
 			continue
 		}
-		go r.sendAppendEntries(peerID)
+		if r.triggerAppendEntriesLocked(peerID) {
+			go r.sendAppendEntries(peerID)
+		}
 	}
 }

@@ -206,30 +206,7 @@ func (r *Raft) initializeCandidateState() error {
 // getLastLogInfoForElection 从存储中获取最后一条日志的索引和任期。
 // 这些信息将用于填充 RequestVote RPC 参数，以供其他节点进行日志新旧检查。
 func (r *Raft) getLastLogInfoForElection() (lastLogIndex uint64, lastLogTerm uint64, err error) {
-	// 从存储中获取自己最后一条日志的索引。
-	lastLogIndex = r.cachedLastLogIndex
-
-	// 如果日志不为空，则获取最后一条日志的任期。
-	if lastLogIndex > 0 {
-		lastLogTerm, err = r.getLogTermLocked(lastLogIndex)
-		if err != nil {
-			if errors.Is(err, errLogEntryNotFound) {
-				log.Debugf("[Election] Node %d cached last log index %d is unavailable; refreshing from storage", r.id, lastLogIndex)
-				r.refreshCachedLastLogIndexLocked()
-				lastLogIndex = r.cachedLastLogIndex
-				if lastLogIndex == 0 {
-					return 0, 0, nil
-				}
-				lastLogTerm, err = r.getLogTermLocked(lastLogIndex)
-				if err == nil {
-					return lastLogIndex, lastLogTerm, nil
-				}
-			}
-			log.Errorf("[Election] Node %d failed to get last log term for election: %v", r.id, err)
-			return 0, 0, err
-		}
-	}
-	return lastLogIndex, lastLogTerm, nil
+	return r.localLastLogInfoLocked()
 }
 
 // broadcastVoteRequests 负责向集群中所有其他节点并行地发送投票请求。
@@ -348,6 +325,7 @@ func (r *Raft) transitionToLeader(electionTerm uint64) {
 		log.Debugf("[Election] Node %d elected as Leader for term %d", r.id, r.currentTerm)
 		r.setState(Leader)
 		r.initLeaderState()
+		r.proposeLeaderNoopLocked()
 		// 初始化租约：新当选的 Leader 需要通过心跳确认后才能获得租约
 		// 这里将租约设为过去时间，强制第一次读操作时进行心跳确认
 		r.lastAck = make(map[int]time.Time)
@@ -357,6 +335,20 @@ func (r *Raft) transitionToLeader(electionTerm uint64) {
 		// 启动 proposal 批处理 goroutine
 		go r.proposalBatcher()
 	}
+}
+
+func (r *Raft) proposeLeaderNoopLocked() {
+	if r.store == nil {
+		log.Debugf("[Election] Leader %d skips election no-op because storage is unavailable", r.id)
+		return
+	}
+	if _, err := r.proposeToLog(param.NoopCommand{}); err != nil {
+		log.Errorf("[Election] Leader %d failed to append election no-op entry: %v", r.id, err)
+		return
+	}
+
+	// Single-node clusters have no follower ACKs to advance commitIndex.
+	r.updateCommitIndex()
 }
 
 // handleElectionTimeout 封装了选举超时后的状态转换逻辑。
@@ -494,12 +486,9 @@ func (r *Raft) isDuplicateRequest(clientID int64, sequenceNum int64) bool {
 // isLogUpToDate 检查候选人的日志是否至少和本节点一样新。
 // 这是 Raft 选举安全规则的核心实现。此函数必须在持有锁的情况下被调用。
 func (r *Raft) isLogUpToDate(candidateLastLogIndex, candidateLastLogTerm uint64) (bool, error) {
-	// 从存储中获取本节点的最后一条日志信息。
-	localLastLogIndex := r.cachedLastLogIndex
-
-	localLastLogTerm, err := r.getLogTermLocked(localLastLogIndex)
-	if err != nil { // 检查 err 是否为 nil
-		log.Errorf("[Election] Node %d failed to get last log entry from store: %v", r.id, err)
+	localLastLogIndex, localLastLogTerm, err := r.localLastLogInfoLocked()
+	if err != nil {
+		log.Errorf("[Election] Node %d failed to resolve local last log metadata: %v", r.id, err)
 		return false, err
 	}
 
@@ -510,6 +499,34 @@ func (r *Raft) isLogUpToDate(candidateLastLogIndex, candidateLastLogTerm uint64)
 	}
 
 	return false, nil
+}
+
+func (r *Raft) localLastLogInfoLocked() (uint64, uint64, error) {
+	lastLogIndex := r.cachedLastLogIndex
+	if lastLogIndex == 0 {
+		return 0, 0, nil
+	}
+
+	lastLogTerm, err := r.getLogTermLocked(lastLogIndex)
+	if err == nil {
+		return lastLogIndex, lastLogTerm, nil
+	}
+	if !errors.Is(err, errLogEntryNotFound) {
+		return 0, 0, err
+	}
+
+	log.Debugf("[Election] Node %d cached last log index %d is unavailable; refreshing from storage", r.id, lastLogIndex)
+	r.refreshCachedLastLogIndexLocked()
+	lastLogIndex = r.cachedLastLogIndex
+	if lastLogIndex == 0 {
+		return 0, 0, nil
+	}
+
+	lastLogTerm, err = r.getLogTermLocked(lastLogIndex)
+	if err != nil {
+		return 0, 0, err
+	}
+	return lastLogIndex, lastLogTerm, nil
 }
 
 // grantVote 记录为指定候选人投票的动作，并将其持久化。

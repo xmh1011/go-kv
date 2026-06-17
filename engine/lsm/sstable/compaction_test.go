@@ -3,6 +3,7 @@ package sstable
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"testing"
@@ -200,15 +201,10 @@ func TestCompactionEdgeCases(t *testing.T) {
 			expectedError: false,
 		},
 		{
-			name: "Invalid SSTable file",
+			name: "Corrupt existing SSTable file",
 			setup: func(mgr *Manager) {
 				for i := 0; i <= mgr.maxFileNumsInLevel(mgr.minSSTableLevel); i++ {
-					mgr.addTable(&SSTable{
-						id:       uint64(i + 1),
-						level:    mgr.minSSTableLevel,
-						Header:   block.NewHeader("a", "z"),
-						filePath: fmt.Sprintf("invalid%d.sst", i),
-					})
+					mgr.addTable(newCorruptSSTable(t, mgr, mgr.minSSTableLevel, uint64(i+1)))
 				}
 			},
 			expectedError: true,
@@ -240,6 +236,25 @@ func TestCompactionEdgeCases(t *testing.T) {
 			}
 		})
 	}
+}
+
+func newCorruptSSTable(t *testing.T, mgr *Manager, level int, id uint64) *SSTable {
+	t.Helper()
+
+	path := sstableFilePath(id, level, mgr.sstPath)
+	assert.NoError(t, os.MkdirAll(filepath.Dir(path), 0755))
+	// The file exists, but the data block declares an 8-byte value and only
+	// stores the 4-byte length prefix. This must remain a hard corruption
+	// error, unlike a missing stale metadata entry.
+	assert.NoError(t, os.WriteFile(path, []byte{8, 0, 0, 0}, 0644))
+
+	sst := NewSSTable()
+	sst.id = id
+	sst.level = level
+	sst.filePath = path
+	sst.Header = block.NewHeader("a", "z")
+	sst.Footer.DataHandle = block.NewHandle(0, 12)
+	return sst
 }
 
 func TestRecursiveCompactionAcrossLevels(t *testing.T) {

@@ -94,6 +94,29 @@ func TestDetermineReplicationAction(t *testing.T) {
 	}
 }
 
+func TestTriggerAppendEntriesCoalescesPerPeerReplication(t *testing.T) {
+	r := &Raft{
+		replicating:        make(map[int]bool),
+		replicationPending: make(map[int]bool),
+	}
+	r.setState(Leader)
+
+	r.mu.Lock()
+	first := r.triggerAppendEntriesLocked(2)
+	second := r.triggerAppendEntriesLocked(2)
+	pending := r.replicationPending[2]
+	r.mu.Unlock()
+
+	assert.True(t, first)
+	assert.False(t, second)
+	assert.True(t, pending)
+
+	r.setState(Follower)
+	r.finishAppendEntries(2)
+	assert.False(t, r.replicating[2])
+	assert.False(t, r.replicationPending[2])
+}
+
 func TestPrepareAppendEntriesArgs(t *testing.T) {
 	type state struct {
 		term        uint64
@@ -1115,21 +1138,16 @@ func TestReplicateLogsToPeer(t *testing.T) {
 
 				// Set cachedLastLogIndex for prepareAppendEntriesArgs
 				r.cachedLastLogIndex = 11
-				gomock.InOrder(
-					s.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 5, Index: 10}, nil).Times(1),
-					// prepareAppendEntriesArgs uses r.cachedLastLogIndex now
-					s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Command: "test", Term: 5, Index: 11}, nil).Times(1),
-					tr.EXPECT().SendAppendEntries(strconv.Itoa(peerID), gomock.Any(), gomock.Any()).
-						DoAndReturn(func(id string, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
-							reply.Term = 5
-							reply.Success = true
-							return nil
-						}).Times(1),
-				)
-
+				s.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 5, Index: 10}, nil).AnyTimes()
 				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11}, nil).AnyTimes()
 				s.EXPECT().FirstLogIndex().Return(uint64(1), nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
+				tr.EXPECT().SendAppendEntries(strconv.Itoa(peerID), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(id string, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
+						reply.Term = 5
+						reply.Success = true
+						return nil
+					}).AnyTimes()
 			},
 			verify: func(t *testing.T, r *Raft, commitChan chan param.CommitEntry) {
 				select {
@@ -1669,6 +1687,44 @@ func TestSuccessfulAppendEntriesDoesNotRequestNextBatchWhenPeerCaughtUp(t *testi
 	assert.Equal(t, uint64(41), r.matchIndex[2])
 }
 
+func TestSuccessfulAppendEntriesRequestsCommitNotificationWhenCommitAdvances(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+	entry := param.LogEntry{Index: 11, Term: 5, Command: param.NoopCommand{}}
+	mockStore.EXPECT().GetEntry(uint64(11)).Return(&entry, nil).AnyTimes()
+
+	r := &Raft{
+		id:                 1,
+		peerIDs:            []int{2, 3},
+		currentTerm:        5,
+		commitIndex:        10,
+		lastApplied:        10,
+		nextIndex:          map[int]uint64{2: 11},
+		matchIndex:         map[int]uint64{2: 10},
+		cachedLastLogIndex: 11,
+		store:              mockStore,
+		stateMachine:       mockSM,
+		notifyApply:        make(map[uint64][]chan any),
+	}
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+	r.setState(Leader)
+
+	args := &param.AppendEntriesArgs{
+		PrevLogIndex: 10,
+		Entries:      []param.LogEntry{entry},
+	}
+
+	shouldContinue := r.handleSuccessfulAppendEntries(2, args)
+
+	assert.True(t, shouldContinue)
+	assert.Equal(t, uint64(11), r.commitIndex)
+	assert.Equal(t, uint64(12), r.nextIndex[2])
+	assert.Equal(t, uint64(11), r.matchIndex[2])
+}
+
 func TestFailedAppendEntriesReplyDoesNotBacktrackBelowMatchIndex(t *testing.T) {
 	r := &Raft{
 		id:         1,
@@ -1725,6 +1781,26 @@ func TestDispatchEntries(t *testing.T) {
 
 		assert.True(t, r.inJointConsensus, "should enter joint consensus")
 		assert.Equal(t, cmd.NewPeerIDs, r.newPeerIDs)
+	})
+
+	t.Run("Apply noop command without state machine side effect", func(t *testing.T) {
+		notifyChan := make(chan any, 1)
+		r := &Raft{
+			stateMachine: mockSM,
+			notifyApply:  map[uint64][]chan any{12: []chan any{notifyChan}},
+			mu:           sync.Mutex{},
+		}
+		r.lastAppliedCond = sync.NewCond(&r.mu)
+
+		r.dispatchEntries([]param.LogEntry{{Command: param.NoopCommand{}, Index: 12, Term: 3}})
+
+		select {
+		case result := <-notifyChan:
+			assert.Nil(t, result)
+		case <-time.After(50 * time.Millisecond):
+			t.Fatal("timed out waiting for noop notification")
+		}
+		assert.Equal(t, uint64(12), r.lastApplied)
 	})
 }
 

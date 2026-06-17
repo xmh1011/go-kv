@@ -44,6 +44,33 @@ func TestGetLastLogInfoForElectionRefreshesStaleCachedIndex(t *testing.T) {
 	assert.Equal(t, uint64(5), r.cachedLastLogIndex)
 }
 
+func TestIsLogUpToDateRefreshesStaleCachedIndex(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	snapshot := param.NewSnapshot(5, 2, []byte("snapshot"))
+
+	gomock.InOrder(
+		mockStore.EXPECT().GetEntry(uint64(10)).Return(nil, nil),
+		mockStore.EXPECT().ReadSnapshot().Return(snapshot, nil),
+		mockStore.EXPECT().LastLogIndex().Return(uint64(5), nil),
+	)
+
+	r := &Raft{
+		id:                 2,
+		store:              mockStore,
+		snapshot:           snapshot,
+		cachedLastLogIndex: 10,
+	}
+
+	upToDate, err := r.isLogUpToDate(5, 2)
+
+	assert.NoError(t, err)
+	assert.True(t, upToDate)
+	assert.Equal(t, uint64(5), r.cachedLastLogIndex)
+}
+
 func TestStartElection(t *testing.T) {
 	type state struct {
 		term               uint64
@@ -99,6 +126,7 @@ func TestStartElection(t *testing.T) {
 					}).AnyTimes()
 
 				// Mock for Heartbeat
+				s.EXPECT().AppendEntries(gomock.Any()).Return(nil).AnyTimes()
 				s.EXPECT().FirstLogIndex().Return(uint64(1), nil).AnyTimes()
 				s.EXPECT().GetEntry(gomock.Any()).Return(&param.LogEntry{Term: 5}, nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()

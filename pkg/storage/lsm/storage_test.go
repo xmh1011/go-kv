@@ -139,23 +139,43 @@ func TestStorageAdapter_LogEntries(t *testing.T) {
 }
 
 func TestStorageAdapter_LogEntryEncodingUsesBinaryCommands(t *testing.T) {
-	entry := param.LogEntry{
-		Term:  7,
-		Index: 42,
-		Command: param.NewClientCommand(
-			99,
-			12,
-			[]byte(`{"op":2,"key":"k","value":"v"}`),
-		),
+	tests := []struct {
+		name  string
+		entry param.LogEntry
+	}{
+		{
+			name: "client command",
+			entry: param.LogEntry{
+				Term:  7,
+				Index: 42,
+				Command: param.NewClientCommand(
+					99,
+					12,
+					[]byte(`{"op":2,"key":"k","value":"v"}`),
+				),
+			},
+		},
+		{
+			name: "raft noop command",
+			entry: param.LogEntry{
+				Term:    8,
+				Index:   43,
+				Command: param.NoopCommand{},
+			},
+		},
 	}
 
-	encoded, err := encodeLogEntry(&entry)
-	assert.NoError(t, err)
-	assert.True(t, bytes.HasPrefix(encoded, []byte(logEntryFormatMagic)))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded, err := encodeLogEntry(&tt.entry)
+			assert.NoError(t, err)
+			assert.True(t, bytes.HasPrefix(encoded, []byte(logEntryFormatMagic)))
 
-	decoded, err := decodeLogEntry(encoded)
-	assert.NoError(t, err)
-	assert.Equal(t, entry, *decoded)
+			decoded, err := decodeLogEntry(encoded)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.entry, *decoded)
+		})
+	}
 }
 
 func TestStorageAdapter_Snapshot(t *testing.T) {

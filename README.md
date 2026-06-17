@@ -29,7 +29,9 @@ Start with the high-level design document if you are new to the codebase.
 | Overall system design | [docs/DESIGN.md](docs/DESIGN.md) | [docs/DESIGN.zh-CN.md](docs/DESIGN.zh-CN.md) |
 | Raft design | [docs/RAFT.md](docs/RAFT.md) | [docs/RAFT.zh-CN.md](docs/RAFT.zh-CN.md) |
 | LSM-tree design | [docs/LSM.md](docs/LSM.md) | [docs/LSM.zh-CN.md](docs/LSM.zh-CN.md) |
-| Performance report | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | currently maintained in Chinese |
+| Usage guide | [docs/USAGE.md](docs/USAGE.md) | [docs/USAGE.zh-CN.md](docs/USAGE.zh-CN.md) |
+| Performance report | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | [docs/PERFORMANCE.zh-CN.md](docs/PERFORMANCE.zh-CN.md) |
+| Bug fix retrospective | [docs/BUG_FIX_RETROSPECTIVE.md](docs/BUG_FIX_RETROSPECTIVE.md) | [docs/BUG_FIX_RETROSPECTIVE.zh-CN.md](docs/BUG_FIX_RETROSPECTIVE.zh-CN.md) |
 
 ## Architecture At A Glance
 
@@ -272,7 +274,9 @@ If you are new to the project, read the docs in this order:
 1. [Overall system design](docs/DESIGN.md)
 2. [Raft design](docs/RAFT.md)
 3. [LSM-tree design](docs/LSM.md)
-4. [Performance report](docs/PERFORMANCE.md)
-5. The tests in `tests/integration_test.go` and `tests/long_running_e2e_test.go`
+4. [Usage guide](docs/USAGE.md)
+5. [Performance report](docs/PERFORMANCE.md)
+6. [Bug fix retrospective](docs/BUG_FIX_RETROSPECTIVE.md)
+7. The tests in `tests/integration_test.go` and `tests/long_running_e2e_test.go`
 
 The tests are often the easiest way to understand how the modules work together.

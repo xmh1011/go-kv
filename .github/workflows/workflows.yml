@@ -12,8 +12,10 @@ jobs:
     name: Run tests and collect coverage
     runs-on: ubuntu-latest
     permissions:
-      contents: read # 允许 checkout 代码
-      pull-requests: write # 允许在 PR 中发表评论
+      contents: read
+      checks: write
+      statuses: write
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,16 +40,6 @@ jobs:
           files: ./coverage.txt
           flags: unittests
           name: go-kv-unit
-          fail_ci_if_error: true
-          verbose: true
-          override_commit: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          override_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
-
-      - name: Send Codecov notifications
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          run_command: send-notifications
           fail_ci_if_error: true
           verbose: true
           override_commit: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
