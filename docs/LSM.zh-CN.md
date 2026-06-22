@@ -161,10 +161,22 @@ WAL 是某个 memtable 的追加式文件。每次 mutation 在插入跳表前�
 
 恢复流程：
 
-1. 按 ID 顺序读取 WAL 文件。
-2. 较旧 WAL 文件恢复成 immutable memtable。
-3. 最新 WAL 文件恢复成活跃 memtable。
-4. Tombstone 像普通记录一样重放。
+1. 只选择命名为 `{id}.wal` 的已提交 WAL 文件。目录、`3.wal.tmp` 这类临时
+   文件和无关文件会被忽略。
+2. 对选中的 WAL 文件按 ID 顺序读取。
+3. 较旧 WAL 文件恢复成 immutable memtable。
+4. 最新 WAL 文件恢复成活跃 memtable。
+5. Tombstone 像普通记录一样重放。
+
+如果某个文件符合已提交 WAL 契约、但内容损坏，恢复仍然必须失败。忽略非 WAL
+目录项只是文件系统卫生规则，不是对损坏已提交数据的兜底。
+
+```go
+files = filterWALFiles(files)
+sort.Slice(files, func(i, j int) bool {
+    return utils.ExtractID(files[i].Name()) < utils.ExtractID(files[j].Name())
+})
+```
 
 WAL 保护尚未 flush 到 SSTable 的最近写入。
 
@@ -400,7 +412,10 @@ immutable memtable
 BuildSSTableFromIMemTable
         |
         v
-EncodeTo(file)
+EncodeTo(同目录临时文件)
+        |
+        v
+fsync + close + rename 成最终 .sst
         |
         v
 addTable(sst) 在 Manager.mu 下发布元数据
@@ -412,6 +427,17 @@ imem.Clean() 成功后才删除旧 WAL
 因此，正在 flush 的 immutable memtable 必须保持可搜索，直到 SSTable 编码并发布成功。如果在 `addTable` 前就让它不可见，读请求可能漏掉已经离开活跃 memtable、但还没进入 SSTable 元数据的 key。
 
 恢复也有顺序要求。Level 0 文件范围可能重叠，必须先查最新文件。`Recover` 先按 ID 升序遍历文件，再调用会插入队首的 `addTable`，这样恢复后的 Level 0 仍然是从新到旧。
+
+SSTable recovery 也遵守已提交文件契约：
+
+- 只加载最终 `.sst` 文件，且文件名 ID 必须可解析；
+- 忽略未提交的临时文件；
+- 移除没有 data/index payload 的旧空 SSTable；
+- 非空但损坏的 `.sst` 仍然是硬错误。
+
+空 SSTable 不能简单把 size `0` 传给通用 `DataBlock.DecodeFrom`，因为那个底层
+API 把 size `0` 理解为“不限制读取”。SSTable 层才拥有文件格式语义：
+`Footer.DataHandle.Size == 0` 表示没有 data block 可读。
 
 ## 18. LSM 中的 Raft 日志 keyspace
 
@@ -463,6 +489,8 @@ firstIndex <= 可见日志索引 <= lastIndex
 | Raft truncate/reappend | 同一 index 上旧日志 payload 和新日志 payload 混用。 | 重写已有 log key 时先扣除旧大小，再写新值。 |
 | Raft compaction | apply loop 读取已被压缩的 committed entry。 | Raft 必须通过覆盖该 index 的 snapshot 跳过；没有覆盖 snapshot 时才应明显失败。 |
 | Compaction 目录清理 | 元数据引用已经删除的文件。 | 缺失文件可以剪掉元数据，但存在且损坏的文件仍然是硬错误。 |
+| WAL recovery 卫生 | 已提交 WAL 旁边残留临时文件或说明文件。 | 只重放 `{id}.wal`；忽略非 WAL 条目，损坏的已提交 WAL 必须失败。 |
+| SSTable 发布 | recovery 看到半写入表。 | 先写临时文件，fsync、close、rename 后再发布 metadata。 |
 
 这些防线在 review 中必须被当作正确性要求，而不是性能细节。
 
@@ -471,10 +499,12 @@ firstIndex <= 可见日志索引 <= lastIndex
 修改 LSM 代码时必须保持：
 
 - WAL append 发生在活跃 memtable 修改之前。
+- WAL recovery 只重放已提交的 `{id}.wal` 文件。
 - 正在 flush 的 immutable memtable 保持可搜索，直到 flush 成功。
 - Level 0 查询顺序是从新到旧。
 - Tombstone 必须遮蔽旧值，直到可以安全丢弃。
 - SSTable decode 在填充可复用结构前必须 reset。
+- SSTable 发布基于临时文件；只有最终 `.sst` 存在后才发布 metadata。
 - Compaction 元数据更新受 manager lock 保护。
 - 只有确认物理 SSTable 文件不存在时，才能剪掉 missing-file 元数据；存在但损坏的文件仍然必须报错。
 - Raft 日志读取必须遵守逻辑 `[firstIndex, lastIndex]` 窗口。

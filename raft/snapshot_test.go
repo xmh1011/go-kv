@@ -285,6 +285,28 @@ func TestTakeSnapshotReturnsWhileSnapshotAlreadyInProgress(t *testing.T) {
 	r.stateMachineMu.Unlock()
 }
 
+func TestInstallSnapshotRejectsWhenStopped(t *testing.T) {
+	r := &Raft{
+		id:          1,
+		currentTerm: 2,
+	}
+	r.setState(Dead)
+
+	reply := &param.InstallSnapshotReply{}
+	err := r.InstallSnapshot(&param.InstallSnapshotArgs{
+		Term:              3,
+		LeaderID:          2,
+		LastIncludedIndex: 10,
+		LastIncludedTerm:  3,
+		Data:              []byte("snapshot"),
+	}, reply)
+
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(2), reply.Term)
+	assert.Equal(t, Dead, r.getState())
+	assert.Equal(t, uint64(2), r.currentTerm)
+}
+
 func TestInstallSnapshot(t *testing.T) {
 	type state struct {
 		term        uint64

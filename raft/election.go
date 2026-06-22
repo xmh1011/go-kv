@@ -114,6 +114,12 @@ func (r *Raft) RequestVote(args *param.RequestVoteArgs, reply *param.RequestVote
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.getState() == Dead {
+		reply.Term = r.currentTerm
+		reply.VoteGranted = false
+		return nil
+	}
+
 	// --- Pre-Vote 特殊处理 ---
 	if args.PreVote {
 		return r.handlePreVote(args, reply)
@@ -194,7 +200,7 @@ func (r *Raft) initializeCandidateState() error {
 	// 这是至关重要的一步：必须在发送投票请求（RPC）之前将新状态写入稳定存储。
 	// 这样可以确保即使节点在发送请求后立即崩溃，重启后也不会忘记自己已经进入了新的任期并投了票，
 	// 从而避免在同一个任期内投票给其他候选人，防止脑裂。
-	if err := r.store.SetState(param.HardState{CurrentTerm: r.currentTerm, VotedFor: uint64(r.votedFor)}); err != nil {
+	if err := r.persistHardStateLocked(); err != nil {
 		log.Errorf("[Election] Node %d failed to persist state before election: %v", r.id, err)
 		return err
 	}
@@ -536,7 +542,7 @@ func (r *Raft) grantVote(candidateID int) error {
 	r.votedFor = candidateID
 	r.electionResetEvent = time.Now()
 
-	if err := r.store.SetState(param.HardState{CurrentTerm: r.currentTerm, VotedFor: uint64(r.votedFor)}); err != nil {
+	if err := r.persistHardStateLocked(); err != nil {
 		log.Errorf("[Election] Node %d failed to persist vote: %v", r.id, err)
 		return err
 	}

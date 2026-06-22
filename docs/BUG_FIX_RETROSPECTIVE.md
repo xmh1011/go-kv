@@ -312,3 +312,162 @@ The full long-running result is documented in [PERFORMANCE.md](PERFORMANCE.md).
 - Tests should wait for state, not time.
 - After any Raft or LSM code change, run the triggering long E2E scenario first,
   then run the full long E2E regression.
+
+## 14. 2026-06-22 Core Recovery And Apply Fixes
+
+The second deep-testing pass focused on failures that only appear when Raft
+restart, snapshot compaction, LSM flush, and LSM recovery overlap. These issues
+are newer than the original #88-#95 campaign and are tracked separately:
+
+- #102 Prevent lossy Raft commit notifications.
+- #103 Align performance harness commit channel consumers.
+- #104 Publish LSM SSTables atomically and handle empty-table metadata.
+- #105 Keep LSM table and WAL IDs local to each database.
+- #106 Restore LSM node state after TCP restart by restoring durable
+  `commitIndex`.
+- #107 Ignore non-WAL directory entries during MemTable recovery.
+
+### #102: Commit Notifications Are Part Of The Apply Boundary
+
+Symptom: under load, `commitChan` could become full. The old code used a
+non-blocking send and silently dropped the notification:
+
+```go
+select {
+case commitChan <- entry:
+default:
+    log.Warnf("commitChan full, skipping")
+}
+```
+
+That made observers believe an entry had not been applied even though Raft had
+already applied it to the state machine. The fix treats `commitChan` as a
+backpressured stream:
+
+```go
+select {
+case commitChan <- commitEntry:
+case <-shutdownChan:
+}
+```
+
+The shutdown escape prevents `Stop()` from hanging forever, while normal running
+nodes no longer lose apply notifications.
+
+### #103: The Benchmark Harness Must Not Apply Twice
+
+`commitChan` is emitted after Raft applies the command. Some performance tests
+were consuming `commitChan` and applying the command again. That inflated writes
+and could hide real state-machine bugs.
+
+The corrected harness only drains the channel:
+
+```go
+go func(ch chan param.CommitEntry) {
+    for range ch {
+        // already applied by Raft
+    }
+}(commitChan)
+```
+
+This keeps benchmarks from creating a second, non-Raft apply path.
+
+### #104: SSTable Publication Has Two Separate Failure Modes
+
+The first hypothesis for #104 was a partially written final file. Long E2E
+later exposed a more precise failure: a retained `.sst` file had footer handles
+with `DataHandle.Size == 0` and `IndexHandle.Size == 0`. The generic
+`DataBlock.DecodeFrom(reader, 0)` API treats size `0` as "unlimited", so the
+SSTable layer accidentally tried to decode footer bytes as values and hit EOF.
+
+The final fix has three parts:
+
+```go
+tmp, _ := os.CreateTemp(dir, "."+base+".*.tmp")
+// encode header/filter/data/index/footer into tmp
+tmp.Sync()
+tmp.Close()
+os.Rename(tmp.Name(), finalPath)
+```
+
+- publish SSTables by temp-file, fsync, close, and rename;
+- skip empty immutable memtables instead of publishing empty Level-0 tables;
+- make `DecodeDataBlock` return immediately when `Footer.DataHandle.Size == 0`.
+
+Recovery now also ignores uncommitted temp files and removes legacy empty
+SSTables instead of loading them into the catalog.
+
+### #105: ID Generators Must Be Scoped To A Database Manager
+
+The old recovery path reset package-level ID generators. Recovering one manager
+could move the global generator backward while another manager was still live.
+That made a live database reuse an SSTable or WAL ID and potentially overwrite
+existing files.
+
+The fix moves ID allocation into the manager:
+
+```go
+type Manager struct {
+    nextID atomic.Uint64
+}
+
+func (m *Manager) nextTableID() uint64 {
+    return m.nextID.Add(1)
+}
+```
+
+Recovery advances the local counter to at least the highest recovered ID. It no
+longer resets global state that other databases share.
+
+### #106: Durable Commit Index Is An Implementation Guardrail
+
+Raft's paper-level persistent state is term, vote, and log entries. In this
+project the state machine is persistent too, so forgetting a durable commit
+index after restart can leave committed entries unapplied until another leader
+happens to resend commit information.
+
+The fix stores `CommitIndex` in `HardState` and restores it in `NewRaft`:
+
+```go
+r.commitIndex = hardState.CommitIndex
+if r.commitIndex > r.lastApplied {
+    r.startApplyLogsLocked()
+}
+```
+
+This does not change the quorum commit rule. It preserves restart progress for
+entries that were already durable and committed.
+
+### #107: WAL Recovery Needs A Committed-File Contract
+
+MemTable recovery used to replay every directory entry returned by `os.ReadDir`.
+A leftover `notes.txt`, `3.wal.tmp`, or directory named `4.wal` could make the
+engine fail before it replayed valid WAL files.
+
+The fix filters the recovery set:
+
+```go
+if file.IsDir() || filepath.Ext(file.Name()) != ".wal" {
+    continue
+}
+idPart := strings.TrimSuffix(file.Name(), ".wal")
+if _, err := strconv.ParseUint(idPart, 10, 64); err != nil {
+    continue
+}
+```
+
+Only `{id}.wal` files are replayed. A committed WAL with corrupt contents still
+fails recovery, so the engine remains strict about real data corruption.
+
+### Validation Signal
+
+After these fixes, the focused 10-minute restart/snapshot scenario passed with:
+
+- 797,556 total operations;
+- 0 failed operations;
+- final cluster barrier success;
+- 3,600 node/key consistency checks passed;
+- 3 snapshotting nodes and 46 leader changes.
+
+The full package and long-E2E validation commands are recorded in
+[PERFORMANCE.md](PERFORMANCE.md).

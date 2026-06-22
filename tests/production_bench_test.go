@@ -68,18 +68,12 @@ func newProductionCluster(t *testing.T, nodeCount int) *productionCluster {
 		c.stateMachines[i] = sm
 		c.commitChans[i] = make(chan param.CommitEntry, 10000) // 更大的缓冲区应对生产负载
 
-		// 启动后台协程消费 commitChan
-		go func(ch chan param.CommitEntry, sm storage.StateMachine) {
-			for entry := range ch {
-				// 将 CommitEntry 转换为 LogEntry 传递给状态机
-				logEntry := param.LogEntry{
-					Command: entry.Command,
-					Term:    entry.Term,
-					Index:   entry.Index,
-				}
-				_ = sm.Apply(logEntry)
+		// 启动后台协程消费 commitChan。Raft 在发送提交通知前已经应用
+		// 状态机；benchmark 只需要 drain，不能再次 Apply。
+		go func(ch chan param.CommitEntry) {
+			for range ch {
 			}
-		}(c.commitChans[i], c.stateMachines[i])
+		}(c.commitChans[i])
 
 		// 配置 Transport
 		c.transports[i].SetPeers(c.peerMap)

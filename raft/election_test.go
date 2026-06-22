@@ -44,6 +44,29 @@ func TestGetLastLogInfoForElectionRefreshesStaleCachedIndex(t *testing.T) {
 	assert.Equal(t, uint64(5), r.cachedLastLogIndex)
 }
 
+func TestRequestVoteRejectsWhenStopped(t *testing.T) {
+	r := &Raft{
+		id:          1,
+		currentTerm: 2,
+		votedFor:    -1,
+	}
+	r.setState(Dead)
+
+	reply := param.NewRequestVoteReply()
+	err := r.RequestVote(&param.RequestVoteArgs{
+		Term:         3,
+		CandidateID:  2,
+		LastLogIndex: 10,
+		LastLogTerm:  3,
+	}, reply)
+
+	assert.NoError(t, err)
+	assert.False(t, reply.VoteGranted)
+	assert.Equal(t, uint64(2), reply.Term)
+	assert.Equal(t, Dead, r.getState())
+	assert.Equal(t, uint64(2), r.currentTerm)
+}
+
 func TestIsLogUpToDateRefreshesStaleCachedIndex(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()

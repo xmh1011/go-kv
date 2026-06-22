@@ -361,6 +361,7 @@ func TestUpdateCommitIndex(t *testing.T) {
 				// findMajorityCommitIndex now uses r.cachedLastLogIndex (set in struct)
 				s.EXPECT().GetEntry(uint64(12)).Return(&param.LogEntry{Term: 5, Index: 12}, nil).AnyTimes()
 				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11}, nil).AnyTimes()
+				s.EXPECT().SetState(param.HardState{CurrentTerm: 5, VotedFor: 0, CommitIndex: 12}).Return(nil)
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
 			},
 			expectedIndex: 12,
@@ -438,6 +439,7 @@ func TestUpdateCommitIndexRewindsLocalGapCandidate(t *testing.T) {
 	mockStore.EXPECT().LastLogIndex().Return(uint64(13), nil).Times(1)
 	mockStore.EXPECT().GetEntry(uint64(13)).Return(&param.LogEntry{Term: 5, Index: 13}, nil).Times(1)
 	mockStore.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11, Command: "cmd11"}, nil).AnyTimes()
+	mockStore.EXPECT().SetState(param.HardState{CurrentTerm: 5, VotedFor: 0, CommitIndex: 11}).Return(nil)
 	mockSM.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
 
 	r := &Raft{
@@ -866,6 +868,7 @@ func TestProcessBatchCommitsSingleNodeEntry(t *testing.T) {
 
 	mockStore.EXPECT().AppendEntries(gomock.Any()).Return(nil).Times(1)
 	mockStore.EXPECT().GetEntry(uint64(1)).Return(&entry, nil).Times(2)
+	mockStore.EXPECT().SetState(gomock.Any()).Return(nil).AnyTimes()
 	mockSM.EXPECT().
 		Apply(entry).
 		DoAndReturn(func(param.LogEntry) any {
@@ -936,6 +939,7 @@ func TestProcessBatchDeduplicatesPendingClientRequest(t *testing.T) {
 	mockStore.EXPECT().GetEntry(uint64(1)).DoAndReturn(func(uint64) (*param.LogEntry, error) {
 		return &storedEntry, nil
 	}).Times(2)
+	mockStore.EXPECT().SetState(gomock.Any()).Return(nil).AnyTimes()
 	mockSM.EXPECT().Apply(gomock.Any()).Return("ok").Times(1)
 
 	r := &Raft{
@@ -1141,6 +1145,7 @@ func TestReplicateLogsToPeer(t *testing.T) {
 				s.EXPECT().GetEntry(uint64(10)).Return(&param.LogEntry{Term: 5, Index: 10}, nil).AnyTimes()
 				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Term: 5, Index: 11}, nil).AnyTimes()
 				s.EXPECT().FirstLogIndex().Return(uint64(1), nil).AnyTimes()
+				s.EXPECT().SetState(gomock.Any()).Return(nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
 				tr.EXPECT().SendAppendEntries(strconv.Itoa(peerID), gomock.Any(), gomock.Any()).
 					DoAndReturn(func(id string, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
@@ -1177,6 +1182,7 @@ func TestReplicateLogsToPeer(t *testing.T) {
 						return &param.LogEntry{Term: 5, Index: index}, nil
 					}).AnyTimes()
 				s.EXPECT().FirstLogIndex().Return(uint64(1), nil).AnyTimes()
+				s.EXPECT().SetState(gomock.Any()).Return(nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
 
 				gomock.InOrder(
@@ -1291,6 +1297,7 @@ func TestAppendEntries(t *testing.T) {
 				)
 				// fetchEntriesToApply 读取条目以应用
 				s.EXPECT().GetEntry(uint64(11)).Return(&param.LogEntry{Command: "cmd1", Term: 5, Index: 11}, nil).AnyTimes()
+				s.EXPECT().SetState(gomock.Any()).Return(nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return("success").AnyTimes()
 			},
 			verify: func(t *testing.T, r *Raft, reply *param.AppendEntriesReply, commitChan chan param.CommitEntry) {
@@ -1547,6 +1554,7 @@ func TestProcessAppendEntriesReply(t *testing.T) {
 				s.EXPECT().LastLogIndex().Return(uint64(10), nil).Times(1)
 				s.EXPECT().ReadSnapshot().Return(nil, nil).AnyTimes()
 				s.EXPECT().GetEntry(gomock.Any()).Return(&param.LogEntry{Term: 5}, nil).AnyTimes()
+				s.EXPECT().SetState(gomock.Any()).Return(nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
 			},
 			verify: func(t *testing.T, r *Raft, pastTime time.Time) {
@@ -1695,6 +1703,7 @@ func TestSuccessfulAppendEntriesRequestsCommitNotificationWhenCommitAdvances(t *
 	mockSM := storage.NewMockStateMachine(ctrl)
 	entry := param.LogEntry{Index: 11, Term: 5, Command: param.NoopCommand{}}
 	mockStore.EXPECT().GetEntry(uint64(11)).Return(&entry, nil).AnyTimes()
+	mockStore.EXPECT().SetState(gomock.Any()).Return(nil).AnyTimes()
 
 	r := &Raft{
 		id:                 1,
@@ -1802,6 +1811,87 @@ func TestDispatchEntries(t *testing.T) {
 		}
 		assert.Equal(t, uint64(12), r.lastApplied)
 	})
+}
+
+func TestDispatchEntriesDoesNotDropCommitNotificationsWhenChannelIsFull(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	commitChan := make(chan param.CommitEntry, 1)
+	commitChan <- param.CommitEntry{Index: 99}
+	r := &Raft{
+		id:           1,
+		stateMachine: mockSM,
+		mu:           sync.Mutex{},
+		commitChan:   commitChan,
+		shutdownChan: make(chan struct{}),
+	}
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	entry := param.LogEntry{Command: "committed", Index: 1, Term: 1}
+	mockSM.EXPECT().Apply(entry).Return(nil)
+
+	done := make(chan struct{})
+	go func() {
+		r.dispatchEntries([]param.LogEntry{entry})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("dispatch returned while commit channel was full")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	assert.Equal(t, uint64(99), (<-r.commitChan).Index)
+
+	var delivered param.CommitEntry
+	select {
+	case delivered = <-r.commitChan:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out waiting for commit notification after draining channel")
+	}
+	assert.Equal(t, uint64(1), delivered.Index)
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("dispatch did not finish after commit channel was drained")
+	}
+	assert.Equal(t, uint64(1), r.lastApplied)
+}
+
+func TestApplyStateMachineCommandUnblocksOnShutdown(t *testing.T) {
+	commitChan := make(chan param.CommitEntry, 1)
+	commitChan <- param.CommitEntry{Index: 99}
+	shutdownChan := make(chan struct{})
+	r := &Raft{
+		id:           1,
+		mu:           sync.Mutex{},
+		commitChan:   commitChan,
+		shutdownChan: shutdownChan,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		r.applyStateMachineCommand(param.LogEntry{Command: "blocked", Index: 1, Term: 1})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("commit notification send returned while channel was full and node was running")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(shutdownChan)
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("commit notification send did not unblock after shutdown")
+	}
 }
 
 func TestDispatchEntriesSkipsDuplicateClientCommand(t *testing.T) {

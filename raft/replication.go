@@ -391,7 +391,13 @@ func (r *Raft) updateCommitIndex() bool {
 
 		if term == r.currentTerm {
 			log.Debugf("[Log Replication] Node %d advances commitIndex to %d (term=%d)", r.id, newCommitIndex, r.currentTerm)
+			oldCommitIndex := r.commitIndex
 			r.commitIndex = newCommitIndex
+			if err := r.persistHardStateLocked(); err != nil {
+				r.commitIndex = oldCommitIndex
+				log.Errorf("[Replication] Node %d failed to persist commit index %d: %v", r.id, newCommitIndex, err)
+				return false
+			}
 			r.startApplyLogsLocked()
 			return true
 		}
@@ -592,6 +598,12 @@ func (r *Raft) AppendEntries(args *param.AppendEntriesArgs, reply *param.AppendE
 	}
 
 	// 验证任期未在 Phase 2 期间变化
+	if r.getState() == Dead {
+		reply.Term = r.currentTerm
+		reply.Success = false
+		r.mu.Unlock()
+		return nil
+	}
 	if r.currentTerm != savedTerm {
 		// 日志已经按当时合法的 AppendEntries 写入本地，但不能让旧任期
 		// Leader 把这个响应当作当前任期的复制确认。
@@ -819,6 +831,9 @@ func (r *Raft) updateFollowerCommitIndex(args *param.AppendEntriesArgs) {
 
 		if r.commitIndex > oldCommitIndex {
 			log.Debugf("[Log Replication] Node %d advances commitIndex to %d", r.id, r.commitIndex)
+			if err := r.persistHardStateLocked(); err != nil {
+				log.Errorf("[Replication] Node %d failed to persist follower commit index %d: %v", r.id, r.commitIndex, err)
+			}
 			r.startApplyLogsLocked()
 		}
 	}
@@ -1106,23 +1121,27 @@ func (r *Raft) applyStateMachineCommand(entry param.LogEntry) {
 	// 快速检查 channel 是否可用，不持有锁
 	r.mu.Lock()
 	commitChan := r.commitChan
+	shutdownChan := r.shutdownChan
 	r.mu.Unlock()
 
 	if commitChan == nil {
 		return
 	}
 
-	// 使用非阻塞发送防止死锁
-	select {
-	case commitChan <- param.CommitEntry{
+	commitEntry := param.CommitEntry{
 		Command: entry.Command,
 		Index:   entry.Index,
 		Term:    entry.Term,
-	}:
-		// 成功发送
-	default:
-		// 通道已满，跳过发送（防止阻塞）
-		log.Warnf("[Replication] Node %d commitChan full, skipping entry %d", r.id, entry.Index)
+	}
+
+	// CommitChan is the public stream of applied normal commands. Do not drop
+	// entries when the caller's channel is full; callers are expected to drain
+	// it. Stop closes shutdownChan so an apply goroutine blocked on a slow
+	// consumer can still exit during shutdown.
+	select {
+	case commitChan <- commitEntry:
+	case <-shutdownChan:
+		log.Debugf("[Replication] Node %d stopped while waiting to send commit entry %d", r.id, entry.Index)
 	}
 }
 

@@ -83,9 +83,14 @@ Persistent state must survive crashes:
 - log entries;
 - snapshots.
 
+The Raft paper treats `commitIndex` as volatile state. This implementation also
+stores it in `param.HardState` for recovery robustness with persistent LSM
+state machines. On restart, Raft restores the durable commit index and schedules
+apply for any committed log entry that has not yet reached `lastApplied`.
+
 Volatile state is rebuilt while running:
 
-- `commitIndex`: highest known committed log index;
+- `commitIndex`: highest known committed log index while the node is running;
 - `lastApplied`: highest log index applied to the state machine;
 - `nextIndex[peer]`: next log index the leader will send to a follower;
 - `matchIndex[peer]`: highest log index known to be stored on a follower;
@@ -273,7 +278,22 @@ the entry belongs to the leader's current term.
 The current-term restriction is a Raft safety rule. It prevents a leader from
 incorrectly committing old-term entries by counting replication alone.
 
-After `commitIndex` advances, Raft wakes the apply loop.
+After `commitIndex` advances, Raft persists the updated HardState and wakes the
+apply loop:
+
+```go
+oldCommitIndex := r.commitIndex
+r.commitIndex = newCommitIndex
+if err := r.persistHardStateLocked(); err != nil {
+    r.commitIndex = oldCommitIndex
+    return false
+}
+r.startApplyLogsLocked()
+```
+
+Persisting the commit index is an implementation guardrail. It does not change
+the quorum commit rule; it only makes restart recovery apply durable committed
+entries instead of forgetting that they were committed.
 
 ## 12. Apply Loop
 
@@ -601,7 +621,10 @@ Raft is a concurrent system. The main rules are:
 - `stateMachineMu` serializes state-machine apply, snapshot export, and snapshot
   install.
 - `lastAppliedCond` wakes read requests waiting for apply progress.
-- `snapshotWG` and apply waiters are drained during shutdown.
+- `snapshotWG`, `applyWG`, and apply waiters are drained during shutdown.
+- `Stop()` also waits for in-flight sections guarded by `stateMachineMu` and
+  `appendEntriesMu`, because RPC handlers may release `r.mu` while doing slower
+  storage or state-machine I/O.
 
 When modifying code, prefer preserving these lock-order expectations rather than
 adding ad-hoc locks around individual symptoms.

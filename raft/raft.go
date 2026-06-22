@@ -193,6 +193,7 @@ func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.
 		}
 		r.currentTerm = hardState.CurrentTerm
 		r.votedFor = int(hardState.VotedFor)
+		r.commitIndex = hardState.CommitIndex
 
 		// 初始化缓存的 lastLogIndex
 		lastIdx, err := store.LastLogIndex()
@@ -209,6 +210,11 @@ func NewRaft(id int, peerIDs []int, store storage.Storage, stateMachine storage.
 	r.electionResetEvent = time.Now()
 	r.currentElectionTimeout = r.randomizedElectionTimeout()
 	r.lastAppliedCond = sync.NewCond(&r.mu)
+	if r.commitIndex > r.lastApplied {
+		r.mu.Lock()
+		r.startApplyLogsLocked()
+		r.mu.Unlock()
+	}
 
 	return r
 }
@@ -364,6 +370,14 @@ func (r *Raft) Stop() {
 
 	r.applyWG.Wait()
 	r.snapshotWG.Wait()
+
+	// Stop may race with RPC handlers that intentionally release r.mu while
+	// doing storage or state-machine I/O. Wait for those critical sections
+	// before callers close or reopen the underlying storage directory.
+	r.stateMachineMu.Lock()
+	r.stateMachineMu.Unlock()
+	r.appendEntriesMu.Lock()
+	r.appendEntriesMu.Unlock()
 }
 
 // randomizedElectionTimeout 返回一个在 [electionTimeout, 2 * electionTimeout) 范围内的随机超时时间。
@@ -1309,11 +1323,22 @@ func (r *Raft) becomeFollower(newTerm uint64) error {
 	r.lastLeadershipConfirm = time.Time{}
 	r.leaseUntil = time.Time{}
 
-	if err := r.store.SetState(param.HardState{CurrentTerm: r.currentTerm, VotedFor: uint64(r.votedFor)}); err != nil {
+	if err := r.persistHardStateLocked(); err != nil {
 		log.Errorf("[Raft] Node %d failed to persist state after becoming follower: %v", r.id, err)
 		return err
 	}
 	return nil
+}
+
+func (r *Raft) persistHardStateLocked() error {
+	if r.store == nil {
+		return nil
+	}
+	return r.store.SetState(param.HardState{
+		CurrentTerm: r.currentTerm,
+		VotedFor:    uint64(r.votedFor),
+		CommitIndex: r.commitIndex,
+	})
 }
 
 func (r *Raft) abortPendingApplyWaitersLocked() {

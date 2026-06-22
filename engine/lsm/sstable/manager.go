@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/xmh1011/go-kv/engine/lsm/kv"
 	"github.com/xmh1011/go-kv/engine/lsm/memtable"
@@ -39,6 +40,7 @@ type Manager struct {
 	compactionCond   *sync.Cond
 	compactingLevels map[int]bool // 记录各层级的压缩状态
 	compactionWG     sync.WaitGroup
+	nextID           atomic.Uint64
 
 	minSSTableLevel int
 	maxSSTableLevel int
@@ -114,7 +116,12 @@ func (m *Manager) OpenFilesSnapshot() ([]SnapshotFile, error) {
 
 // CreateNewSSTable 将 imem 数据构建为 SSTable，写入到磁盘，然后将其元数据添加到内存中。
 func (m *Manager) CreateNewSSTable(imem *memtable.IMemTable) error {
-	sst := BuildSSTableFromIMemTable(imem, m.sstPath)
+	sst := m.buildSSTableFromIMemTable(imem)
+	if sst.DataBlock.Len() == 0 {
+		imem.Clean()
+		log.Debugf("[SSTableManager] Skipped empty immutable MemTable %d", imem.ID())
+		return nil
+	}
 
 	// 写入 Level0 文件
 	filePath := sstableFilePath(sst.id, sst.level, m.sstPath)
@@ -278,7 +285,6 @@ func (m *Manager) searchFromTable(sst *SSTable, key kv.Key) (kv.Value, bool, err
 // Recover 加载所有层中 SSTable 的元数据信息到内存中
 func (m *Manager) Recover() error {
 	var maxID uint64
-	ResetIDGenerator()
 
 	for level := m.minSSTableLevel; level <= m.maxSSTableLevel; level++ {
 		dir := sstableLevelPath(level, m.sstPath)
@@ -292,6 +298,7 @@ func (m *Manager) Recover() error {
 			return fmt.Errorf("read directory %s failed: %w", dir, err)
 		}
 
+		files = filterSSTableFiles(files)
 		if len(files) == 0 {
 			log.Debugf("[SSTableManager] Directory %s is empty, skipping", dir)
 			continue
@@ -309,12 +316,7 @@ func (m *Manager) Recover() error {
 			maxID = latestID
 		}
 
-		// 加载每个文件的元数据
 		for _, file := range files {
-			if file.IsDir() {
-				continue
-			}
-
 			filePath := filepath.Join(dir, file.Name())
 			table := NewRecoverSSTable(level)
 			table.id = utils.ExtractID(file.Name())
@@ -323,14 +325,66 @@ func (m *Manager) Recover() error {
 				log.Errorf("[SSTableManager] Recover: load meta for file %s error: %s", filePath, err.Error())
 				return fmt.Errorf("load meta for file %s failed: %w", filePath, err)
 			}
+			if table.IndexBlock.Len() == 0 || table.Footer.DataHandle.Size == 0 {
+				log.Debugf("[SSTableManager] Recover: removing empty SSTable %s", filePath)
+				if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+					return fmt.Errorf("remove empty sstable %s failed: %w", filePath, err)
+				}
+				continue
+			}
 
 			m.addTable(table)
 		}
 	}
 
-	idGenerator.Add(maxID)
+	m.advanceNextID(maxID)
 	log.Debugf("[SSTableManager] Recovered SSTables, max ID: %d", maxID)
 	return nil
+}
+
+func filterSSTableFiles(files []os.DirEntry) []os.DirEntry {
+	filtered := files[:0]
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		if filepath.Ext(file.Name()) != "."+sstFileSuffix {
+			continue
+		}
+		if _, err := utils.ExtractIDFromFileName(file.Name()); err != nil {
+			continue
+		}
+		filtered = append(filtered, file)
+	}
+	return filtered
+}
+
+func (m *Manager) buildSSTableFromIMemTable(imem *memtable.IMemTable) *SSTable {
+	builder := m.newSSTableBuilder(config.Conf.LSM.MinSSTableLevel)
+	imem.RangeScan(func(pair *kv.KeyValuePair) {
+		builder.Add(pair)
+	})
+	return builder.Build()
+}
+
+func (m *Manager) newSSTableBuilder(level int) *Builder {
+	return NewSSTableBuilderWithID(m.nextTableID(), level, m.sstPath)
+}
+
+func (m *Manager) nextTableID() uint64 {
+	return m.nextID.Add(1)
+}
+
+func (m *Manager) advanceNextID(id uint64) {
+	for {
+		current := m.nextID.Load()
+		if current >= id {
+			return
+		}
+		if m.nextID.CompareAndSwap(current, id) {
+			return
+		}
+	}
 }
 
 // addTable 将新的 SSTable 添加到内存中，保持层级和排序（新文件在最前面）
@@ -342,6 +396,7 @@ func (m *Manager) addTable(table *SSTable) {
 }
 
 func (m *Manager) addTableLocked(table *SSTable) {
+	m.advanceNextID(table.id)
 	table.DataBlock = block.NewDataBlock()
 	level := table.level
 	m.removeTableMetadataLocked(table.FilePath(), level)

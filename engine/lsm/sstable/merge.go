@@ -54,7 +54,7 @@ func (m *Manager) CompactAndMergeKVs(kvs []kv.KeyValuePair, level int) []*SSTabl
 	}
 
 	results := make([]*SSTable, 0)
-	builder := NewSSTableBuilder(level, m.sstPath)
+	builder := m.newSSTableBuilder(level)
 
 	var lastWrittenKey kv.Key // 记录上一个写入的 Key
 
@@ -85,7 +85,7 @@ func (m *Manager) CompactAndMergeKVs(kvs []kv.KeyValuePair, level int) []*SSTabl
 		// 检查是否需要 Flush
 		if builder.ShouldFlush() {
 			results = append(results, builder.Build())
-			builder = NewSSTableBuilder(level, m.sstPath)
+			builder = m.newSSTableBuilder(level)
 		}
 	}
 

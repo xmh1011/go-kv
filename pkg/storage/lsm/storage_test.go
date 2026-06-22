@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -136,6 +138,33 @@ func TestStorageAdapter_LogEntries(t *testing.T) {
 	entry, err = adapter.GetEntry(2)
 	assert.NoError(t, err)
 	assert.Nil(t, entry)
+}
+
+func TestStorageAdapterCloseWaitsForInFlightStorageOperation(t *testing.T) {
+	db, dir := setupTestDB(t, "lsm_storage_close_wait")
+	defer cleanupTestDB(t, dir)
+
+	adapter, err := NewStorageAdapter(db)
+	assert.NoError(t, err)
+
+	adapter.mu.Lock()
+	closeReturned := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		closeReturned <- adapter.Close()
+	}()
+
+	select {
+	case err := <-closeReturned:
+		t.Fatalf("Close returned before the in-flight storage operation completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	adapter.mu.Unlock()
+	wg.Wait()
+	assert.NoError(t, <-closeReturned)
 }
 
 func TestStorageAdapter_LogEntryEncodingUsesBinaryCommands(t *testing.T) {

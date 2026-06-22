@@ -14,8 +14,15 @@ type Builder struct {
 }
 
 func NewSSTableBuilder(level int, rootPath string) *Builder {
+	return NewSSTableBuilderWithID(idGenerator.Add(1), level, rootPath)
+}
+
+func NewSSTableBuilderWithID(id uint64, level int, rootPath string) *Builder {
+	table := NewRecoverSSTable(level)
+	table.id = id
+	table.filePath = sstableFilePath(id, level, rootPath)
 	return &Builder{
-		table:   NewSSTableWithLevel(level, rootPath),
+		table:   table,
 		size:    0,
 		maxSize: uint64(config.Conf.LSM.MaxSSTableSize),
 	}

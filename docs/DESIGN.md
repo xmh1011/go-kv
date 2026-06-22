@@ -268,6 +268,21 @@ For LSM-backed Raft logs, log entries use a compact binary format with a magic
 header. This keeps the hot log path deterministic and avoids gob reflection on
 every append/read.
 
+The recovery boundary is intentionally strict:
+
+- Raft restores the persisted `commitIndex` before starting the apply loop, so
+  entries that were durable and committed before a restart are applied again
+  after the node comes back.
+- MemTable recovery only replays committed WAL files named `{id}.wal`. Temporary
+  files, directories, and unrelated files in the WAL directory are ignored.
+- SSTable recovery only loads committed `.sst` files, ignores uncommitted temp
+  files, and removes legacy empty SSTables that contain no recoverable data.
+- SSTable publishing writes a same-directory temp file, syncs and closes it,
+  renames it to the final `.sst` name, then publishes metadata. Readers should
+  see either the old catalog or the new catalog, never a half-written file.
+- MemTable and SSTable ID allocation is local to each manager instance.
+  Recovering another database must not reset IDs for a live database.
+
 ## 13. Snapshots
 
 Snapshots keep Raft logs bounded.
@@ -329,6 +344,10 @@ These invariants are useful when reading or modifying the code:
   safely published.
 - A tombstone must suppress older values until compaction can safely discard it.
 - SSTable metadata updates must be atomic from the reader's point of view.
+- WAL recovery must ignore non-committed directory entries but still fail on a
+  committed `{id}.wal` file whose contents are corrupt.
+- Raft `Stop()` must wait for in-flight apply, snapshot, AppendEntries, and
+  state-machine storage sections before the caller closes or reopens storage.
 
 Keeping these invariants true is more important than micro-optimizing a single
 code path.

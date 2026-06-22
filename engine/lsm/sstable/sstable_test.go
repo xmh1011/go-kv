@@ -123,6 +123,28 @@ func TestEncodeDecode(t *testing.T) {
 	}
 }
 
+func TestEncodeToPublishesOnlyFinalSSTable(t *testing.T) {
+	tempDir := setupTestEnv(t)
+	defer cleanupTestEnv(t, tempDir)
+
+	table := createSampleSSTable(0, tempDir, []*kv.KeyValuePair{
+		{Key: "key1", Value: []byte("value1")},
+		{Key: "key2", Value: []byte("value2")},
+	})
+
+	err := table.EncodeTo(table.filePath)
+	assert.NoError(t, err)
+	assert.FileExists(t, table.filePath)
+
+	levelDir := filepath.Dir(table.filePath)
+	tmpFiles, err := filepath.Glob(filepath.Join(levelDir, "*.tmp"))
+	assert.NoError(t, err)
+	assert.Empty(t, tmpFiles, "atomic SSTable publish should not leave committed temp files")
+
+	recovered := NewRecoverSSTable(0)
+	assert.NoError(t, recovered.DecodeFrom(table.filePath))
+}
+
 func TestDecodeBlocks(t *testing.T) {
 	tempDir := setupTestEnv(t)
 	defer cleanupTestEnv(t, tempDir)
@@ -197,6 +219,24 @@ func TestGetDataBlockFromFile(t *testing.T) {
 	loadedPairs, err = metaLoadedTable.GetDataBlockFromFile(table.filePath)
 	assert.NoError(t, err)
 	assert.Equal(t, len(pairs), len(loadedPairs), "repeated reads must not append duplicate DataBlock entries")
+}
+
+func TestGetDataBlockFromEmptySSTableDoesNotReadFooter(t *testing.T) {
+	tempDir := setupTestEnv(t)
+	defer cleanupTestEnv(t, tempDir)
+
+	table := createSampleSSTable(0, tempDir, nil)
+	err := table.EncodeTo(table.filePath)
+	assert.NoError(t, err)
+
+	metaLoadedTable := NewRecoverSSTable(0)
+	err = metaLoadedTable.DecodeFrom(table.filePath)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), metaLoadedTable.Footer.DataHandle.Size)
+
+	loadedPairs, err := metaLoadedTable.GetDataBlockFromFile(table.filePath)
+	assert.NoError(t, err)
+	assert.Empty(t, loadedPairs)
 }
 
 func TestGetKeyValuePairs(t *testing.T) {

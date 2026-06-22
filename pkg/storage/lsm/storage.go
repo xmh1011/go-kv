@@ -578,6 +578,8 @@ func (s *StorageAdapter) CompactLog(upToIndex uint64) error {
 
 // Close 关闭数据库连接。
 func (s *StorageAdapter) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.db.Close()
 }
 

@@ -260,3 +260,149 @@ c.waitForStateMachineValue(t, nodeIndex, key, expected, 5*time.Second)
 - LSM metadata 和物理文件必须作为一个逻辑目录维护。
 - 测试应该等待状态，而不是等待固定时间。
 - 任何 Raft 或 LSM 代码修改后，都应该先跑触发问题的单个长时间 E2E，再跑全量长时间 E2E 回归。
+
+## 14. 2026-06-22 核心恢复与 Apply 修复复盘
+
+第二轮深测重点放在 Raft restart、snapshot compaction、LSM flush 和 LSM
+recovery 同时发生时才会暴露的问题。这些问题晚于 #88-#95，单独跟踪：
+
+- #102 防止 Raft commit notification 丢失。
+- #103 修正性能测试 harness 对 commit channel 的消费方式。
+- #104 原子发布 LSM SSTable，并处理空表 metadata。
+- #105 让 LSM table/WAL ID 变成每个数据库 manager 本地状态。
+- #106 通过恢复 durable `commitIndex` 修复 TCP restart 后的 LSM 节点状态恢复。
+- #107 MemTable recovery 忽略非 WAL 目录项。
+
+### #102：Commit notification 属于 apply 边界
+
+现象：高负载下 `commitChan` 可能被写满。旧代码用非阻塞发送，满了就直接丢：
+
+```go
+select {
+case commitChan <- entry:
+default:
+    log.Warnf("commitChan full, skipping")
+}
+```
+
+这会让观察者以为某条 entry 没有 apply，但 Raft 实际已经写入状态机。修复后
+`commitChan` 是带背压的流：
+
+```go
+select {
+case commitChan <- commitEntry:
+case <-shutdownChan:
+}
+```
+
+`shutdownChan` 防止 `Stop()` 永久阻塞；正常运行时不再丢 apply notification。
+
+### #103：Benchmark harness 不能重复 Apply
+
+`commitChan` 是 Raft apply 完之后才发出的通知。一些性能测试消费 `commitChan`
+后又把命令 apply 到状态机一次，这会放大写入，并掩盖真实状态机问题。
+
+修复后 harness 只 drain：
+
+```go
+go func(ch chan param.CommitEntry) {
+    for range ch {
+        // Raft 已经 apply
+    }
+}(commitChan)
+```
+
+这样 benchmark 不会制造第二条绕过 Raft 的 apply 路径。
+
+### #104：SSTable 发布有两个独立故障模式
+
+#104 最早的假设是 final file 半写入。长时间 E2E 后进一步定位到更精确的问题：
+保留下来的 `.sst` footer 里 `DataHandle.Size == 0` 且 `IndexHandle.Size == 0`。
+通用 `DataBlock.DecodeFrom(reader, 0)` 把 size `0` 理解成“不限制读取”，于是
+SSTable 层把 footer 字节误当 value 解码，最终 EOF。
+
+最终修复分三部分：
+
+```go
+tmp, _ := os.CreateTemp(dir, "."+base+".*.tmp")
+// encode header/filter/data/index/footer into tmp
+tmp.Sync()
+tmp.Close()
+os.Rename(tmp.Name(), finalPath)
+```
+
+- SSTable 发布使用临时文件、fsync、close、rename；
+- 跳过空 immutable memtable，不发布空 Level-0 表；
+- `Footer.DataHandle.Size == 0` 时 `DecodeDataBlock` 直接返回。
+
+Recovery 也会忽略未提交临时文件，并移除旧空 SSTable，而不是把它加载进 catalog。
+
+### #105：ID generator 必须属于数据库 manager
+
+旧恢复路径会 reset 包级 ID generator。恢复一个 manager 时可能把全局 generator
+回退，而另一个 manager 还在运行。这会让活跃数据库复用 SSTable 或 WAL ID，
+甚至覆盖已有文件。
+
+修复后 ID 分配放到 manager 内部：
+
+```go
+type Manager struct {
+    nextID atomic.Uint64
+}
+
+func (m *Manager) nextTableID() uint64 {
+    return m.nextID.Add(1)
+}
+```
+
+Recovery 只把本 manager 的 counter 推进到不小于已恢复最大 ID，不再重置其他
+数据库共享的全局状态。
+
+### #106：持久化 CommitIndex 是工程 guardrail
+
+Raft 论文层面的持久状态是 term、vote 和 log entries。本项目状态机也是持久化的，
+如果重启后忘记 durable commit index，已提交 entry 可能要等另一个 leader 再次传播
+commit 信息才会 apply。
+
+修复后 `CommitIndex` 写入 `HardState`，并在 `NewRaft` 恢复：
+
+```go
+r.commitIndex = hardState.CommitIndex
+if r.commitIndex > r.lastApplied {
+    r.startApplyLogsLocked()
+}
+```
+
+这不改变多数派提交规则，只保留已经 durable 且 committed 的 entry 的重启进度。
+
+### #107：WAL recovery 需要已提交文件契约
+
+MemTable recovery 以前会重放 `os.ReadDir` 返回的每个目录项。残留的 `notes.txt`、
+`3.wal.tmp` 或名为 `4.wal` 的目录，都可能让引擎在重放有效 WAL 前失败。
+
+修复后先过滤 recovery set：
+
+```go
+if file.IsDir() || filepath.Ext(file.Name()) != ".wal" {
+    continue
+}
+idPart := strings.TrimSuffix(file.Name(), ".wal")
+if _, err := strconv.ParseUint(idPart, 10, 64); err != nil {
+    continue
+}
+```
+
+只有 `{id}.wal` 会被重放。内容损坏的已提交 WAL 仍然会让恢复失败，因此不会掩盖
+真实数据损坏。
+
+### 验证信号
+
+这些修复后，聚焦的 10 分钟 restart/snapshot 场景通过：
+
+- 总操作 797,556；
+- 失败操作 0；
+- 最终 cluster barrier 成功；
+- 3,600 个 node/key 一致性检查通过；
+- 3 个节点产生 snapshot，leader 切换 46 次。
+
+完整包级和长时间 E2E 验证命令记录在 [PERFORMANCE.zh-CN.md](PERFORMANCE.zh-CN.md)。

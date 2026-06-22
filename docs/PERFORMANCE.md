@@ -11,7 +11,7 @@ LSM compaction, client retries, and final data consistency.
 
 | Field | Value |
 |---|---|
-| Date | 2026-06-17 |
+| Date | 2026-06-22 |
 | Machine | macOS Darwin 26.3.1, Apple Silicon |
 | Go | 1.25.5 |
 | Transport | gRPC for long E2E; focused integration also covers TCP |
@@ -22,10 +22,10 @@ LSM compaction, client retries, and final data consistency.
 
 | Purpose | Command | Result |
 |---|---|---|
-| Focused TCP/LSM restart regression | `GO_KV_LOG_LEVEL=warn go test -v ./tests -run '^TestCluster_Persistence_Restart$/^tcp_lsm$' -count=10 -timeout=3m` | Passed in 40.689s |
-| Full short unit/integration gate | `GO_KV_LOG_LEVEL=warn go test -short ./... -count=1 -timeout=15m` | Passed in 772.798s |
-| Single 10-minute trigger scenario | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=25m ./tests/long_running_e2e_test.go -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1` | Passed in 608.749s |
-| Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests/long_running_e2e_test.go -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | Passed in 3688.472s |
+| LSM/WAL recovery regression | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=5m` | Passed |
+| Full short unit/integration gate | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=25m` | Passed; `tests` package 779.477s |
+| Single 10-minute restart/snapshot trigger scenario | `GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1 -timeout=25m` | Passed in 606.884s |
+| Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | Passed in 3672.630s |
 
 The short-mode behavior is now explicit: the 10-minute E2E tests skip when
 `testing.Short()` is enabled. That keeps `go test -short ./...` usable for PR
@@ -41,24 +41,24 @@ node data.
 
 | Scenario | Total ops | Failed ops | Throughput | P50 | P95 | P99 | Leader changes | Snapshot nodes | Max snapshot index | Consistency |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Comprehensive | 1,187,811 | 0 | 1,979.68 ops/s | 2.079625ms | 4.845958ms | 11.733209ms | 33 | 3 | 891,649 | Passed, 1,996 keys |
-| WriteHeavy | 711,886 | 0 | 1,186.48 ops/s | 1.9855ms | 5.132084ms | 11.577292ms | 57 | 3 | 706,490 | Passed, 2,000 keys |
-| MixedWithFailures | 998,188 | 0 | 1,663.65 ops/s | 1.276875ms | 3.291916ms | 7.843792ms | 39 | 3 | 698,422 | Passed, 3,600 node-key checks |
-| ConsistencyWithRestartsAndSnapshots | 1,304,041 | 0 | 2,173.40 ops/s | 1.468917ms | 3.905167ms | 8.690958ms | 72 | 3 | 908,358 | Passed, 3,600 node-key checks |
-| ReadHeavy | 61,771,824 | 0 | 102,953.04 ops/s | 15.542us | 327.333us | 681.125us | 0 | 0 | 0 | Passed, 2,000 keys |
-| DeleteStress | 714,646 | 0 | 1,191.08 ops/s | 2.107375ms | 5.763834ms | 13.462959ms | 50 | 3 | 714,968 | Passed, 3,600 node-key checks |
+| Comprehensive | 741,998 | 0 | 1,236.66 ops/s | 2.947709ms | 13.335041ms | 29.132709ms | 34 | 3 | 557,264 | Passed, 1,994 keys |
+| WriteHeavy | 651,910 | 0 | 1,086.52 ops/s | 2.319708ms | 6.559708ms | 14.27275ms | 76 | 3 | 634,129 | Passed, 2,000 keys |
+| MixedWithFailures | 667,024 | 0 | 1,111.71 ops/s | 1.45125ms | 6.477083ms | 19.660041ms | 34 | 3 | 467,029 | Passed, 3,600 node-key checks |
+| ConsistencyWithRestartsAndSnapshots | 649,820 | 0 | 1,083.03 ops/s | 2.218459ms | 12.986833ms | 35.574416ms | 44 | 3 | 445,972 | Passed, 3,600 node-key checks |
+| ReadHeavy | 29,051,853 | 0 | 48,419.75 ops/s | 24.667us | 472.458us | 1.695083ms | 0 | 0 | 0 | Passed, 2,000 keys |
+| DeleteStress | 397,732 | 0 | 662.89 ops/s | 4.177875ms | 20.314792ms | 58.492375ms | 30 | 3 | 397,665 | Passed, 3,600 node-key checks |
 
-`MixedWithFailures` emitted one warning from the new LSM compaction recovery
-guard:
+`Comprehensive` emitted one ReadIndex wait warning while the cluster was under
+snapshot and compaction load:
 
 ```text
-[Compaction] Pruning stale SSTable metadata for missing file .../node-2/lsm_raftlog/sst/1-level/515.sst at level 1
+[ReadIndex] Node 1 timed out waiting for lastApplied to reach 446053 (current: 445844)
 ```
 
-That warning is expected for the repaired path. The metadata entry was stale,
-the physical file was already gone, and compaction pruned the catalog entry
-instead of failing the whole storage engine. The scenario continued and passed
-strict final consistency.
+The request stream still completed with zero failed operations, and final
+consistency passed. The warning is useful performance signal: write-heavy
+compaction or snapshot pressure can temporarily delay `lastApplied` catch-up,
+but the latest run did not expose data loss or divergence.
 
 ## Correctness Gates
 
@@ -78,7 +78,7 @@ The current long-running suites enforce these gates:
 Run one scenario first when debugging a specific failure:
 
 ```bash
-GO_KV_LOG_LEVEL=warn go test -race -v -timeout=25m ./tests/long_running_e2e_test.go \
+GO_KV_LOG_LEVEL=warn go test -race -v -timeout=25m ./tests \
   -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' \
   -count=1
 ```
@@ -86,7 +86,7 @@ GO_KV_LOG_LEVEL=warn go test -race -v -timeout=25m ./tests/long_running_e2e_test
 After a code or test-logic fix, run the full long E2E regression:
 
 ```bash
-GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests/long_running_e2e_test.go \
+GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests \
   -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' \
   -count=1
 ```
@@ -94,7 +94,7 @@ GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests/long_running_e2e_test
 For PR coverage and Codecov:
 
 ```bash
-GO_KV_LOG_LEVEL=warn go test -short ./... -count=1 -timeout=15m
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=25m
 make test
 ```
 

@@ -3,7 +3,10 @@ package memtable
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -27,6 +30,7 @@ type Manager struct {
 	IMems             []*IMemTable
 	maxIMemTableCount int
 	flushing          map[uint64]bool
+	nextID            atomic.Uint64
 }
 
 func NewMemTableManager(walPath string) *Manager {
@@ -35,13 +39,14 @@ func NewMemTableManager(walPath string) *Manager {
 		log.Errorf("[MemTableManager] Failed to create WAL directory %s: %s", walPath, err.Error())
 	}
 
-	return &Manager{
+	manager := &Manager{
 		walPath:           walPath,
-		Mem:               NewMemTable(idGenerator.Add(1), walPath),
 		IMems:             make([]*IMemTable, 0),
 		maxIMemTableCount: config.Conf.LSM.MaxIMemTableCount,
 		flushing:          make(map[uint64]bool),
 	}
+	manager.Mem = NewMemTable(manager.nextMemTableID(), walPath)
+	return manager
 }
 
 func (m *Manager) Insert(pair kv.KeyValuePair) (*IMemTable, error) {
@@ -122,7 +127,7 @@ func (m *Manager) GetAll() []*IMemTable {
 func (m *Manager) promoteLocked() *IMemTable {
 	imem := NewIMemTable(m.Mem)
 	m.IMems = append(m.IMems, imem)
-	m.Mem = NewMemTable(idGenerator.Add(1), m.walPath)
+	m.Mem = NewMemTable(m.nextMemTableID(), m.walPath)
 
 	if len(m.IMems) <= m.maxIMemTableCount {
 		return nil
@@ -193,7 +198,9 @@ func (m *Manager) Recover() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	ResetIDGenerator()
+	if m.Mem != nil {
+		_ = m.Mem.Close()
+	}
 	m.IMems = m.IMems[:0]
 	m.flushing = make(map[uint64]bool)
 	// 收集所有 WAL 恢复数据
@@ -202,13 +209,20 @@ func (m *Manager) Recover() error {
 		// 如果目录不存在，则不需要恢复，直接返回
 		if os.IsNotExist(err) {
 			log.Debugf("[MemTableManager] WAL directory %s does not exist, skipping recovery", m.walPath)
+			m.Mem = NewMemTable(m.nextMemTableID(), m.walPath)
 			return nil
 		}
 		log.Errorf("[MemTableManager] Failed to read WAL directory %s: %s", m.walPath, err.Error())
 		return fmt.Errorf("failed to read WAL directory %s: %w", m.walPath, err)
 	}
+	files = filterWALFiles(files)
 	// 将所有 WAL 按照 ID 排序，最新的加载为 memtable，其余加载为 imemtable
 	sort.Slice(files, func(i, j int) bool { return utils.ExtractID(files[i].Name()) < utils.ExtractID(files[j].Name()) })
+	if len(files) == 0 {
+		m.Mem = NewMemTable(m.nextMemTableID(), m.walPath)
+		log.Debug("[MemTableManager] No WAL files found, created a fresh active MemTable")
+		return nil
+	}
 	// 构建 IMemTable 和 MemTable
 	for i, file := range files {
 		mem := NewMemTableWithoutWAL()
@@ -216,10 +230,9 @@ func (m *Manager) Recover() error {
 			log.Errorf("[MemTableManager] Recover from WAL %s failed: %s", file.Name(), err.Error())
 			return fmt.Errorf("recover from WAL %s failed: %w", file.Name(), err)
 		}
+		m.advanceNextID(mem.ID())
 		if i == len(files)-1 {
 			m.Mem = mem
-			// 并且处理自增 id 的逻辑
-			idGenerator.Add(utils.ExtractID(file.Name()))
 		} else {
 			// 其他的都作为 IMemTable
 			m.IMems = append(m.IMems, NewIMemTable(mem))
@@ -228,6 +241,40 @@ func (m *Manager) Recover() error {
 
 	log.Debugf("[MemTableManager] Recovered %d Immutable MemTables and 1 Active MemTable", len(m.IMems))
 	return nil
+}
+
+func filterWALFiles(files []os.DirEntry) []os.DirEntry {
+	filtered := files[:0]
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		if filepath.Ext(file.Name()) != ".wal" {
+			continue
+		}
+		idPart := strings.TrimSuffix(file.Name(), ".wal")
+		if _, err := strconv.ParseUint(idPart, 10, 64); err != nil {
+			continue
+		}
+		filtered = append(filtered, file)
+	}
+	return filtered
+}
+
+func (m *Manager) nextMemTableID() uint64 {
+	return m.nextID.Add(1)
+}
+
+func (m *Manager) advanceNextID(id uint64) {
+	for {
+		current := m.nextID.Load()
+		if current >= id {
+			return
+		}
+		if m.nextID.CompareAndSwap(current, id) {
+			return
+		}
+	}
 }
 
 // Close closes the active MemTable's WAL.
