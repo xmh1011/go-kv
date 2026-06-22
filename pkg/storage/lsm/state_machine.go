@@ -27,6 +27,11 @@ type StateMachineAdapter struct {
 	db *database.Database
 }
 
+type snapshotFile struct {
+	fullPath string
+	content  []byte
+}
+
 // NewStateMachineAdapter 创建一个新的 LSM 状态机适配器。
 func NewStateMachineAdapter(db *database.Database) *StateMachineAdapter {
 	return &StateMachineAdapter{
@@ -175,6 +180,10 @@ func (lsm *StateMachineAdapter) ApplySnapshot(snapshot []byte) error {
 
 	dbPath := lsm.db.Name()
 	sstPath := filepath.Join(dbPath, "sst")
+	filesToRestore, err := validateSnapshotFiles(sstPath, snapshotData)
+	if err != nil {
+		return err
+	}
 
 	// 2. 清空目录 (先关闭 DB)
 	if err := lsm.db.Close(); err != nil {
@@ -191,22 +200,14 @@ func (lsm *StateMachineAdapter) ApplySnapshot(snapshot []byte) error {
 	}
 
 	// 3. 写回文件
-	for relPath, content := range snapshotData {
-		// 防止路径遍历攻击
-		if strings.Contains(relPath, "..") {
-			log.Warnf("[LSMAdapter] Skipping invalid snapshot file path: %s", relPath)
-			continue
-		}
-
-		fullPath := filepath.Join(sstPath, relPath)
-
+	for _, file := range filesToRestore {
 		// 确保子目录存在 (例如 0-level)
-		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(file.fullPath), 0755); err != nil {
 			return err
 		}
 
-		if err := os.WriteFile(fullPath, content, 0644); err != nil {
-			log.Errorf("[LSMAdapter] Failed to write snapshot file %s: %v", fullPath, err)
+		if err := os.WriteFile(file.fullPath, file.content, 0644); err != nil {
+			log.Errorf("[LSMAdapter] Failed to write snapshot file %s: %v", file.fullPath, err)
 			return err
 		}
 	}
@@ -232,6 +233,59 @@ func (lsm *StateMachineAdapter) ApplySnapshot(snapshot []byte) error {
 	}
 
 	return nil
+}
+
+func validateSnapshotFiles(sstRoot string, files map[string][]byte) ([]snapshotFile, error) {
+	rootAbs, err := filepath.Abs(sstRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve snapshot root failed: %w", err)
+	}
+	rootWithSeparator := rootAbs + string(os.PathSeparator)
+
+	paths := make([]string, 0, len(files))
+	for relPath := range files {
+		paths = append(paths, relPath)
+	}
+	sort.Strings(paths)
+
+	validated := make([]snapshotFile, 0, len(paths))
+	for _, relPath := range paths {
+		cleanRel, err := cleanSnapshotRelPath(relPath)
+		if err != nil {
+			return nil, err
+		}
+
+		fullPath := filepath.Join(sstRoot, cleanRel)
+		fullAbs, err := filepath.Abs(fullPath)
+		if err != nil {
+			return nil, fmt.Errorf("resolve snapshot file path %q failed: %w", relPath, err)
+		}
+		if fullAbs != rootAbs && !strings.HasPrefix(fullAbs, rootWithSeparator) {
+			return nil, fmt.Errorf("invalid snapshot file path %q: escapes snapshot root", relPath)
+		}
+
+		validated = append(validated, snapshotFile{
+			fullPath: fullPath,
+			content:  files[relPath],
+		})
+	}
+
+	return validated, nil
+}
+
+func cleanSnapshotRelPath(relPath string) (string, error) {
+	if relPath == "" {
+		return "", fmt.Errorf("invalid snapshot file path: empty")
+	}
+	if filepath.IsAbs(relPath) {
+		return "", fmt.Errorf("invalid snapshot file path %q: absolute paths are not allowed", relPath)
+	}
+
+	cleanRel := filepath.Clean(relPath)
+	if cleanRel == "." || cleanRel == ".." || strings.HasPrefix(cleanRel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("invalid snapshot file path %q: parent traversal is not allowed", relPath)
+	}
+	return cleanRel, nil
 }
 
 func encodeSnapshotData(files map[string][]byte) ([]byte, error) {

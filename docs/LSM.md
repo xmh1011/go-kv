@@ -565,6 +565,7 @@ or file encoding. They come from boundaries between modules:
 | WAL recovery hygiene | Temp files or notes exist beside committed WAL files. | Replay only `{id}.wal`; ignore non-WAL entries and fail corrupt committed WALs. |
 | SSTable publication | Recovery sees a partially written table. | Publish via temp file, fsync, close, and rename before metadata publication. |
 | SSTable rewrite | A reused in-memory table carries stale footer sizes into a new file. | Reset all derived layout metadata before each encode pass. |
+| Snapshot apply | Malformed snapshot path clears the local state machine. | Validate every snapshot path before closing or deleting the current DB. |
 
 These guardrails should be mentioned in code reviews. They are correctness
 requirements, not performance details.
@@ -588,6 +589,8 @@ When modifying the LSM code, keep these invariants true:
   confirmed absent; existing corrupt files remain hard errors.
 - Raft log reads respect the logical `[firstIndex, lastIndex]` window.
 - Snapshot export and apply must not race with state-machine writes.
+- Snapshot apply must validate the full file manifest before destructive
+  replacement starts; invalid paths are hard errors, not skipped files.
 
 Most storage bugs are violations of one of these invariants.
 

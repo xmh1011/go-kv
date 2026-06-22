@@ -562,3 +562,111 @@ and the wider LSM/storage regression:
 ```bash
 GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=5m
 ```
+
+## 16. 2026-06-22 Snapshot Apply Path Validation Fix
+
+Issue #111 was found while reviewing the LSM snapshot installation path. The
+dangerous part was not just path traversal. The bigger correctness bug was that
+`ApplySnapshot` validated file paths after it had already closed and removed
+the current database.
+
+### Symptom
+
+The failing test installed a malformed snapshot into a database that already
+contained a key:
+
+```go
+adapter.Apply(param.LogEntry{Command: mustMarshal(param.KVCommand{
+    Op: param.OpSet, Key: "keep", Value: "value",
+})})
+
+snapData, _ := encodeSnapshotData(map[string][]byte{
+    "../escape.sst": []byte("not-a-valid-sstable"),
+})
+
+err := adapter.ApplySnapshot(snapData)
+```
+
+Before the fix, the adapter logged a warning, returned nil, and the original key
+was gone:
+
+```text
+[LSMAdapter] Skipping invalid snapshot file path: ../escape.sst
+expected error but got nil
+key not found
+```
+
+### Root Cause
+
+The old implementation checked paths while writing files:
+
+```go
+for relPath, content := range snapshotData {
+    if strings.Contains(relPath, "..") {
+        log.Warnf("Skipping invalid snapshot file path: %s", relPath)
+        continue
+    }
+    fullPath := filepath.Join(sstPath, relPath)
+    os.WriteFile(fullPath, content, 0644)
+}
+```
+
+This had three problems:
+
+- invalid paths were skipped instead of rejected;
+- the check ran after `db.Close()` and `os.RemoveAll(dbPath)`;
+- `strings.Contains("..")` is not a precise path policy.
+
+### Fix
+
+`ApplySnapshot` now validates the full snapshot manifest before any destructive
+operation:
+
+```go
+filesToRestore, err := validateSnapshotFiles(sstPath, snapshotData)
+if err != nil {
+    return err
+}
+
+if err := lsm.db.Close(); err != nil {
+    return err
+}
+```
+
+The validator accepts only clean relative paths that stay under the snapshot
+SSTable root:
+
+```go
+cleanRel := filepath.Clean(relPath)
+if cleanRel == "." || cleanRel == ".." ||
+    strings.HasPrefix(cleanRel, ".."+string(os.PathSeparator)) {
+    return "", fmt.Errorf("invalid snapshot file path")
+}
+```
+
+It also checks the absolute joined path remains inside the snapshot root.
+
+### Principle
+
+Raft snapshot installation is a local state-machine replacement. It must behave
+like a transaction at the validation boundary:
+
+- reject malformed input before touching the current state;
+- accept only a complete, validated file manifest;
+- never silently skip part of a snapshot and call the install successful.
+
+### Validation
+
+Validation for #111:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm -run TestApplySnapshotRejectsInvalidFilePathBeforeClearingDB -count=1 -timeout=2m
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm -count=1 -timeout=3m
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=5m
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=25m
+GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1 -timeout=25m
+```
+
+The focused 10-minute replay completed with 1,104,337 total operations, 0
+failed operations, final barrier success, and 3,600 strict node-key consistency
+checks passed.

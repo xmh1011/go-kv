@@ -100,6 +100,28 @@ func TestStateMachineAdapterSnapshotIncludesAllImmutableMemTables(t *testing.T) 
 	}
 }
 
+func TestApplySnapshotRejectsInvalidFilePathBeforeClearingDB(t *testing.T) {
+	db, dir := setupTestDB(t, "lsm_sm_invalid_snapshot_path")
+	defer cleanupTestDB(t, dir)
+
+	adapter := NewStateMachineAdapter(db)
+	defer adapter.Close()
+
+	adapter.Apply(param.LogEntry{Command: mustMarshal(param.KVCommand{Op: param.OpSet, Key: "keep", Value: "value"})})
+
+	snapData, err := encodeSnapshotData(map[string][]byte{
+		"../escape.sst": []byte("not-a-valid-sstable"),
+	})
+	assert.NoError(t, err)
+
+	err = adapter.ApplySnapshot(snapData)
+	assert.Error(t, err)
+
+	val, err := adapter.Get("keep")
+	assert.NoError(t, err)
+	assert.Equal(t, "value", val)
+}
+
 func setupTestDB(t *testing.T, name string) (*database.Database, string) {
 	dir, err := os.MkdirTemp("", name)
 	assert.NoError(t, err)

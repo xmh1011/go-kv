@@ -23,8 +23,8 @@ LSM compaction, client retries, and final data consistency.
 | Purpose | Command | Result |
 |---|---|---|
 | LSM/WAL recovery regression | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=5m` | Passed |
-| Full short unit/integration gate | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=25m` | Passed; latest `tests` package 774.370s |
-| Single 10-minute restart/snapshot trigger scenario | `GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1 -timeout=25m` | Latest post-#109 run passed in 606.997s |
+| Full short unit/integration gate | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=25m` | Passed; latest `tests` package 776.861s |
+| Single 10-minute restart/snapshot trigger scenario | `GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1 -timeout=25m` | Latest post-#111 run passed in 607.722s |
 | Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | Passed in 3672.630s |
 
 The short-mode behavior is now explicit: the 10-minute E2E tests skip when
@@ -83,6 +83,30 @@ scenario was rerun under the race detector:
 This focused replay does not replace the six-scenario full regression above. It
 is the latest targeted evidence for the SSTable metadata fix because that bug
 affects the LSM file-layout boundary used by snapshot and restart paths.
+
+## Post-#111 Focused Restart/Snapshot Replay
+
+After fixing LSM snapshot path validation, the same restart/snapshot trigger
+scenario was rerun under the race detector:
+
+| Field | Value |
+|---|---:|
+| Duration | 10m0s |
+| Total ops | 1,104,337 |
+| Failed ops | 0 |
+| Throughput | 1,840.56 ops/s |
+| P50 | 1.579459ms |
+| P95 | 5.621625ms |
+| P99 | 16.051875ms |
+| Leader changes | 65 |
+| Snapshot nodes | 3 |
+| Max snapshot index | 759,795 |
+| Final barrier | Passed |
+| Strict consistency | Passed, 3,600 node-key checks |
+
+This is the latest targeted evidence for the snapshot apply validation fix. The
+test exercises normal snapshot export/install and restart behavior; the new
+unit regression covers malformed snapshot manifests directly.
 
 ## Correctness Gates
 
