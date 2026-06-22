@@ -25,7 +25,7 @@ LSM compaction, client retries, and final data consistency.
 | LSM/WAL recovery regression | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=5m` | Passed |
 | Full short unit/integration gate | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=25m` | Passed; latest `tests` package 776.861s |
 | Single 10-minute restart/snapshot trigger scenario | `GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1 -timeout=25m` | Latest post-#111 run passed in 607.722s |
-| Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | Passed in 3672.630s |
+| Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | Latest run passed in 3684.450s |
 
 The short-mode behavior is now explicit: the 10-minute E2E tests skip when
 `testing.Short()` is enabled. That keeps `go test -short ./...` usable for PR
@@ -41,24 +41,32 @@ node data.
 
 | Scenario | Total ops | Failed ops | Throughput | P50 | P95 | P99 | Leader changes | Snapshot nodes | Max snapshot index | Consistency |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Comprehensive | 741,998 | 0 | 1,236.66 ops/s | 2.947709ms | 13.335041ms | 29.132709ms | 34 | 3 | 557,264 | Passed, 1,994 keys |
-| WriteHeavy | 651,910 | 0 | 1,086.52 ops/s | 2.319708ms | 6.559708ms | 14.27275ms | 76 | 3 | 634,129 | Passed, 2,000 keys |
-| MixedWithFailures | 667,024 | 0 | 1,111.71 ops/s | 1.45125ms | 6.477083ms | 19.660041ms | 34 | 3 | 467,029 | Passed, 3,600 node-key checks |
-| ConsistencyWithRestartsAndSnapshots | 649,820 | 0 | 1,083.03 ops/s | 2.218459ms | 12.986833ms | 35.574416ms | 44 | 3 | 445,972 | Passed, 3,600 node-key checks |
-| ReadHeavy | 29,051,853 | 0 | 48,419.75 ops/s | 24.667us | 472.458us | 1.695083ms | 0 | 0 | 0 | Passed, 2,000 keys |
-| DeleteStress | 397,732 | 0 | 662.89 ops/s | 4.177875ms | 20.314792ms | 58.492375ms | 30 | 3 | 397,665 | Passed, 3,600 node-key checks |
+| Comprehensive | 502,428 | 0 | 837.38 ops/s | 3.5285ms | 25.564834ms | 66.73125ms | 23 | 3 | 371,551 | Passed, 1,994 keys |
+| WriteHeavy | 326,298 | 0 | 543.83 ops/s | 3.841292ms | 24.972667ms | 70.632083ms | 35 | 3 | 326,489 | Passed, 2,000 keys |
+| MixedWithFailures | 464,357 | 0 | 773.93 ops/s | 2.070792ms | 13.270042ms | 35.819375ms | 31 | 3 | 311,698 | Passed, 3,600 node-key checks |
+| ConsistencyWithRestartsAndSnapshots | 681,847 | 0 | 1,136.41 ops/s | 2.518375ms | 10.924792ms | 28.547208ms | 41 | 3 | 462,404 | Passed, 3,600 node-key checks |
+| ReadHeavy | 16,729,989 | 0 | 27,883.31 ops/s | 29.5us | 467.625us | 2.115667ms | 0 | 0 | 0 | Passed, 2,000 keys |
+| DeleteStress | 539,492 | 0 | 899.15 ops/s | 2.93875ms | 11.89325ms | 29.039792ms | 58 | 3 | 536,558 | Passed, 3,600 node-key checks |
 
-`Comprehensive` emitted one ReadIndex wait warning while the cluster was under
-snapshot and compaction load:
+The latest full run preserved all correctness gates, but it also exposed a
+performance and ReadIndex availability signal now tracked in
+[issue #113](https://github.com/xmh1011/go-kv/issues/113). Several scenarios
+emitted ReadIndex timeout warnings while still completing with zero failed
+operations:
 
 ```text
-[ReadIndex] Node 1 timed out waiting for lastApplied to reach 446053 (current: 445844)
+[ReadIndex] Node 3 timed out waiting for heartbeat quorum.
+[ReadIndex] Node 3 timed out waiting for lastApplied to reach 234016 (current: 233759)
+[ReadIndex] Node 2 timed out waiting for heartbeat quorum.
+[ReadIndex] Node 1 timed out waiting for heartbeat quorum.
 ```
 
-The request stream still completed with zero failed operations, and final
+The request streams still completed with zero failed operations, and final
 consistency passed. The warning is useful performance signal: write-heavy
-compaction or snapshot pressure can temporarily delay `lastApplied` catch-up,
-but the latest run did not expose data loss or divergence.
+compaction, snapshot pressure, or ReadIndex heartbeat scheduling can temporarily
+delay linearizable reads. Compared with the previous report, WriteHeavy and
+ReadHeavy throughput are materially lower, so #113 should be treated as a
+follow-up performance bug rather than a correctness failure.
 
 ## Post-#109 Focused Restart/Snapshot Replay
 
