@@ -488,6 +488,22 @@ An empty SSTable is not decoded by passing size `0` into the generic
 "unlimited". The SSTable layer owns the file-format meaning:
 `Footer.DataHandle.Size == 0` means there is no data block to read.
 
+`EncodeTo` treats footer handles and per-entry offsets as derived file-layout
+metadata. They must be reset before every encode pass:
+
+```go
+t.Footer.DataHandle = block.NewHandle(0, 0)
+t.Footer.IndexHandle = block.NewHandle(0, 0)
+for _, entry := range t.IndexBlock.Indexes {
+    entry.Offset = 0
+}
+```
+
+Without this reset, rewriting the same in-memory SSTable object can serialize
+stale footer sizes into a fully published file. Atomic rename protects readers
+from partial files; it does not protect them from internally inconsistent
+metadata in a completed file.
+
 ## 18. Raft Log Keyspace In LSM
 
 The Raft storage adapter stores consensus metadata and log entries as normal LSM
@@ -548,6 +564,7 @@ or file encoding. They come from boundaries between modules:
 | Compaction catalog cleanup | Metadata references a file that was already removed. | Prune missing-file metadata, but still fail existing corrupt files. |
 | WAL recovery hygiene | Temp files or notes exist beside committed WAL files. | Replay only `{id}.wal`; ignore non-WAL entries and fail corrupt committed WALs. |
 | SSTable publication | Recovery sees a partially written table. | Publish via temp file, fsync, close, and rename before metadata publication. |
+| SSTable rewrite | A reused in-memory table carries stale footer sizes into a new file. | Reset all derived layout metadata before each encode pass. |
 
 These guardrails should be mentioned in code reviews. They are correctness
 requirements, not performance details.
@@ -564,6 +581,8 @@ When modifying the LSM code, keep these invariants true:
 - SSTable decode resets reusable structures before filling them.
 - SSTable publication is temp-file based and metadata is published only after
   the final `.sst` exists.
+- SSTable encoding derives footer handles and index offsets from the current
+  write pass; stale layout metadata must never be reused.
 - Compaction metadata updates are protected by manager locks.
 - Missing SSTable metadata can be pruned only after the physical file is
   confirmed absent; existing corrupt files remain hard errors.

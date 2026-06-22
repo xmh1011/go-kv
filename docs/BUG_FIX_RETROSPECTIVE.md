@@ -471,3 +471,94 @@ After these fixes, the focused 10-minute restart/snapshot scenario passed with:
 
 The full package and long-E2E validation commands are recorded in
 [PERFORMANCE.md](PERFORMANCE.md).
+
+## 15. 2026-06-22 SSTable Rewrite Metadata Fix
+
+Issue #109 was found during the next deep LSM pass after #102-#107 had been
+merged. The target was a narrow but important file-format invariant: encoding an
+in-memory SSTable twice should produce a readable SSTable both times.
+
+### Symptom
+
+The regression test rewrites the same table object twice and then reloads it:
+
+```go
+table := createSampleSSTable(0, tempDir, pairs)
+
+require.NoError(t, table.EncodeTo(table.filePath))
+require.NoError(t, table.EncodeTo(table.filePath))
+
+recovered := NewRecoverSSTable(0)
+require.NoError(t, recovered.DecodeFrom(table.filePath))
+_, err := recovered.GetDataBlockFromFile(table.filePath)
+```
+
+Before the fix, the second read failed:
+
+```text
+read value failed: unexpected EOF
+decode DataBlock failed: read value data failed: unexpected EOF
+```
+
+### Root Cause
+
+`EncodeTo` serialized layout metadata that was stored on the `SSTable` object.
+During data-block encoding it added each encoded value size to
+`Footer.DataHandle.Size`:
+
+```go
+t.Footer.DataHandle.Size += size
+```
+
+That is correct for one encode pass, but not for repeated encodes. The second
+pass started with the previous size already present, so the footer claimed the
+data block was larger than the bytes actually written in the current file.
+
+When recovery later trusted that footer, it read past the data block and into
+the index/footer area, where value decoding correctly failed.
+
+### Fix
+
+The encoder now resets all derived file-layout metadata before writing:
+
+```go
+func (t *SSTable) resetFileLayout() {
+    if t.Footer == nil {
+        t.Footer = block.NewFooter()
+        return
+    }
+    t.Footer.DataHandle = block.NewHandle(0, 0)
+    t.Footer.IndexHandle = block.NewHandle(0, 0)
+    for _, entry := range t.IndexBlock.Indexes {
+        entry.Offset = 0
+    }
+}
+```
+
+`EncodeTo` calls this before creating the temporary output file. The footer and
+index offsets are therefore derived only from the current write pass.
+
+### Principle
+
+Atomic SSTable publication has two layers:
+
+- publish only complete files, using temp file + fsync + close + rename;
+- serialize internally consistent metadata into those complete files.
+
+#104 fixed the first layer. #109 fixes the second layer for rewrite/retry paths.
+Even if production normally writes each SSTable object once, the encoder should
+remain deterministic and safe under retry, test, and maintenance tooling paths.
+
+### Validation
+
+Validation for #109:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run TestEncodeToCanRewriteSameTableWithoutStaleFooterState -count=1 -timeout=2m
+```
+
+and the wider LSM/storage regression:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=5m
+```

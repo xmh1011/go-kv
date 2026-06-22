@@ -439,6 +439,21 @@ SSTable recovery 也遵守已提交文件契约：
 API 把 size `0` 理解为“不限制读取”。SSTable 层才拥有文件格式语义：
 `Footer.DataHandle.Size == 0` 表示没有 data block 可读。
 
+`EncodeTo` 会把 footer handle 和每个 index entry 的 offset 当作“本次文件布局”
+推导出来的 metadata。每次 encode 前都必须重置：
+
+```go
+t.Footer.DataHandle = block.NewHandle(0, 0)
+t.Footer.IndexHandle = block.NewHandle(0, 0)
+for _, entry := range t.IndexBlock.Indexes {
+    entry.Offset = 0
+}
+```
+
+否则，同一个内存 SSTable 对象被重复写入时，旧的 footer size 可能被写进新的完整
+文件。原子 rename 只能防止读到半写文件，不能防止一个已经发布的完整文件内部
+metadata 不一致。
+
 ## 18. LSM 中的 Raft 日志 keyspace
 
 Raft 存储适配器把共识元数据和日志条目作为普通 LSM key 存储。keyspace 很小，并且是显式的。
@@ -491,6 +506,7 @@ firstIndex <= 可见日志索引 <= lastIndex
 | Compaction 目录清理 | 元数据引用已经删除的文件。 | 缺失文件可以剪掉元数据，但存在且损坏的文件仍然是硬错误。 |
 | WAL recovery 卫生 | 已提交 WAL 旁边残留临时文件或说明文件。 | 只重放 `{id}.wal`；忽略非 WAL 条目，损坏的已提交 WAL 必须失败。 |
 | SSTable 发布 | recovery 看到半写入表。 | 先写临时文件，fsync、close、rename 后再发布 metadata。 |
+| SSTable 重写 | 复用的内存表把旧 footer size 带进新文件。 | 每次 encode 前重置所有派生布局 metadata。 |
 
 这些防线在 review 中必须被当作正确性要求，而不是性能细节。
 
@@ -505,6 +521,7 @@ firstIndex <= 可见日志索引 <= lastIndex
 - Tombstone 必须遮蔽旧值，直到可以安全丢弃。
 - SSTable decode 在填充可复用结构前必须 reset。
 - SSTable 发布基于临时文件；只有最终 `.sst` 存在后才发布 metadata。
+- SSTable encoding 的 footer handle 和 index offset 必须来自当前写入过程，不能复用旧布局 metadata。
 - Compaction 元数据更新受 manager lock 保护。
 - 只有确认物理 SSTable 文件不存在时，才能剪掉 missing-file 元数据；存在但损坏的文件仍然必须报错。
 - Raft 日志读取必须遵守逻辑 `[firstIndex, lastIndex]` 窗口。

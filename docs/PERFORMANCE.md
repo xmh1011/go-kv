@@ -23,8 +23,8 @@ LSM compaction, client retries, and final data consistency.
 | Purpose | Command | Result |
 |---|---|---|
 | LSM/WAL recovery regression | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=5m` | Passed |
-| Full short unit/integration gate | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=25m` | Passed; `tests` package 779.477s |
-| Single 10-minute restart/snapshot trigger scenario | `GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1 -timeout=25m` | Passed in 606.884s |
+| Full short unit/integration gate | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=25m` | Passed; latest `tests` package 774.370s |
+| Single 10-minute restart/snapshot trigger scenario | `GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1 -timeout=25m` | Latest post-#109 run passed in 606.997s |
 | Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | Passed in 3672.630s |
 
 The short-mode behavior is now explicit: the 10-minute E2E tests skip when
@@ -59,6 +59,30 @@ The request stream still completed with zero failed operations, and final
 consistency passed. The warning is useful performance signal: write-heavy
 compaction or snapshot pressure can temporarily delay `lastApplied` catch-up,
 but the latest run did not expose data loss or divergence.
+
+## Post-#109 Focused Restart/Snapshot Replay
+
+After fixing SSTable rewrite metadata reset, the restart/snapshot trigger
+scenario was rerun under the race detector:
+
+| Field | Value |
+|---|---:|
+| Duration | 10m0s |
+| Total ops | 1,392,428 |
+| Failed ops | 0 |
+| Throughput | 2,320.71 ops/s |
+| P50 | 1.696541ms |
+| P95 | 3.19325ms |
+| P99 | 7.467875ms |
+| Leader changes | 84 |
+| Snapshot nodes | 3 |
+| Max snapshot index | 974,207 |
+| Final barrier | Passed |
+| Strict consistency | Passed, 3,600 node-key checks |
+
+This focused replay does not replace the six-scenario full regression above. It
+is the latest targeted evidence for the SSTable metadata fix because that bug
+affects the LSM file-layout boundary used by snapshot and restart paths.
 
 ## Correctness Gates
 
