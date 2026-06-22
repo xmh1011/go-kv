@@ -492,3 +492,103 @@ GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run TestEncodeToCanRewriteSam
 ```bash
 GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=5m
 ```
+
+## 16. 2026-06-22 Snapshot Apply 路径验证修复
+
+#111 是检查 LSM snapshot 安装路径时发现的。危险点不只是路径穿越，更大的正确性问题是：
+`ApplySnapshot` 在验证文件路径之前，已经关闭并删除了当前数据库。
+
+### 现象
+
+失败测试会把畸形 snapshot 安装到一个已有数据的数据库：
+
+```go
+adapter.Apply(param.LogEntry{Command: mustMarshal(param.KVCommand{
+    Op: param.OpSet, Key: "keep", Value: "value",
+})})
+
+snapData, _ := encodeSnapshotData(map[string][]byte{
+    "../escape.sst": []byte("not-a-valid-sstable"),
+})
+
+err := adapter.ApplySnapshot(snapData)
+```
+
+修复前 adapter 只打一条 warning，返回 nil，而且原 key 已经丢失：
+
+```text
+[LSMAdapter] Skipping invalid snapshot file path: ../escape.sst
+expected error but got nil
+key not found
+```
+
+### 根因
+
+旧实现是在写文件循环里检查路径：
+
+```go
+for relPath, content := range snapshotData {
+    if strings.Contains(relPath, "..") {
+        log.Warnf("Skipping invalid snapshot file path: %s", relPath)
+        continue
+    }
+    fullPath := filepath.Join(sstPath, relPath)
+    os.WriteFile(fullPath, content, 0644)
+}
+```
+
+这里有三个问题：
+
+- 非法路径被跳过，而不是拒绝整个 snapshot；
+- 检查发生在 `db.Close()` 和 `os.RemoveAll(dbPath)` 之后；
+- `strings.Contains("..")` 不是精确的路径策略。
+
+### 修复方案
+
+`ApplySnapshot` 现在会在任何破坏性操作前验证完整 snapshot manifest：
+
+```go
+filesToRestore, err := validateSnapshotFiles(sstPath, snapshotData)
+if err != nil {
+    return err
+}
+
+if err := lsm.db.Close(); err != nil {
+    return err
+}
+```
+
+validator 只接受清理后的相对路径，并要求路径仍在 snapshot SSTable 根目录下：
+
+```go
+cleanRel := filepath.Clean(relPath)
+if cleanRel == "." || cleanRel == ".." ||
+    strings.HasPrefix(cleanRel, ".."+string(os.PathSeparator)) {
+    return "", fmt.Errorf("invalid snapshot file path")
+}
+```
+
+它还会检查 join 后的绝对路径没有逃出 snapshot root。
+
+### 原理
+
+Raft snapshot 安装是本地状态机替换操作。在验证边界上，它应该像事务一样：
+
+- 畸形输入必须在触碰当前状态前被拒绝；
+- 只有完整验证过的文件清单才能安装；
+- 不能静默跳过 snapshot 的一部分后仍声称安装成功。
+
+### 验证
+
+#111 的验证命令：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm -run TestApplySnapshotRejectsInvalidFilePathBeforeClearingDB -count=1 -timeout=2m
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm -count=1 -timeout=3m
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=5m
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=25m
+GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1 -timeout=25m
+```
+
+聚焦 10 分钟重放完成：总操作 1,104,337，失败操作 0，最终 barrier 成功，
+3,600 个严格 node-key 一致性检查通过。

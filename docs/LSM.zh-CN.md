@@ -507,6 +507,7 @@ firstIndex <= 可见日志索引 <= lastIndex
 | WAL recovery 卫生 | 已提交 WAL 旁边残留临时文件或说明文件。 | 只重放 `{id}.wal`；忽略非 WAL 条目，损坏的已提交 WAL 必须失败。 |
 | SSTable 发布 | recovery 看到半写入表。 | 先写临时文件，fsync、close、rename 后再发布 metadata。 |
 | SSTable 重写 | 复用的内存表把旧 footer size 带进新文件。 | 每次 encode 前重置所有派生布局 metadata。 |
+| Snapshot apply | 畸形 snapshot 路径清空本地状态机。 | 关闭或删除当前 DB 前先验证完整 snapshot 路径清单。 |
 
 这些防线在 review 中必须被当作正确性要求，而不是性能细节。
 
@@ -526,6 +527,7 @@ firstIndex <= 可见日志索引 <= lastIndex
 - 只有确认物理 SSTable 文件不存在时，才能剪掉 missing-file 元数据；存在但损坏的文件仍然必须报错。
 - Raft 日志读取必须遵守逻辑 `[firstIndex, lastIndex]` 窗口。
 - 快照导出和应用不能与状态机写入并发冲突。
+- Snapshot apply 必须在破坏性替换开始前验证完整文件清单；非法路径是硬错误，不能跳过。
 
 大多数存储 bug 都是这些不变量之一被破坏。
 
