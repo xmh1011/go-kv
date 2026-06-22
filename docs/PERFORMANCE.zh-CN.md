@@ -20,8 +20,8 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 | 目的 | 命令 | 结果 |
 |---|---|---|
 | LSM/WAL recovery 回归 | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=5m` | 通过 |
-| 全量 short 单元/集成门禁 | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=25m` | 通过；`tests` 包 779.477s |
-| 单个 10 分钟重启/快照触发场景 | `GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1 -timeout=25m` | 606.884s 通过 |
+| 全量 short 单元/集成门禁 | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=25m` | 通过；最新 `tests` 包 774.370s |
+| 单个 10 分钟重启/快照触发场景 | `GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1 -timeout=25m` | 最新 post-#109 运行 606.997s 通过 |
 | 全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | 3672.630s 通过 |
 
 现在 short 模式行为是明确的：10 分钟 E2E 在 `testing.Short()` 下会跳过。这样 `go test -short ./...` 可以继续作为 PR 覆盖率入口，而真实 10 分钟场景必须显式运行。
@@ -48,6 +48,28 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 请求流最终仍然是 0 失败，并且最终一致性通过。这个日志是有价值的性能信号：
 写入密集 compaction 或 snapshot 压力会短暂拖慢 `lastApplied` 追赶，但最新运行没有
 暴露数据丢失或节点分歧。
+
+## #109 后的重启/快照聚焦重放
+
+修复 SSTable 重写 metadata reset 后，重新在 race detector 下跑了重启/快照触发场景：
+
+| 项目 | 值 |
+|---|---:|
+| 时长 | 10m0s |
+| 总操作数 | 1,392,428 |
+| 失败操作 | 0 |
+| 吞吐量 | 2,320.71 ops/s |
+| P50 | 1.696541ms |
+| P95 | 3.19325ms |
+| P99 | 7.467875ms |
+| Leader 切换 | 84 |
+| 快照节点数 | 3 |
+| 最大快照 index | 974,207 |
+| 最终 barrier | 通过 |
+| 严格一致性 | 通过，3,600 个 node-key 检查 |
+
+这次聚焦重放不替代上面的六场景全量回归。它是 #109 SSTable metadata 修复的最新
+定向证据，因为该问题影响 snapshot 和 restart 路径会使用到的 LSM 文件布局边界。
 
 ## 正确性门禁
 

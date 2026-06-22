@@ -406,3 +406,89 @@ if _, err := strconv.ParseUint(idPart, 10, 64); err != nil {
 - 3 个节点产生 snapshot，leader 切换 46 次。
 
 完整包级和长时间 E2E 验证命令记录在 [PERFORMANCE.zh-CN.md](PERFORMANCE.zh-CN.md)。
+
+## 15. 2026-06-22 SSTable 重写 metadata 修复
+
+#109 是在 #102-#107 合并后的下一轮 LSM 深测中发现的。检查目标是一个很窄但很关键
+的文件格式不变量：同一个内存 SSTable 编码两次，每次产出的文件都必须能被正确读取。
+
+### 现象
+
+回归测试会把同一个 table 对象写两次，再重新加载：
+
+```go
+table := createSampleSSTable(0, tempDir, pairs)
+
+require.NoError(t, table.EncodeTo(table.filePath))
+require.NoError(t, table.EncodeTo(table.filePath))
+
+recovered := NewRecoverSSTable(0)
+require.NoError(t, recovered.DecodeFrom(table.filePath))
+_, err := recovered.GetDataBlockFromFile(table.filePath)
+```
+
+修复前第二次读取失败：
+
+```text
+read value failed: unexpected EOF
+decode DataBlock failed: read value data failed: unexpected EOF
+```
+
+### 根因
+
+`EncodeTo` 会把存放在 `SSTable` 对象上的布局 metadata 序列化进文件。写 data block
+时，它会累加本次写入的 value size：
+
+```go
+t.Footer.DataHandle.Size += size
+```
+
+单次 encode 这是对的，但重复 encode 时就不对。第二次写入开始时，上一次的 size 已经
+留在 footer 里，于是新文件的 footer 声称 data block 比实际写入的字节更大。
+
+恢复过程信任 footer 后，就会越过 data block 继续读到 index/footer 区域，value decoder
+最终正确报 `unexpected EOF`。
+
+### 修复方案
+
+encoder 现在每次写入前重置所有派生文件布局 metadata：
+
+```go
+func (t *SSTable) resetFileLayout() {
+    if t.Footer == nil {
+        t.Footer = block.NewFooter()
+        return
+    }
+    t.Footer.DataHandle = block.NewHandle(0, 0)
+    t.Footer.IndexHandle = block.NewHandle(0, 0)
+    for _, entry := range t.IndexBlock.Indexes {
+        entry.Offset = 0
+    }
+}
+```
+
+`EncodeTo` 在创建临时输出文件前调用它。这样 footer 和 index offset 只来自当前写入过程。
+
+### 原理
+
+SSTable 原子发布有两层：
+
+- 只发布完整文件：temp file + fsync + close + rename；
+- 完整文件内部也必须有一致的 metadata。
+
+#104 修的是第一层；#109 修的是 rewrite/retry 路径下的第二层。即使生产路径通常一个
+SSTable 对象只写一次，encoder 也应该在重试、测试和维护工具路径中保持确定性。
+
+### 验证
+
+#109 的验证命令：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run TestEncodeToCanRewriteSameTableWithoutStaleFooterState -count=1 -timeout=2m
+```
+
+以及更宽的 LSM/storage 回归：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=5m
+```

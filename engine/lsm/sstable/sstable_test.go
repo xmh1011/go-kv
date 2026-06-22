@@ -145,6 +145,31 @@ func TestEncodeToPublishesOnlyFinalSSTable(t *testing.T) {
 	assert.NoError(t, recovered.DecodeFrom(table.filePath))
 }
 
+func TestEncodeToCanRewriteSameTableWithoutStaleFooterState(t *testing.T) {
+	tempDir := setupTestEnv(t)
+	defer cleanupTestEnv(t, tempDir)
+
+	pairs := []*kv.KeyValuePair{
+		{Key: "key1", Value: []byte("value1")},
+		{Key: "key2", Value: []byte("value2")},
+	}
+	table := createSampleSSTable(0, tempDir, pairs)
+
+	assert.NoError(t, table.EncodeTo(table.filePath))
+	assert.NoError(t, table.EncodeTo(table.filePath))
+
+	recovered := NewRecoverSSTable(0)
+	assert.NoError(t, recovered.DecodeFrom(table.filePath))
+
+	loadedPairs, err := recovered.GetDataBlockFromFile(table.filePath)
+	assert.NoError(t, err)
+	assert.Len(t, loadedPairs, len(pairs))
+	for i, pair := range pairs {
+		assert.Equal(t, pair.Key, loadedPairs[i].Key)
+		assert.Equal(t, pair.Value, loadedPairs[i].Value)
+	}
+}
+
 func TestDecodeBlocks(t *testing.T) {
 	tempDir := setupTestEnv(t)
 	defer cleanupTestEnv(t, tempDir)

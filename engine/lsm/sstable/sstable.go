@@ -132,6 +132,7 @@ func (t *SSTable) EncodeTo(filePath string) error {
 		log.Errorf("[SSTable] create directory %s error: %s", dir, err.Error())
 		return fmt.Errorf("create directory failed: %w", err)
 	}
+	t.resetFileLayout()
 
 	tmpFile, err := os.CreateTemp(dir, "."+filepath.Base(filePath)+".*.tmp")
 	if err != nil {
@@ -208,6 +209,18 @@ func (t *SSTable) EncodeTo(filePath string) error {
 	}
 	t.filePath = filePath
 	return nil
+}
+
+func (t *SSTable) resetFileLayout() {
+	if t.Footer == nil {
+		t.Footer = block.NewFooter()
+		return
+	}
+	t.Footer.DataHandle = block.NewHandle(0, 0)
+	t.Footer.IndexHandle = block.NewHandle(0, 0)
+	for _, entry := range t.IndexBlock.Indexes {
+		entry.Offset = 0
+	}
 }
 
 func syncDirectory(dir string) error {
