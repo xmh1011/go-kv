@@ -17,6 +17,11 @@ import (
 func (r *Raft) InstallSnapshot(args *param.InstallSnapshotArgs, reply *param.InstallSnapshotReply) error {
 	// 1. 快速任期检查（短锁）
 	r.mu.Lock()
+	if r.getState() == Dead {
+		reply.Term = r.currentTerm
+		r.mu.Unlock()
+		return nil
+	}
 	if args.Term < r.currentTerm {
 		reply.Term = r.currentTerm
 		r.mu.Unlock()

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/xmh1011/go-kv/engine/lsm/kv"
 	"github.com/xmh1011/go-kv/pkg/config"
@@ -44,6 +45,62 @@ func TestMemTableBuilderInsertAndEviction(t *testing.T) {
 	// 验证当前 MemTable 仍可写入
 	ok := manager.CanInsert(kv.KeyValuePair{Key: "z", Value: []byte("zzz")})
 	assert.True(t, ok, "should still allow insert to new MemTable")
+}
+
+func TestRecoverDoesNotResetLiveManagerIDs(t *testing.T) {
+	ResetIDGenerator()
+
+	live := NewMemTableManager(t.TempDir())
+	assert.NoError(t, live.Mem.Insert(kv.KeyValuePair{Key: "first", Value: []byte("value")}))
+	live.ForcePromote()
+	previousActiveID := live.Mem.ID()
+
+	assert.NoError(t, live.Mem.Insert(kv.KeyValuePair{Key: "second", Value: []byte("value")}))
+
+	otherDir := t.TempDir()
+	otherMem := NewMemTable(1, otherDir)
+	assert.NoError(t, otherMem.Insert(kv.KeyValuePair{Key: "other", Value: []byte("value")}))
+	assert.NoError(t, otherMem.Close())
+
+	other := &Manager{
+		walPath:           otherDir,
+		IMems:             make([]*IMemTable, 0),
+		maxIMemTableCount: config.Conf.LSM.MaxIMemTableCount,
+		flushing:          make(map[uint64]bool),
+	}
+	assert.NoError(t, other.Recover())
+	defer other.Close()
+
+	live.ForcePromote()
+
+	assert.Greater(t, live.Mem.ID(), previousActiveID, "recovering another manager must not make a live manager reuse its active WAL ID")
+}
+
+func TestRecoverIgnoresNonWALDirectoryEntries(t *testing.T) {
+	dir := t.TempDir()
+
+	valid := NewMemTable(2, dir)
+	assert.NoError(t, valid.Insert(kv.KeyValuePair{Key: "valid", Value: []byte("value")}))
+	assert.NoError(t, valid.Close())
+
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, "3.wal.tmp"), []byte("partial"), 0644))
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("not a wal"), 0644))
+	assert.NoError(t, os.Mkdir(filepath.Join(dir, "4.wal"), 0755))
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, "5.extra.wal"), []byte("not a committed wal"), 0644))
+
+	manager := &Manager{
+		walPath:           dir,
+		IMems:             make([]*IMemTable, 0),
+		maxIMemTableCount: config.Conf.LSM.MaxIMemTableCount,
+		flushing:          make(map[uint64]bool),
+	}
+	require.NoError(t, manager.Recover())
+	defer manager.Close()
+
+	value, found := manager.Search("valid")
+	assert.True(t, found)
+	assert.Equal(t, kv.Value("value"), value)
+	assert.Equal(t, uint64(2), manager.Mem.ID())
 }
 
 func TestInsertTriggersPromotion(t *testing.T) {
@@ -159,18 +216,14 @@ func TestRecoverSuccess(t *testing.T) {
 	_ = os.Remove(lastFile) // 先删了，再做下个测试用
 }
 
-// 模拟 WAL 恢复失败（用空文件名，必定失败）
+// 模拟 WAL 恢复失败（合法 WAL 文件名但内容损坏，必须失败）
 func TestRecoverFromWALFail(t *testing.T) {
 	tempDir := t.TempDir()
 
-	// 创建一个非法文件名
-	fname := filepath.Join(tempDir, "invalid.wal")
-	f, err := os.Create(fname)
-	assert.NoError(t, err)
-	assert.NoError(t, f.Close(), "WAL file should be created")
+	assert.NoError(t, os.WriteFile(filepath.Join(tempDir, "2.wal"), []byte("corrupt"), 0644))
 
 	manager := NewMemTableManager(tempDir)
 
-	err = manager.Recover()
+	err := manager.Recover()
 	assert.Error(t, err)
 }

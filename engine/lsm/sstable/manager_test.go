@@ -49,6 +49,99 @@ func TestSSTableManagerCreateNewSSTable(t *testing.T) {
 	assert.True(t, os.IsNotExist(err), "WAL 文件应被 Clean 删除")
 }
 
+func TestSSTableManagerCreateNewSSTableSkipsEmptyIMemTable(t *testing.T) {
+	tmp := t.TempDir()
+	manager := NewSSTableManager(tmp)
+
+	mem := memtable.NewMemTableWithoutWAL()
+	imem := memtable.NewIMemTable(mem)
+
+	assert.NoError(t, manager.CreateNewSSTable(imem))
+	assert.Empty(t, manager.getFilesByLevel(0))
+}
+
+func TestSSTableManagerRecoverDoesNotResetLiveManagerIDs(t *testing.T) {
+	ResetIDGenerator()
+
+	liveDir := t.TempDir()
+	live := NewSSTableManager(liveDir)
+	assert.NoError(t, live.CreateNewSSTable(testIMemWithPair("live-0", "value-0")))
+	assert.NoError(t, live.CreateNewSSTable(testIMemWithPair("live-1", "value-1")))
+	assert.NoError(t, live.CreateNewSSTable(testIMemWithPair("live-2", "value-2")))
+
+	value, found, err := live.Search("live-1")
+	assert.NoError(t, err)
+	if !assert.True(t, found, "precondition: live key should exist before another manager recovers") {
+		return
+	}
+	assert.Equal(t, "value-1", string(value))
+
+	otherDir := t.TempDir()
+	writeRecoverableSSTableWithID(t, otherDir, 1, "other", "value")
+	other := NewSSTableManager(otherDir)
+	assert.NoError(t, other.Recover())
+
+	assert.NoError(t, live.CreateNewSSTable(testIMemWithPair("live-new", "value-new")))
+
+	value, found, err = live.Search("live-1")
+	assert.NoError(t, err)
+	assert.True(t, found, "recovering another manager must not make live manager reuse and overwrite an existing SSTable ID")
+	assert.Equal(t, "value-1", string(value))
+}
+
+func TestSSTableManagerRecoverIgnoresUncommittedTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	writeRecoverableSSTableWithID(t, dir, 1, "stable", "value")
+
+	tempPath := filepath.Join(dir, "0-level", ".2.sst.12345.tmp")
+	assert.NoError(t, os.WriteFile(tempPath, []byte{1, 2, 3}, 0644))
+
+	manager := NewSSTableManager(dir)
+	assert.NoError(t, manager.Recover())
+
+	files := manager.getFilesByLevel(0)
+	assert.Len(t, files, 1)
+	assert.Equal(t, sstableFilePath(1, 0, dir), files[0])
+
+	value, found, err := manager.Search("stable")
+	assert.NoError(t, err)
+	assert.True(t, found)
+	assert.Equal(t, "value", string(value))
+}
+
+func TestSSTableManagerRecoverRemovesEmptySSTables(t *testing.T) {
+	dir := t.TempDir()
+	writeRecoverableSSTableWithID(t, dir, 1, "stable", "value")
+
+	empty := NewSSTableBuilderWithID(2, 0, dir).Build()
+	assert.NoError(t, empty.EncodeTo(empty.FilePath()))
+
+	manager := NewSSTableManager(dir)
+	assert.NoError(t, manager.Recover())
+
+	files := manager.getFilesByLevel(0)
+	assert.Len(t, files, 1)
+	assert.Equal(t, sstableFilePath(1, 0, dir), files[0])
+	assert.NoFileExists(t, empty.FilePath())
+}
+
+func testIMemWithPair(key string, value string) *memtable.IMemTable {
+	mem := memtable.NewMemTableWithoutWAL()
+	mem.AddPair(kv.KeyValuePair{Key: kv.Key(key), Value: []byte(value)})
+	return memtable.NewIMemTable(mem)
+}
+
+func writeRecoverableSSTableWithID(t *testing.T, dir string, id uint64, key string, value string) {
+	t.Helper()
+
+	builder := NewSSTableBuilderWithID(id, 0, dir)
+	builder.Add(&kv.KeyValuePair{Key: kv.Key(key), Value: []byte(value)})
+	table := builder.Build()
+	if err := table.EncodeTo(table.FilePath()); err != nil {
+		t.Fatalf("failed to write recoverable sstable: %v", err)
+	}
+}
+
 func TestSSTableManagerOpenFilesSnapshotReleasesManagerLock(t *testing.T) {
 	tmp := t.TempDir()
 

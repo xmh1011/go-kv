@@ -127,44 +127,47 @@ func (t *SSTable) DecodeFrom(filePath string) error {
 
 // EncodeTo 将 SSTable 的各个部分（DataBlocks、IndexBlock、FilterBlock、Footer）依次写入文件中
 func (t *SSTable) EncodeTo(filePath string) error {
-	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
-		log.Errorf("[SSTable] create directory %s error: %s", filepath.Dir(filePath), err.Error())
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Errorf("[SSTable] create directory %s error: %s", dir, err.Error())
 		return fmt.Errorf("create directory failed: %w", err)
 	}
-	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+
+	tmpFile, err := os.CreateTemp(dir, "."+filepath.Base(filePath)+".*.tmp")
 	if err != nil {
-		log.Errorf("[SSTable] open file %s error: %s", filePath, err.Error())
+		log.Errorf("[SSTable] create temp file for %s error: %s", filePath, err.Error())
 		return fmt.Errorf("open file error: %w", err)
 	}
-	defer func(file *os.File) {
-		err := file.Close()
-		if err != nil {
-			log.Errorf("[SSTable] close file %s error: %s", filePath, err.Error())
+	tmpPath := tmpFile.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
 		}
-	}(file)
-	t.filePath = filePath
+	}()
 
-	if err = t.Header.EncodeTo(file); err != nil {
+	if err = t.Header.EncodeTo(tmpFile); err != nil {
 		log.Errorf("[SSTable] encode Header to file %s error: %s", filePath, err.Error())
 		return fmt.Errorf("encode Header failed: %w", err)
 	}
 
-	if err = t.FilterBlock.EncodeTo(file); err != nil {
+	if err = t.FilterBlock.EncodeTo(tmpFile); err != nil {
 		log.Errorf("[SSTable] encode FilterBlock to file %s error: %s", filePath, err.Error())
 		return fmt.Errorf("encode FilterBlock failed: %w", err)
 	}
 
 	// 记录 DataBlock 的起始偏移量和大小
-	if t.Footer.DataHandle.Offset, err = file.Seek(0, io.SeekCurrent); err != nil {
+	if t.Footer.DataHandle.Offset, err = tmpFile.Seek(0, io.SeekCurrent); err != nil {
 		log.Errorf("[SSTable] seek to index block position error: %s", err.Error())
 		return fmt.Errorf("seek to index block position failed: %w", err)
 	}
 	for i, value := range t.DataBlock.Entries {
-		if t.IndexBlock.Indexes[i].Offset, err = file.Seek(0, io.SeekCurrent); err != nil {
+		if t.IndexBlock.Indexes[i].Offset, err = tmpFile.Seek(0, io.SeekCurrent); err != nil {
 			log.Errorf("[SSTable] seek to current position error: %s", err.Error())
 			return fmt.Errorf("seek to current position failed: %w", err)
 		}
-		size, err := value.EncodeTo(file)
+		size, err := value.EncodeTo(tmpFile)
 		if err != nil {
 			log.Errorf("[SSTable] encode DataBlock to file %s error: %s", filePath, err.Error())
 			return fmt.Errorf("encode DataBlock failed: %w", err)
@@ -173,21 +176,51 @@ func (t *SSTable) EncodeTo(filePath string) error {
 	}
 
 	// 记录 IndexBlock 的起始偏移量和大小
-	if t.Footer.IndexHandle.Offset, err = file.Seek(0, io.SeekCurrent); err != nil {
+	if t.Footer.IndexHandle.Offset, err = tmpFile.Seek(0, io.SeekCurrent); err != nil {
 		log.Errorf("[SSTable] seek to index block position error: %s", err.Error())
 		return fmt.Errorf("seek to index block position failed: %w", err)
 	}
-	if t.Footer.IndexHandle.Size, err = t.IndexBlock.Encode(file); err != nil {
+	if t.Footer.IndexHandle.Size, err = t.IndexBlock.Encode(tmpFile); err != nil {
 		log.Errorf("[SSTable] encode IndexBlock to file %s error: %s", filePath, err.Error())
 		return fmt.Errorf("encode IndexBlock failed: %w", err)
 	}
 
-	if err = t.Footer.EncodeTo(file); err != nil {
+	if err = t.Footer.EncodeTo(tmpFile); err != nil {
 		log.Errorf("[SSTable] encode Footer to file %s error: %s", filePath, err.Error())
 		return fmt.Errorf("encode Footer failed: %w", err)
 	}
 
+	if err = tmpFile.Sync(); err != nil {
+		log.Errorf("[SSTable] sync temp file %s error: %s", tmpPath, err.Error())
+		return fmt.Errorf("sync file failed: %w", err)
+	}
+	if err = tmpFile.Close(); err != nil {
+		log.Errorf("[SSTable] close temp file %s error: %s", tmpPath, err.Error())
+		return fmt.Errorf("close file failed: %w", err)
+	}
+	if err = os.Rename(tmpPath, filePath); err != nil {
+		log.Errorf("[SSTable] rename temp file %s to %s error: %s", tmpPath, filePath, err.Error())
+		return fmt.Errorf("rename temp sstable failed: %w", err)
+	}
+	committed = true
+	if err = syncDirectory(dir); err != nil {
+		log.Warnf("[SSTable] sync directory %s after publishing %s failed: %s", dir, filePath, err.Error())
+	}
+	t.filePath = filePath
 	return nil
+}
+
+func syncDirectory(dir string) error {
+	file, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			log.Warnf("[SSTable] close directory %s after sync failed: %s", dir, closeErr.Error())
+		}
+	}()
+	return file.Sync()
 }
 
 func (t *SSTable) DecodeFooterFrom(file *os.File) error {
@@ -215,6 +248,9 @@ func (t *SSTable) DecodeDataBlock(file *os.File) error {
 		return fmt.Errorf("seek to IndexBlock position failed: %w", err)
 	}
 	t.DataBlock = block.NewDataBlock()
+	if t.Footer.DataHandle.Size == 0 {
+		return nil
+	}
 	if err := t.DataBlock.DecodeFrom(file, t.Footer.DataHandle.Size); err != nil {
 		log.Errorf("[SSTable] decode DataBlock from file error: %s", err.Error())
 		return fmt.Errorf("decode DataBlock failed: %w", err)

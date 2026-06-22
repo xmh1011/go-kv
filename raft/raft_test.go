@@ -14,6 +14,7 @@ import (
 	"github.com/xmh1011/go-kv/pkg/config"
 	"github.com/xmh1011/go-kv/pkg/param"
 	"github.com/xmh1011/go-kv/pkg/storage"
+	memorystore "github.com/xmh1011/go-kv/pkg/storage/inmemory"
 	"github.com/xmh1011/go-kv/pkg/storage/kvstore"
 	"github.com/xmh1011/go-kv/pkg/transport"
 )
@@ -29,6 +30,63 @@ func TestNewRaft_RecoveryState(t *testing.T) {
 	r := NewRaft(1, []int{2, 3}, mockStore, nil, nil, nil)
 	assert.Equal(t, persistedState.CurrentTerm, r.currentTerm, "recovered term should match")
 	assert.Equal(t, int(persistedState.VotedFor), r.votedFor, "recovered votedFor should match")
+}
+
+type recordingStateMachine struct {
+	mu        sync.Mutex
+	applied   []uint64
+	appliedCh chan uint64
+}
+
+func newRecordingStateMachine() *recordingStateMachine {
+	return &recordingStateMachine{appliedCh: make(chan uint64, 8)}
+}
+
+func (sm *recordingStateMachine) Apply(entry param.LogEntry) any {
+	sm.mu.Lock()
+	sm.applied = append(sm.applied, entry.Index)
+	sm.mu.Unlock()
+	sm.appliedCh <- entry.Index
+	return nil
+}
+
+func (sm *recordingStateMachine) Get(string) (string, error) {
+	return "", kvstore.ErrKeyNotFound
+}
+
+func (sm *recordingStateMachine) GetSnapshot() ([]byte, error) {
+	return nil, nil
+}
+
+func (sm *recordingStateMachine) ApplySnapshot([]byte) error {
+	return nil
+}
+
+func TestNewRaftAppliesPersistedCommitIndexOnRestart(t *testing.T) {
+	store := memorystore.NewStorage()
+	assert.NoError(t, store.AppendEntries([]param.LogEntry{
+		{Term: 1, Index: 1, Command: []byte("cmd-1")},
+		{Term: 1, Index: 2, Command: []byte("cmd-2")},
+	}))
+	assert.NoError(t, store.SetState(param.HardState{CurrentTerm: 1, VotedFor: math.MaxUint64, CommitIndex: 2}))
+
+	sm := newRecordingStateMachine()
+	r := NewRaft(1, []int{2, 3}, store, sm, nil, make(chan param.CommitEntry, 2))
+	defer r.Stop()
+
+	for _, expected := range []uint64{1, 2} {
+		select {
+		case got := <-sm.appliedCh:
+			assert.Equal(t, expected, got)
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for restored committed entry %d to apply", expected)
+		}
+	}
+	assert.Eventually(t, func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.commitIndex == 2 && r.lastApplied == 2
+	}, time.Second, 10*time.Millisecond)
 }
 
 func TestSubmit(t *testing.T) {
@@ -66,6 +124,7 @@ func TestSubmit(t *testing.T) {
 					DoAndReturn(func(index uint64) (*param.LogEntry, error) {
 						return &param.LogEntry{Term: 2, Index: index}, nil
 					}).AnyTimes()
+				s.EXPECT().SetState(gomock.Any()).Return(nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
 
 				wg.Add(2) // 2 peers
@@ -191,6 +250,7 @@ func TestChangeConfig(t *testing.T) {
 					DoAndReturn(func(index uint64) (*param.LogEntry, error) {
 						return &param.LogEntry{Term: 3, Index: index}, nil
 					}).AnyTimes()
+				s.EXPECT().SetState(gomock.Any()).Return(nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
 
 				// 4 unique peers: 2, 3, 4, 5 (1 is self)
@@ -689,6 +749,7 @@ func TestClientRequest_ReadWriteBranching(t *testing.T) {
 		mockStore.EXPECT().GetEntry(uint64(1)).Return(&param.LogEntry{Term: 1, Index: 1}, nil).AnyTimes()
 		appliedCmd := param.NewClientCommand(args.ClientID, args.SequenceNum, setCmd)
 		mockStore.EXPECT().GetEntry(uint64(2)).Return(&param.LogEntry{Command: appliedCmd, Term: 1, Index: 2}, nil).AnyTimes()
+		mockStore.EXPECT().SetState(gomock.Any()).Return(nil).AnyTimes()
 
 		mockSM.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
 
@@ -1024,6 +1085,79 @@ func TestRun_StopShutsDownLoop(t *testing.T) {
 
 	// 尝试再次 Stop (应该无操作)
 	r.Stop()
+}
+
+func TestStopWaitsForInFlightAppendEntriesStorageIO(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
+
+	appendStarted := make(chan struct{})
+	releaseAppend := make(chan struct{})
+	gomock.InOrder(
+		mockStore.EXPECT().GetEntry(uint64(1)).Return(nil, nil).Times(1),
+		mockStore.EXPECT().AppendEntries(gomock.Any()).
+			DoAndReturn(func(entries []param.LogEntry) error {
+				close(appendStarted)
+				<-releaseAppend
+				return nil
+			}).Times(1),
+	)
+
+	r := NewRaft(1, []int{2, 3}, mockStore, nil, nil, make(chan param.CommitEntry, 1))
+	r.currentTerm = 1
+	r.setState(Follower)
+
+	appendDone := make(chan struct{})
+	go func() {
+		reply := param.NewAppendEntriesReply()
+		_ = r.AppendEntries(&param.AppendEntriesArgs{
+			Term:         1,
+			LeaderID:     2,
+			PrevLogIndex: 0,
+			PrevLogTerm:  0,
+			LeaderCommit: 0,
+			Entries: []param.LogEntry{
+				{Index: 1, Term: 1, Command: "cmd"},
+			},
+		}, reply)
+		assert.False(t, reply.Success, "stopped node must not acknowledge an AppendEntries that completed after Stop")
+		close(appendDone)
+	}()
+
+	select {
+	case <-appendStarted:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("AppendEntries did not reach storage append")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		r.Stop()
+		close(stopDone)
+	}()
+
+	select {
+	case <-stopDone:
+		t.Fatal("Stop returned before in-flight AppendEntries storage I/O completed")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(releaseAppend)
+
+	select {
+	case <-appendDone:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("AppendEntries did not finish after storage append was released")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Stop did not return after in-flight AppendEntries completed")
+	}
 }
 
 // TestTimeoutResets 验证在所有必要情况下选举超时都会被重置。

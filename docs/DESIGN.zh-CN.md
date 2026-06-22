@@ -245,6 +245,20 @@ Raft 需要从进程崩溃中恢复。恢复依赖三层数据：
 
 LSM-backed Raft 日志使用带 magic header 的紧凑二进制格式。这避免了每次追加/读取日志都走 gob 反射路径。
 
+恢复边界必须非常明确：
+
+- Raft 会在启动 apply loop 前恢复持久化的 `commitIndex`，这样重启前已经
+  durable 且 committed 的 entry 会在节点恢复后继续被 apply。
+- MemTable recovery 只重放命名为 `{id}.wal` 的已提交 WAL 文件。WAL 目录里的
+  临时文件、目录和无关文件会被忽略。
+- SSTable recovery 只加载已提交的 `.sst` 文件，忽略未提交的临时文件，并移除
+  没有可恢复数据的旧空 SSTable。
+- SSTable 发布先在同目录写临时文件，sync 并 close 后 rename 成最终 `.sst`
+  名称，然后再发布内存 metadata。读者应该看到旧 catalog 或新 catalog，
+  不能看到半写入文件。
+- MemTable 和 SSTable ID 分配是每个 manager 实例本地的。恢复另一个数据库
+  不能重置仍在运行的数据库 ID。
+
 ## 13. 快照
 
 快照用于限制 Raft 日志增长。
@@ -301,6 +315,10 @@ make long-test
 - 正在 flush 的 immutable memtable 必须保持可搜索，直到 SSTable 安全发布。
 - tombstone 必须遮蔽旧值，直到 compaction 可以安全丢弃它。
 - 从读者视角看，SSTable 元数据更新必须是原子的。
+- WAL recovery 必须忽略非提交目录项；但如果某个已提交 `{id}.wal` 文件内容
+  损坏，仍然必须失败。
+- Raft `Stop()` 必须等待 in-flight apply、snapshot、AppendEntries 和
+  state-machine storage 临界区结束后，调用方才能关闭或重新打开存储。
 
 保持这些不变量比优化某一条局部路径更重要。
 

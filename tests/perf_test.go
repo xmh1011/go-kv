@@ -66,6 +66,14 @@ func newPerfCluster(t *testing.T, nodeCount int) *perfCluster {
 		c.commitChans[i] = make(chan param.CommitEntry, 1000)
 		c.peerMap[id] = c.transports[i].Addr()
 
+		go func(ch chan param.CommitEntry) {
+			for range ch {
+				// Raft applies entries before publishing commit notifications.
+				// These performance tests read state machines directly, so the
+				// channel only needs to be drained to avoid apply backpressure.
+			}
+		}(c.commitChans[i])
+
 		rf := raft.NewRaft(id, initialPeerIDs, store, sm, c.transports[i], c.commitChans[i])
 		c.nodes[i] = rf
 

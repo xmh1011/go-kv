@@ -172,10 +172,23 @@ WAL before being inserted into the skiplist.
 
 On recovery:
 
-1. WAL files are read by ID order.
-2. Older WAL files become immutable memtables.
-3. The newest WAL file becomes the active memtable.
-4. Tombstones are replayed like normal records.
+1. Only committed WAL files named `{id}.wal` are selected. Directories, temp
+   files such as `3.wal.tmp`, and unrelated files are ignored.
+2. The selected WAL files are read by ID order.
+3. Older WAL files become immutable memtables.
+4. The newest WAL file becomes the active memtable.
+5. Tombstones are replayed like normal records.
+
+A file that matches the committed WAL contract but contains corrupt bytes is
+still a hard recovery error. Ignoring non-WAL directory entries is a filesystem
+hygiene rule; it is not a fallback for damaged committed data.
+
+```go
+files = filterWALFiles(files)
+sort.Slice(files, func(i, j int) bool {
+    return utils.ExtractID(files[i].Name()) < utils.ExtractID(files[j].Name())
+})
+```
 
 The WAL protects recent writes that have not yet been flushed to SSTables.
 
@@ -442,7 +455,10 @@ immutable memtable
 BuildSSTableFromIMemTable
         |
         v
-EncodeTo(file)
+EncodeTo(temp file in the same directory)
+        |
+        v
+fsync + close + rename to final .sst
         |
         v
 addTable(sst) publishes metadata under Manager.mu
@@ -459,6 +475,18 @@ Recovery also has an ordering rule. Level 0 tables can overlap, so the newest
 table must be searched first. `Recover` sorts files by ascending ID and then
 uses `addTable`, which inserts at the front. The result after recovery is still
 newest-first lookup.
+
+SSTable recovery follows the same committed-file contract as WAL recovery:
+
+- only final `.sst` files with parseable IDs are loaded;
+- uncommitted temp files are ignored;
+- legacy empty SSTables with no data/index payload are removed;
+- a non-empty corrupt `.sst` remains a hard error.
+
+An empty SSTable is not decoded by passing size `0` into the generic
+`DataBlock.DecodeFrom` API, because that lower-level API treats size `0` as
+"unlimited". The SSTable layer owns the file-format meaning:
+`Footer.DataHandle.Size == 0` means there is no data block to read.
 
 ## 18. Raft Log Keyspace In LSM
 
@@ -518,6 +546,8 @@ or file encoding. They come from boundaries between modules:
 | Raft truncate/reappend | Old log payload and new log payload share an index. | Replacing an existing log key subtracts old size and writes the new value. |
 | Raft compaction | Apply loop asks for a compacted committed entry. | Raft must either skip through a covering snapshot or fail loudly if no snapshot covers it. |
 | Compaction catalog cleanup | Metadata references a file that was already removed. | Prune missing-file metadata, but still fail existing corrupt files. |
+| WAL recovery hygiene | Temp files or notes exist beside committed WAL files. | Replay only `{id}.wal`; ignore non-WAL entries and fail corrupt committed WALs. |
+| SSTable publication | Recovery sees a partially written table. | Publish via temp file, fsync, close, and rename before metadata publication. |
 
 These guardrails should be mentioned in code reviews. They are correctness
 requirements, not performance details.
@@ -527,10 +557,13 @@ requirements, not performance details.
 When modifying the LSM code, keep these invariants true:
 
 - WAL append happens before mutating the active memtable.
+- WAL recovery replays only committed `{id}.wal` files.
 - A flushing immutable memtable remains searchable until flush success.
 - Level 0 lookup order is newest to oldest.
 - Tombstones hide older values until it is safe to drop them.
 - SSTable decode resets reusable structures before filling them.
+- SSTable publication is temp-file based and metadata is published only after
+  the final `.sst` exists.
 - Compaction metadata updates are protected by manager locks.
 - Missing SSTable metadata can be pruned only after the physical file is
   confirmed absent; existing corrupt files remain hard errors.

@@ -75,9 +75,13 @@ const (
 - 日志条目；
 - 快照。
 
+Raft 论文通常把 `commitIndex` 作为易失状态。本实现额外把它写入
+`param.HardState`，这是面向 LSM 持久状态机的恢复增强：节点重启时会恢复
+durable commit index，并调度 apply 尚未推进到 `lastApplied` 的 committed log。
+
 运行中可重建的状态：
 
-- `commitIndex`：已知已提交的最高日志索引；
+- `commitIndex`：节点运行期间已知已提交的最高日志索引；
 - `lastApplied`：已应用到状态机的最高日志索引；
 - `nextIndex[peer]`：leader 下次发送给某个 follower 的日志索引；
 - `matchIndex[peer]`：某个 follower 已确认保存的最高日志索引；
@@ -245,7 +249,20 @@ Leader 可以在某个日志索引被多数派保存，并且该日志属于当�
 
 当前任期限制是 Raft 安全规则，用于避免 leader 仅靠复制数量错误提交旧任期日志。
 
-`commitIndex` 推进后，Raft 会唤醒 apply loop。
+`commitIndex` 推进后，Raft 会先持久化新的 HardState，再唤醒 apply loop：
+
+```go
+oldCommitIndex := r.commitIndex
+r.commitIndex = newCommitIndex
+if err := r.persistHardStateLocked(); err != nil {
+    r.commitIndex = oldCommitIndex
+    return false
+}
+r.startApplyLogsLocked()
+```
+
+持久化 commit index 是实现层 guardrail，不改变多数派提交规则；它只保证重启后
+不会忘记 durable committed entry 已经提交，从而继续 apply。
 
 ## 12. Apply Loop
 
@@ -533,7 +550,9 @@ Raft 是并发系统。主要规则：
 - `appendEntriesMu` 串行化 follower 日志修改；
 - `stateMachineMu` 串行化状态机 apply、快照导出和快照安装；
 - `lastAppliedCond` 唤醒等待 apply 进度的读请求；
-- `snapshotWG` 和 apply waiters 在 shutdown 时被收束。
+- `snapshotWG`、`applyWG` 和 apply waiters 在 shutdown 时被收束；
+- `Stop()` 还会等待 `stateMachineMu` 和 `appendEntriesMu` 保护的 in-flight
+  临界区，因为 RPC handler 可能在较慢的存储或状态机 I/O 期间释放 `r.mu`。
 
 修改代码时，应尽量保持这些锁顺序和生命周期规则，而不是临时加锁掩盖问题。
 
