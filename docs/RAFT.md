@@ -411,6 +411,12 @@ store.SaveSnapshot
 store.CompactLog(snapshotIndex)
 ```
 
+For the LSM-backed log store, `CompactLog(snapshotIndex)` is both a logical and
+physical operation. Advancing `firstIndex` is not enough: the adapter must also
+write tombstones for covered `log:<index>` keys so obsolete log payloads can be
+reclaimed by normal LSM compaction. This keeps the Raft log window and the LSM
+keyspace consistent after snapshot creation.
+
 InstallSnapshot flow:
 
 ```text

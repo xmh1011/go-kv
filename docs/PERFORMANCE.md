@@ -26,9 +26,20 @@ LSM compaction, client retries, and final data consistency.
 | LSM compaction scheduling regression | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run '^(TestCreateNewSSTableSkipsCompactionWhenBelowThreshold|TestSSTableManagerOpenFilesSnapshotReleasesManagerLock)$' -count=10 -timeout=2m` | Passed |
 | SSTable package stability loop | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -count=100 -timeout=5m` | Passed in 114.758s |
 | LSM/storage race gate | `GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=12m` | Passed |
+| LSM-backed Raft log physical compaction regression | `GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm -run '^(TestStorageAdapterCompactLogDeletesPhysicalLogKeys|TestStorageAdapter_Snapshot|TestStorageAdapter_CompactBeyondLastIndexFromSnapshot|TestStorageAdapter_LogEntries|TestStorageAdapter_ReappendAfterTruncateSurvivesFlushCompactionAndRestart)$' -count=1 -timeout=5m` | Passed in 2.753s |
+| LSM package regression after physical log tombstones | `GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm ./engine/lsm/... -count=1 -timeout=12m` | Passed |
+| LSM/storage race gate after physical log tombstones | `GO_KV_LOG_LEVEL=warn go test -race ./pkg/storage/lsm ./engine/lsm/... -count=1 -timeout=12m` | Passed; slowest package `engine/lsm/database` 33.343s |
+| Snapshot/restart cluster loop after physical log tombstones | `GO_KV_LOG_LEVEL=warn go test ./tests -run '^(TestCluster_TakeSnapshot|TestCluster_InstallSnapshot|TestCluster_FullClusterRestart)$' -count=3 -timeout=12m` | Passed in 301.753s |
+| Deterministic waitForAppliedLog timeout-recheck regression | `GO_KV_LOG_LEVEL=warn go test -race ./raft -run '^TestWaitForAppliedLogRechecksLastAppliedOnTimeout$' -count=100 -timeout=3m` | Passed in 11.291s |
+| Raft package race gate after deterministic test fix | `GO_KV_LOG_LEVEL=warn go test -race ./raft -count=1 -timeout=8m` | Passed in 14.295s |
+| Race-load leader discovery regression | `GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_MembershipChange$/^grpc_simplefile$' -count=5 -timeout=12m` | Passed in 71.951s |
+| Full membership-change matrix after leader discovery fix | `GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_MembershipChange$' -count=1 -timeout=15m` | Passed in 72.375s |
+| Race-load network partition leader detection regression | `GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_NetworkPartition$/^tcp_inmemory$' -count=5 -timeout=12m` | Passed in 61.821s |
+| Full network-partition matrix after candidate-scoped leader discovery | `GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_NetworkPartition$' -count=1 -timeout=15m` | Passed in 68.575s |
 | Focused cluster regression loop | `GO_KV_LOG_LEVEL=warn go test ./tests -run '^(TestCluster_ConcurrentClientRequests|TestCluster_TakeSnapshot|TestCluster_InstallSnapshot|TestCluster_FullClusterRestart|TestCluster_LeaderFailover)$' -count=3 -timeout=12m` | Passed in 527.110s |
-| Full short unit/integration gate | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m` | Passed; latest `tests` package 977.155s |
+| Full short unit/integration gate | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m` | Passed; latest `tests` package 1005.048s after issues #122, #123, and #124 |
 | Single 10-minute write-heavy trigger scenario | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_WriteHeavy$' -count=1` | Passed in 613.049s after async compaction scheduling |
+| Post-#121 10-minute restart/snapshot consistency scenario | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=25m ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1` | Passed in 611.921s with 0 failed operations |
 | Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | Passed in 3657.132s |
 
 The short-mode behavior is now explicit: the 10-minute E2E tests skip when
@@ -62,7 +73,19 @@ durable Level-0 SSTables before returning, but compaction is scheduled on a
 coalesced background worker and can be joined with `WaitForCompactions()` during
 shutdown or tests. Follow-up issue #119 tightened this further: below-threshold
 flushes now return without starting a no-op compaction worker, so ordinary small
-flushes do not create avoidable goroutines or contend on `Manager.mu`.
+flushes do not create avoidable goroutines or contend on `Manager.mu`. Follow-up
+issue #121 tightened snapshot-driven Raft log compaction: `CompactLog` now
+tombstones compacted physical `log:<index>` keys before advancing the logical
+window, so long-running nodes can reclaim obsolete log payloads through normal
+LSM compaction. Issue #122 fixed a race-mode test precondition in
+`TestWaitForAppliedLogRechecksLastAppliedOnTimeout`: the test now waits for the
+apply waiter to register before setting `lastApplied`, so it verifies the
+timeout-path recheck instead of depending on a short scheduler race. Issue #123
+fixed the integration leader-discovery helper so race-mode membership tests scan
+for local leader candidates before issuing ReadIndex probes, avoiding slow
+serial probes against every follower. Issue #124 reused that helper inside the
+network-partition test's majority partition, removing a second hand-written
+fixed-sleep probe loop.
 
 ## Post-#109 Focused Restart/Snapshot Replay
 
@@ -111,6 +134,50 @@ scenario was rerun under the race detector:
 This is the latest targeted evidence for the snapshot apply validation fix. The
 test exercises normal snapshot export/install and restart behavior; the new
 unit regression covers malformed snapshot manifests directly.
+
+## Post-#121 Focused Physical Log Compaction Validation
+
+Issue #121 did not appear as a user-visible consistency failure because
+`GetEntry` correctly hid compacted indexes after `firstIndex` moved forward. The
+failure was lower in the storage stack: old physical `log:<index>` keys remained
+in the LSM tree and had no tombstones, so normal LSM compaction could not reclaim
+their payload bytes.
+
+The focused validation therefore checks both layers:
+
+| Check | Signal |
+|---|---|
+| Direct physical-key regression | `TestStorageAdapterCompactLogDeletesPhysicalLogKeys` confirms compacted keys return `nil` through the raw LSM lookup path while the first retained key still exists. |
+| Snapshot/log adapter compatibility | Existing snapshot, compact-beyond-last-index, log-entry, and truncate/reappend tests still pass with the new tombstone writes. |
+| LSM package regression | `./pkg/storage/lsm ./engine/lsm/...` passes after the change, covering flush, compaction, WAL recovery, SSTable reads, and restart-adjacent storage behavior. |
+| Snapshot/restart integration | `TestCluster_TakeSnapshot`, `TestCluster_InstallSnapshot`, and `TestCluster_FullClusterRestart` pass with `-count=3`, proving the new physical deletions do not break snapshot creation, snapshot install, or durable restart recovery. |
+
+This validation is intentionally separate from throughput numbers. The fix adds
+one tombstone write per compacted Raft log key, which is a correctness tradeoff:
+the logical log window and physical keyspace must agree before performance work
+can safely optimize range deletion or batching.
+
+The targeted 10-minute restart/snapshot E2E replay after #121 produced:
+
+| Field | Value |
+|---|---:|
+| Duration | 10m0s |
+| Total ops | 518,144 |
+| Failed ops | 0 |
+| Throughput | 863.57 ops/s |
+| P50 | 2.64ms |
+| P95 | 16.902334ms |
+| P99 | 40.707ms |
+| Leader changes | 5 |
+| Restart count | 3 |
+| Snapshot nodes | 3 |
+| Max snapshot index | 363,305 |
+| Final barrier | Passed |
+| Strict consistency | Passed, 3,600 node-key checks |
+
+This replay directly exercises the fixed `CompactLog` path because snapshots
+advance the Raft log window while restarts force persisted LSM state to be
+reopened.
 
 ## Correctness Gates
 

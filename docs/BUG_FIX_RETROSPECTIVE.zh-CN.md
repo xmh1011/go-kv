@@ -19,6 +19,10 @@ English version: [BUG_FIX_RETROSPECTIVE.md](BUG_FIX_RETROSPECTIVE.md)
 - #116 Long mixed-failure E2E exhausts retries during leader changes
 - #117 Mixed-failure long E2E can return apply timeouts despite final consistency
 - #119 Avoid unnecessary LSM compaction scheduling below threshold
+- #121 LSM CompactLog leaves compacted log keys on disk
+- #122 Make waitForAppliedLog timeout recheck test deterministic
+- #123 Make integration leader discovery reliable under race load
+- #124 Make network partition leader detection race-load safe
 
 ## 1. 真正改变结果的调试原则
 
@@ -860,3 +864,437 @@ GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -count=100 -timeout=5m
 GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=12m
 GO_KV_LOG_LEVEL=warn go test ./tests -run '^(TestCluster_ConcurrentClientRequests|TestCluster_TakeSnapshot|TestCluster_InstallSnapshot|TestCluster_FullClusterRestart|TestCluster_LeaderFailover)$' -count=3 -timeout=12m
 ```
+
+## 19. 2026-06-23 LSM CompactLog 写入物理 Raft 日志 Tombstone
+
+相关 issue：#121。
+
+### 症状
+
+从普通 Raft API 看，`StorageAdapter.CompactLog(upToIndex)` 似乎是正确的：
+压缩后，`GetEntry(index)` 会因为 `firstIndex` 已经推进而对已压缩 index 返回
+`nil`。
+
+但更底层的存储不变量仍然被破坏了。已压缩 entry 对应的物理 LSM key
+`log:<index>` 仍然留在逻辑窗口下面。直接查询底层 storage 仍能读到旧的编码日志
+payload，而且普通 LSM compaction 也无法回收这些字节，因为从未写入 tombstone。
+
+这意味着长时间运行的 Raft 节点即使已经通过 snapshot 让这些日志逻辑不可达，旧
+payload 仍可能永久占用存储空间。
+
+### 根因
+
+旧实现只更新 metadata：
+
+```go
+s.firstIndex = upToIndex + 1
+if upToIndex >= s.lastIndex {
+    s.lastIndex = upToIndex
+    s.logSize = 0
+} else if oldLastIndex >= oldFirstIndex {
+    totalEntries := oldLastIndex - oldFirstIndex + 1
+    compactedEntries := deleteTo - oldFirstIndex + 1
+    compactedBytes := int((int64(s.logSize) * int64(compactedEntries)) / int64(totalEntries))
+    s.logSize -= compactedBytes
+}
+
+return s.saveMetadata()
+```
+
+这只维护了逻辑 Raft 日志窗口，没有维护物理 LSM 状态。`logSize` 的更新也只是按
+entry 数量做比例估算；因为 Raft entry 的 command 长度可变，这个估算会逐渐偏离真实
+保留的编码字节数。
+
+这里要区分两个平面：
+
+- 逻辑窗口（`firstIndex..lastIndex`）决定 Raft 还能读取哪些日志；
+- 物理 LSM tree 决定哪些字节仍然持久化、哪些字节可以被回收。
+
+这两个平面必须一起推进。只在 adapter 层隐藏旧 key，不等于从 storage engine 中删除
+旧 key。
+
+### 回归测试
+
+回归测试在 compaction 后刻意绕过 `GetEntry`，直接检查底层 LSM key：
+
+```go
+func TestStorageAdapterCompactLogDeletesPhysicalLogKeys(t *testing.T) {
+    ...
+    assert.NoError(t, adapter.CompactLog(2))
+
+    raw, err = adapter.db.Get(key1)
+    assert.NoError(t, err)
+    assert.Nil(t, raw, "CompactLog must tombstone compacted physical log key 1")
+
+    raw, err = adapter.db.Get(key2)
+    assert.NoError(t, err)
+    assert.Nil(t, raw, "CompactLog must tombstone compacted physical log key 2")
+
+    raw, err = adapter.db.Get(key3)
+    assert.NoError(t, err)
+    assert.NotNil(t, raw, "CompactLog must keep entries after the compacted range")
+}
+```
+
+修复前，key 1 和 key 2 仍能读到 `GLG1` 编码字节。
+
+### 修复方案
+
+`CompactLog` 现在会先为已压缩的物理 key 范围写入 tombstone，再保存新的逻辑
+metadata：
+
+```go
+oldFirstIndex := s.firstIndex
+oldLastIndex := s.lastIndex
+deleteTo := min(upToIndex, oldLastIndex)
+
+if oldLastIndex >= oldFirstIndex {
+    for i := oldFirstIndex; i <= deleteTo; i++ {
+        key := s.getLogKey(i)
+        val, err := s.db.Get(key)
+        if err != nil {
+            return err
+        }
+        if val != nil {
+            s.logSize -= len(val)
+            if s.logSize < 0 {
+                s.logSize = 0
+            }
+        }
+        if err := s.db.Delete(key); err != nil {
+            return err
+        }
+    }
+}
+
+s.firstIndex = upToIndex + 1
+if upToIndex >= s.lastIndex {
+    s.lastIndex = upToIndex
+    s.logSize = 0
+}
+
+return s.saveMetadata()
+```
+
+这样恢复了 snapshot 驱动的 Raft log compaction 不变量：
+
+1. Raft 可见的日志窗口不再暴露已压缩 entry；
+2. LSM 可见的 keyspace 中存在 tombstone，普通 LSM compaction 可以回收旧日志
+   payload。
+
+`logSize` 也改为按实际移除的编码 value 长度扣减，不再使用比例估算。
+
+### 验证
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm -run '^(TestStorageAdapterCompactLogDeletesPhysicalLogKeys|TestStorageAdapter_Snapshot|TestStorageAdapter_CompactBeyondLastIndexFromSnapshot|TestStorageAdapter_LogEntries|TestStorageAdapter_ReappendAfterTruncateSurvivesFlushCompactionAndRestart)$' -count=1 -timeout=5m
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm ./engine/lsm/... -count=1 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test -race ./pkg/storage/lsm ./engine/lsm/... -count=1 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test ./tests -run '^(TestCluster_TakeSnapshot|TestCluster_InstallSnapshot|TestCluster_FullClusterRestart)$' -count=3 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m
+GO_KV_LOG_LEVEL=warn go test -race -v -timeout=25m ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1
+```
+
+第一条命令验证直接物理 key 的回归；第二条命令覆盖周边 LSM package，确认新增
+tombstone 写入不会破坏 flush、compaction、WAL recovery 或 restart 行为。race
+和集群命令进一步覆盖并发、snapshot 创建、snapshot install 和持久化重启恢复。最后两条命令完成
+PR 级门禁：所有 short 单元/集成测试在 race detector 下通过，10 分钟重启/快照 E2E
+也以 0 失败操作和严格逐节点一致性通过。
+
+## 20. 2026-06-23 waitForAppliedLog Timeout 重查测试改为确定性
+
+相关 issue：#122。
+
+### 症状
+
+全量 short race 门禁暴露了一个 Raft 测试失败：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m
+```
+
+失败点：
+
+```text
+--- FAIL: TestWaitForAppliedLogRechecksLastAppliedOnTimeout
+    raft_test.go:1575: Should be true
+```
+
+定向重复运行说明它更像时序敏感测试，而不是确定性的生产逻辑失败：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./raft -run '^TestWaitForAppliedLogRechecksLastAppliedOnTimeout$' -count=20 -timeout=2m
+GO_KV_LOG_LEVEL=warn go test -race ./raft -run '^TestWaitForAppliedLogRechecksLastAppliedOnTimeout$' -count=50 -timeout=3m
+```
+
+两条定向命令都通过，但全量 race 门禁已经在 package-wide 负载下失败过。
+
+### 根因
+
+生产代码本身已经有 timeout 分支重查逻辑：
+
+```go
+case <-timer.C:
+    r.mu.Lock()
+    applied := r.lastApplied >= index
+    ...
+    r.mu.Unlock()
+    if applied {
+        return nil, true
+    }
+    return nil, false
+```
+
+脆弱的是测试。旧测试依赖固定 sleep 在短 timeout 前更新 `lastApplied`：
+
+```go
+go func() {
+    time.Sleep(5 * time.Millisecond)
+    r.mu.Lock()
+    r.lastApplied = 7
+    r.mu.Unlock()
+}()
+
+result, ok := r.waitForAppliedLog(7, 20*time.Millisecond)
+```
+
+在 race detector 下，goroutine 不保证一定能在 20ms timer 触发前运行。如果它运行得
+更晚，timeout 分支正确看到 `lastApplied < 7` 并返回 false。这不能证明 timeout
+重查失效，只能说明测试的前置条件依赖调度器。
+
+### 修复方案
+
+测试现在显式建立期望顺序：
+
+1. 在 goroutine 中启动 `waitForAppliedLog`；
+2. 等待 waiter 注册到 `notifyApply`；
+3. 持有 `r.mu` 设置 `lastApplied`，但不发送 apply 通知；
+4. 等 timeout 分支重查 `lastApplied`；
+5. 断言成功并验证 waiter cleanup。
+
+```go
+go func() {
+    result, ok := r.waitForAppliedLog(7, 100*time.Millisecond)
+    results <- waitResult{result: result, ok: ok}
+}()
+
+assert.Eventually(t, func() bool {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    return len(r.notifyApply[7]) == 1
+}, time.Second, time.Millisecond)
+
+r.mu.Lock()
+r.lastApplied = 7
+r.mu.Unlock()
+```
+
+这样仍然测试同一个内核不变量，但不再依赖 helper goroutine 赢过 5ms 和 20ms
+之间的调度竞态。
+
+### 验证
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race ./raft -run '^TestWaitForAppliedLogRechecksLastAppliedOnTimeout$' -count=100 -timeout=3m
+GO_KV_LOG_LEVEL=warn go test -race ./raft -count=1 -timeout=8m
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m
+```
+
+定向测试在 race detector 下重复 100 次通过，整个 `raft` package 也在 race
+detector 下通过。修复该测试以及后续集成 helper 后，全量 short race 门禁也通过。
+
+## 21. 2026-06-23 集成测试 Leader 发现适配 Race 负载
+
+相关 issue：#123。
+
+### 症状
+
+#122 之后，全量 short race 门禁已经通过 Raft package，但在集成测试里失败：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m
+```
+
+失败点：
+
+```text
+--- FAIL: TestCluster_MembershipChange (64.83s)
+    --- FAIL: TestCluster_MembershipChange/grpc_simplefile (8.22s)
+        integration_test.go:179: Cluster failed to elect a leader within timeout
+FAIL github.com/xmh1011/go-kv/tests 1009.098s
+```
+
+定向重复运行没有发现确定性的 membership-change 逻辑错误：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./tests -run '^TestCluster_MembershipChange$/^grpc_simplefile$' -count=5 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_MembershipChange$/^grpc_simplefile$' -count=3 -timeout=12m
+```
+
+两条都通过，因此排查重点转到用于发现 leader 的测试 helper。
+
+### 根因
+
+`tests.cluster.getLeader` 的注释说大约等待 8 秒，但实际做了更重的工作。每轮它会对
+每个运行中节点发送完整 `ClientRequest` probe：
+
+```go
+for i := 0; i < 40; i++ {
+    time.Sleep(200 * time.Millisecond)
+    for _, node := range c.nodes {
+        _ = node.ClientRequest(args, reply)
+        if !reply.NotLeader && reply.Success {
+            return node
+        }
+        if !reply.NotLeader && reply.Result == "key not found" {
+            return node
+        }
+    }
+}
+```
+
+`ClientRequest` 不是廉价的本地状态检查。对 leader 上的 read，它可能执行 ReadIndex
+leader confirmation，并等待 `lastApplied`，最长可到 client apply timeout。全量
+`-race` 负载下，helper 可能把大部分时间花在 read probe 阻塞上，最后报
+“failed to elect a leader”。这个错误信息会误导排查：真正的问题可能是 probe 路径没有在固定窗口内完成，而不是 Raft 没有选主。
+
+另外，旧 helper 使用固定 probe client id，多次 `getLeader` 调用会共享 client-session
+状态，也会让 probe 响应的语义变模糊。
+
+### 修复方案
+
+Leader 发现改为条件驱动：
+
+```go
+deadline := time.Now().Add(30 * time.Second)
+for time.Now().Before(deadline) {
+    for _, node := range c.nodes {
+        if node.IsStopped() || node.State() != raft.Leader {
+            continue
+        }
+
+        sequenceNum++
+        args := &param.ClientArgs{
+            ClientID:    probeClientID,
+            SequenceNum: sequenceNum,
+            Command:     probeCmdBytes,
+        }
+        ...
+    }
+    time.Sleep(200 * time.Millisecond)
+}
+```
+
+新的 helper 会：
+
+- 先扫描本地 Raft 状态，只 probe leader 候选节点；
+- 每次 `getLeader` 使用唯一 probe client id；
+- 对 race-mode 集成测试使用 30 秒 deadline；
+- 失败时打印所有节点状态和最后一次 probe 响应。
+
+这样仍保留对候选 leader 的 stale-leader 防线，同时避免对所有 follower 串行执行
+ReadIndex/apply 等待。
+
+### 验证
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_MembershipChange$/^grpc_simplefile$' -count=5 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_MembershipChange$' -count=1 -timeout=15m
+```
+
+修复后，原失败的 `grpc_simplefile` membership-change 子场景在 race detector 下连续
+5 次通过；完整 membership-change transport/storage 矩阵也在 race detector 下通过。
+
+## 22. 2026-06-23 Network Partition Leader 检测适配 Race 负载
+
+相关 issue：#124。
+
+### 症状
+
+#123 之后，全量 short race 门禁继续向后推进，但在网络分区集成测试里失败：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m
+```
+
+失败点：
+
+```text
+--- FAIL: TestCluster_NetworkPartition (70.77s)
+    --- FAIL: TestCluster_NetworkPartition/tcp_inmemory (12.03s)
+        integration_test.go:413: Leader: Node 3
+        integration_test.go:417: Isolating Node 3...
+        integration_test.go:436: Waiting for new leader in majority partition...
+        integration_test.go:473: Majority partition failed to elect a new leader
+FAIL github.com/xmh1011/go-kv/tests 1011.196s
+```
+
+定向重复运行仍然没有发现确定性的 Raft 分区选举失败：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./tests -run '^TestCluster_NetworkPartition$/^tcp_inmemory$' -count=5 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_NetworkPartition$/^tcp_inmemory$' -count=5 -timeout=12m
+```
+
+两条都通过。
+
+### 根因
+
+`TestCluster_NetworkPartition` 在 majority partition 内部有一份手写 leader detection
+loop，没有复用 #123 新增的条件驱动 helper：
+
+```go
+time.Sleep(5 * time.Second)
+for i := 0; i < 20 && !foundLeader; i++ {
+    time.Sleep(200 * time.Millisecond)
+    for _, node := range majorityNodes {
+        reply := &param.ClientReply{}
+        _ = node.ClientRequest(&param.ClientArgs{Command: probeCmdBytes}, reply)
+        ...
+    }
+}
+```
+
+这重复了同类测试设计问题：
+
+- 固定 sleep，而不是条件驱动等待；
+- 对 majority 中每个节点都走完整 `ClientRequest` probe；
+- 每次 probe 都使用零值 `ClientID` 和 `SequenceNum`；
+- 失败时没有节点状态诊断信息。
+
+测试本来要回答“多数派分区是否选出 leader”，但在 full race 负载下，read-probe
+路径慢也可能导致这段 loop 失败。
+
+### 修复方案
+
+通用 leader helper 现在可以接受候选节点集合：
+
+```go
+func (c *cluster) getLeader(t *testing.T) *raft.Raft {
+    t.Helper()
+    return c.getLeaderFromCandidates(t, c.nodes, 30*time.Second)
+}
+```
+
+网络分区测试构造 `majorityNodes` 后直接复用同一个 helper：
+
+```go
+newLeader = c.getLeaderFromCandidates(t, majorityNodes, 30*time.Second)
+```
+
+这样分区场景的 leader 检测和其他集成测试遵循相同规则：
+
+- 只 probe 本地状态为 `Leader` 的节点；
+- probe 使用唯一 client id 和递增 sequence number；
+- deadline 足够覆盖 race-mode 下 TCP 和 storage 的额外开销；
+- 失败时输出节点状态和最后一次 probe 响应。
+
+### 验证
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_NetworkPartition$/^tcp_inmemory$' -count=5 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_NetworkPartition$' -count=1 -timeout=15m
+```
+
+修复后，原失败的 `tcp_inmemory` network-partition 子场景在 race detector 下连续 5
+次通过；完整 network-partition transport/storage 矩阵也在 race detector 下通过。

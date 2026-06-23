@@ -370,6 +370,11 @@ store.SaveSnapshot
 store.CompactLog(snapshotIndex)
 ```
 
+对 LSM-backed log store 来说，`CompactLog(snapshotIndex)` 同时是逻辑操作和物理
+操作。只推进 `firstIndex` 不够：adapter 还必须为被 snapshot 覆盖的 `log:<index>`
+key 写入 tombstone，让旧日志 payload 能被普通 LSM compaction 回收。这样 snapshot
+创建后，Raft 日志窗口和 LSM keyspace 才保持一致。
+
 InstallSnapshot 流程：
 
 ```text

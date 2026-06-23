@@ -23,9 +23,20 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 | LSM compaction 调度回归 | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run '^(TestCreateNewSSTableSkipsCompactionWhenBelowThreshold|TestSSTableManagerOpenFilesSnapshotReleasesManagerLock)$' -count=10 -timeout=2m` | 通过 |
 | SSTable 包稳定性循环 | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -count=100 -timeout=5m` | 114.758s 通过 |
 | LSM/storage race 门禁 | `GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=12m` | 通过 |
+| LSM-backed Raft log 物理压缩回归 | `GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm -run '^(TestStorageAdapterCompactLogDeletesPhysicalLogKeys|TestStorageAdapter_Snapshot|TestStorageAdapter_CompactBeyondLastIndexFromSnapshot|TestStorageAdapter_LogEntries|TestStorageAdapter_ReappendAfterTruncateSurvivesFlushCompactionAndRestart)$' -count=1 -timeout=5m` | 2.753s 通过 |
+| 物理日志 tombstone 后的 LSM 包回归 | `GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm ./engine/lsm/... -count=1 -timeout=12m` | 通过 |
+| 物理日志 tombstone 后的 LSM/storage race 门禁 | `GO_KV_LOG_LEVEL=warn go test -race ./pkg/storage/lsm ./engine/lsm/... -count=1 -timeout=12m` | 通过；最慢 package `engine/lsm/database` 33.343s |
+| 物理日志 tombstone 后的快照/重启集群循环 | `GO_KV_LOG_LEVEL=warn go test ./tests -run '^(TestCluster_TakeSnapshot|TestCluster_InstallSnapshot|TestCluster_FullClusterRestart)$' -count=3 -timeout=12m` | 301.753s 通过 |
+| 确定性的 waitForAppliedLog timeout 重查回归 | `GO_KV_LOG_LEVEL=warn go test -race ./raft -run '^TestWaitForAppliedLogRechecksLastAppliedOnTimeout$' -count=100 -timeout=3m` | 11.291s 通过 |
+| 确定性测试修复后的 Raft package race 门禁 | `GO_KV_LOG_LEVEL=warn go test -race ./raft -count=1 -timeout=8m` | 14.295s 通过 |
+| Race 负载下 leader 发现回归 | `GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_MembershipChange$/^grpc_simplefile$' -count=5 -timeout=12m` | 71.951s 通过 |
+| Leader 发现修复后的完整 membership-change 矩阵 | `GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_MembershipChange$' -count=1 -timeout=15m` | 72.375s 通过 |
+| Race 负载下 network partition leader 检测回归 | `GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_NetworkPartition$/^tcp_inmemory$' -count=5 -timeout=12m` | 61.821s 通过 |
+| 候选节点限定 leader discovery 后的完整 network-partition 矩阵 | `GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_NetworkPartition$' -count=1 -timeout=15m` | 68.575s 通过 |
 | 聚焦集群回归循环 | `GO_KV_LOG_LEVEL=warn go test ./tests -run '^(TestCluster_ConcurrentClientRequests|TestCluster_TakeSnapshot|TestCluster_InstallSnapshot|TestCluster_FullClusterRestart|TestCluster_LeaderFailover)$' -count=3 -timeout=12m` | 527.110s 通过 |
-| 全量 short 单元/集成门禁 | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m` | 通过；最新 `tests` 包 977.155s |
+| 全量 short 单元/集成门禁 | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m` | 通过；修复 #122、#123、#124 后最新 `tests` 包 1005.048s |
 | 单个 10 分钟写入密集触发场景 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_WriteHeavy$' -count=1` | 异步 compaction 调度修复后 613.049s 通过 |
+| #121 后 10 分钟重启/快照一致性场景 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=25m ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1` | 611.921s 通过，失败操作 0 |
 | 全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | 3657.132s 通过 |
 
 现在 short 模式行为是明确的：10 分钟 E2E 在 `testing.Short()` 下会跳过。这样 `go test -short ./...` 可以继续作为 PR 覆盖率入口，而真实 10 分钟场景必须显式运行。
@@ -53,7 +64,15 @@ SSTable compaction 不再同步运行在 Raft apply 前台路径里。MemTable f
 里执行；测试或关闭流程可以通过 `WaitForCompactions()` 等待后台任务收敛。
 Issue #119 进一步收紧了这个路径：低于阈值的 flush 不再启动无实际 merge 工作的
 compaction worker，普通小 flush 不会额外创建 goroutine，也不会为 no-op compaction
-竞争 `Manager.mu`。
+竞争 `Manager.mu`。Issue #121 进一步收紧 snapshot 驱动的 Raft log compaction：
+`CompactLog` 现在会先 tombstone 已压缩的物理 `log:<index>` key，再推进逻辑窗口，
+让长时间运行节点可以通过普通 LSM compaction 回收旧日志 payload。Issue #122
+修复了 `TestWaitForAppliedLogRechecksLastAppliedOnTimeout` 在 race 模式下的测试前置
+条件：测试现在先等待 apply waiter 注册，再设置 `lastApplied`，因此验证的是 timeout
+分支重查逻辑，而不是依赖很短的调度竞态。Issue #123 修复了集成测试 leader-discovery
+helper：membership 测试在 race 模式下会先扫描本地 leader 候选，再发 ReadIndex probe，
+避免对所有 follower 串行执行缓慢 probe。Issue #124 在 network-partition 测试的
+majority partition 内复用了同一个 helper，移除了另一份固定 sleep 的手写 probe loop。
 
 ## #109 后的重启/快照聚焦重放
 
@@ -98,6 +117,47 @@ compaction worker，普通小 flush 不会额外创建 goroutine，也不会为 
 
 这是 snapshot apply 路径验证修复的最新定向证据。长测覆盖正常 snapshot
 导出/安装和重启行为；新增单测直接覆盖畸形 snapshot manifest。
+
+## #121 后的物理日志压缩聚焦验证
+
+Issue #121 没有表现为用户可见的一致性失败，因为 `firstIndex` 推进后，`GetEntry`
+已经会正确隐藏被压缩的 index。真正的问题在更底层：旧的物理 `log:<index>` key
+仍留在 LSM tree 中，而且没有 tombstone，普通 LSM compaction 无法回收这些 payload
+字节。
+
+因此这次聚焦验证同时检查两个层次：
+
+| 检查 | 信号 |
+|---|---|
+| 直接物理 key 回归 | `TestStorageAdapterCompactLogDeletesPhysicalLogKeys` 确认已压缩 key 在 raw LSM lookup 路径返回 `nil`，而第一个保留 key 仍存在。 |
+| Snapshot/log adapter 兼容性 | 现有 snapshot、compact-beyond-last-index、log-entry、truncate/reappend 测试在新增 tombstone 写入后仍通过。 |
+| LSM 包回归 | `./pkg/storage/lsm ./engine/lsm/...` 通过，覆盖 flush、compaction、WAL recovery、SSTable read 和接近 restart 的存储行为。 |
+| Snapshot/restart 集成 | `TestCluster_TakeSnapshot`、`TestCluster_InstallSnapshot`、`TestCluster_FullClusterRestart` 使用 `-count=3` 通过，证明新增物理删除不破坏 snapshot 创建、snapshot install 或持久化重启恢复。 |
+
+这组验证有意和吞吐指标分开。该修复会为每个已压缩 Raft log key 多写一个 tombstone，
+这是正确性取舍：只有先确保逻辑日志窗口和物理 keyspace 一致，后续 range deletion
+或批量删除优化才是安全的。
+
+这次 #121 后的 10 分钟重启/快照 E2E 定向重放结果：
+
+| 项目 | 值 |
+|---|---:|
+| 时长 | 10m0s |
+| 总操作数 | 518,144 |
+| 失败操作 | 0 |
+| 吞吐量 | 863.57 ops/s |
+| P50 | 2.64ms |
+| P95 | 16.902334ms |
+| P99 | 40.707ms |
+| Leader 切换 | 5 |
+| 重启次数 | 3 |
+| 快照节点数 | 3 |
+| 最大快照 index | 363,305 |
+| 最终 barrier | 通过 |
+| 严格一致性 | 通过，3,600 个 node-key 检查 |
+
+这次重放直接覆盖修复后的 `CompactLog` 路径，因为 snapshot 会推进 Raft log 窗口，
+restart 又会强制重新打开已持久化的 LSM 状态。
 
 ## 正确性门禁
 

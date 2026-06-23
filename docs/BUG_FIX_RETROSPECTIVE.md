@@ -22,6 +22,10 @@ Related issues:
 - #116 Long mixed-failure E2E exhausts retries during leader changes
 - #117 Mixed-failure long E2E can return apply timeouts despite final consistency
 - #119 Avoid unnecessary LSM compaction scheduling below threshold
+- #121 LSM CompactLog leaves compacted log keys on disk
+- #122 Make waitForAppliedLog timeout recheck test deterministic
+- #123 Make integration leader discovery reliable under race load
+- #124 Make network partition leader detection race-load safe
 
 ## 1. The Debugging Rule That Changed The Result
 
@@ -962,3 +966,464 @@ GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -count=100 -timeout=5m
 GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=12m
 GO_KV_LOG_LEVEL=warn go test ./tests -run '^(TestCluster_ConcurrentClientRequests|TestCluster_TakeSnapshot|TestCluster_InstallSnapshot|TestCluster_FullClusterRestart|TestCluster_LeaderFailover)$' -count=3 -timeout=12m
 ```
+
+## 19. 2026-06-23 Physical Raft Log Tombstones During LSM CompactLog
+
+Related issue: #121.
+
+### Symptom
+
+`StorageAdapter.CompactLog(upToIndex)` looked correct from the normal Raft API:
+after compaction, `GetEntry(index)` returned `nil` for compacted indexes because
+the adapter had advanced `firstIndex`.
+
+The deeper storage invariant was still broken. The physical LSM keys
+`log:<index>` for compacted entries remained present underneath the logical
+window. A direct storage lookup could still see the old encoded log payload, and
+normal LSM compaction could not reclaim it because no tombstone had ever been
+written.
+
+That means a long-running Raft node could keep obsolete log payloads forever even
+though snapshots had already made those entries logically unreachable.
+
+### Root Cause
+
+The old implementation was metadata-only:
+
+```go
+s.firstIndex = upToIndex + 1
+if upToIndex >= s.lastIndex {
+    s.lastIndex = upToIndex
+    s.logSize = 0
+} else if oldLastIndex >= oldFirstIndex {
+    totalEntries := oldLastIndex - oldFirstIndex + 1
+    compactedEntries := deleteTo - oldFirstIndex + 1
+    compactedBytes := int((int64(s.logSize) * int64(compactedEntries)) / int64(totalEntries))
+    s.logSize -= compactedBytes
+}
+
+return s.saveMetadata()
+```
+
+This maintained the logical Raft log window, but it did not maintain the physical
+LSM state. The `logSize` update was also only proportional. It could drift from
+the true retained encoded bytes because Raft log entries have variable command
+sizes.
+
+The important distinction is:
+
+- the logical window (`firstIndex..lastIndex`) controls what Raft may read;
+- the physical LSM tree controls what bytes remain durable and reclaimable.
+
+Both must move together. Hiding old keys at the Raft adapter layer is not the
+same as deleting those keys from the storage engine.
+
+### Regression Test
+
+The regression test intentionally bypasses `GetEntry` after compaction and checks
+the underlying LSM keys directly:
+
+```go
+func TestStorageAdapterCompactLogDeletesPhysicalLogKeys(t *testing.T) {
+    ...
+    assert.NoError(t, adapter.CompactLog(2))
+
+    raw, err = adapter.db.Get(key1)
+    assert.NoError(t, err)
+    assert.Nil(t, raw, "CompactLog must tombstone compacted physical log key 1")
+
+    raw, err = adapter.db.Get(key2)
+    assert.NoError(t, err)
+    assert.Nil(t, raw, "CompactLog must tombstone compacted physical log key 2")
+
+    raw, err = adapter.db.Get(key3)
+    assert.NoError(t, err)
+    assert.NotNil(t, raw, "CompactLog must keep entries after the compacted range")
+}
+```
+
+Before the fix it failed with encoded `GLG1` bytes still present for keys 1 and
+2.
+
+### Fix
+
+`CompactLog` now writes tombstones for the compacted physical key range before it
+saves the new logical metadata:
+
+```go
+oldFirstIndex := s.firstIndex
+oldLastIndex := s.lastIndex
+deleteTo := min(upToIndex, oldLastIndex)
+
+if oldLastIndex >= oldFirstIndex {
+    for i := oldFirstIndex; i <= deleteTo; i++ {
+        key := s.getLogKey(i)
+        val, err := s.db.Get(key)
+        if err != nil {
+            return err
+        }
+        if val != nil {
+            s.logSize -= len(val)
+            if s.logSize < 0 {
+                s.logSize = 0
+            }
+        }
+        if err := s.db.Delete(key); err != nil {
+            return err
+        }
+    }
+}
+
+s.firstIndex = upToIndex + 1
+if upToIndex >= s.lastIndex {
+    s.lastIndex = upToIndex
+    s.logSize = 0
+}
+
+return s.saveMetadata()
+```
+
+This restores the invariant that snapshot-driven Raft log compaction updates both
+planes:
+
+1. the Raft-visible log window no longer exposes compacted entries;
+2. the LSM-visible keyspace contains tombstones that allow normal LSM compaction
+   to reclaim obsolete log payloads.
+
+The `logSize` accounting is now based on the actual encoded value length being
+removed instead of a proportional estimate.
+
+### Validation
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm -run '^(TestStorageAdapterCompactLogDeletesPhysicalLogKeys|TestStorageAdapter_Snapshot|TestStorageAdapter_CompactBeyondLastIndexFromSnapshot|TestStorageAdapter_LogEntries|TestStorageAdapter_ReappendAfterTruncateSurvivesFlushCompactionAndRestart)$' -count=1 -timeout=5m
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm ./engine/lsm/... -count=1 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test -race ./pkg/storage/lsm ./engine/lsm/... -count=1 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test ./tests -run '^(TestCluster_TakeSnapshot|TestCluster_InstallSnapshot|TestCluster_FullClusterRestart)$' -count=3 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m
+GO_KV_LOG_LEVEL=warn go test -race -v -timeout=25m ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1
+```
+
+The first command proves the direct physical-key regression. The second command
+checks the surrounding LSM packages so the new tombstone writes do not break
+flush, compaction, WAL recovery, or restart behavior. The race and cluster
+commands cover concurrency, snapshot creation, snapshot install, and durable
+restart recovery after the new physical deletions. The final two commands close
+the PR-level gate: all short unit/integration tests passed under the race
+detector, and the 10-minute restart/snapshot E2E replay completed with zero
+failed operations and strict node-by-node consistency.
+
+## 20. 2026-06-23 Deterministic Timeout-Recheck Test For waitForAppliedLog
+
+Related issue: #122.
+
+### Symptom
+
+The full short race gate exposed a Raft test failure:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m
+```
+
+Failure:
+
+```text
+--- FAIL: TestWaitForAppliedLogRechecksLastAppliedOnTimeout
+    raft_test.go:1575: Should be true
+```
+
+Targeted repeat runs showed that the failure was timing-sensitive rather than a
+deterministic production logic failure:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./raft -run '^TestWaitForAppliedLogRechecksLastAppliedOnTimeout$' -count=20 -timeout=2m
+GO_KV_LOG_LEVEL=warn go test -race ./raft -run '^TestWaitForAppliedLogRechecksLastAppliedOnTimeout$' -count=50 -timeout=3m
+```
+
+Both targeted commands passed, while the full race gate had already failed under
+package-wide load.
+
+### Root Cause
+
+The production code already had the intended timeout-path recheck:
+
+```go
+case <-timer.C:
+    r.mu.Lock()
+    applied := r.lastApplied >= index
+    ...
+    r.mu.Unlock()
+    if applied {
+        return nil, true
+    }
+    return nil, false
+```
+
+The test was the fragile part. It used a fixed sleep to update `lastApplied`
+before a short timeout:
+
+```go
+go func() {
+    time.Sleep(5 * time.Millisecond)
+    r.mu.Lock()
+    r.lastApplied = 7
+    r.mu.Unlock()
+}()
+
+result, ok := r.waitForAppliedLog(7, 20*time.Millisecond)
+```
+
+Under the race detector, the goroutine is not guaranteed to run before the 20 ms
+timer fires. When it runs late, the timeout branch correctly sees
+`lastApplied < 7` and returns false. That does not disprove the timeout recheck;
+it only proves the test had a scheduler-dependent precondition.
+
+### Fix
+
+The test now makes the intended ordering explicit:
+
+1. start `waitForAppliedLog` in a goroutine;
+2. wait until the waiter is registered in `notifyApply`;
+3. set `lastApplied` under `r.mu` without sending an apply notification;
+4. wait for the timeout branch to recheck `lastApplied`;
+5. assert success and verify waiter cleanup.
+
+```go
+go func() {
+    result, ok := r.waitForAppliedLog(7, 100*time.Millisecond)
+    results <- waitResult{result: result, ok: ok}
+}()
+
+assert.Eventually(t, func() bool {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    return len(r.notifyApply[7]) == 1
+}, time.Second, time.Millisecond)
+
+r.mu.Lock()
+r.lastApplied = 7
+r.mu.Unlock()
+```
+
+This tests the same kernel invariant, but it no longer depends on a helper
+goroutine winning a 5 ms versus 20 ms scheduling race.
+
+### Validation
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race ./raft -run '^TestWaitForAppliedLogRechecksLastAppliedOnTimeout$' -count=100 -timeout=3m
+GO_KV_LOG_LEVEL=warn go test -race ./raft -count=1 -timeout=8m
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m
+```
+
+The focused test passed 100 times under the race detector, and the whole `raft`
+package passed under the race detector. The full short race gate then passed
+after this fix and the follow-up integration-helper fixes.
+
+## 21. 2026-06-23 Race-Load-Safe Integration Leader Discovery
+
+Related issue: #123.
+
+### Symptom
+
+After #122, the full short race gate progressed past the Raft package but failed
+later in the integration suite:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m
+```
+
+Failure:
+
+```text
+--- FAIL: TestCluster_MembershipChange (64.83s)
+    --- FAIL: TestCluster_MembershipChange/grpc_simplefile (8.22s)
+        integration_test.go:179: Cluster failed to elect a leader within timeout
+FAIL github.com/xmh1011/go-kv/tests 1009.098s
+```
+
+Focused reruns did not show a deterministic membership-change bug:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./tests -run '^TestCluster_MembershipChange$/^grpc_simplefile$' -count=5 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_MembershipChange$/^grpc_simplefile$' -count=3 -timeout=12m
+```
+
+Both passed, so the investigation moved to the test helper used to discover a
+leader.
+
+### Root Cause
+
+`tests.cluster.getLeader` said it waited about 8 seconds, but it actually did
+more expensive work. On every attempt it sent a full `ClientRequest` probe to
+every running node:
+
+```go
+for i := 0; i < 40; i++ {
+    time.Sleep(200 * time.Millisecond)
+    for _, node := range c.nodes {
+        _ = node.ClientRequest(args, reply)
+        if !reply.NotLeader && reply.Success {
+            return node
+        }
+        if !reply.NotLeader && reply.Result == "key not found" {
+            return node
+        }
+    }
+}
+```
+
+`ClientRequest` is not a cheap local state check. For a leader-side read it may
+perform ReadIndex leadership confirmation and wait for `lastApplied` for up to
+the client apply timeout. In a full `-race` run, this means the helper can spend
+most of its budget blocked in read probes and then report "failed to elect a
+leader", even though the real problem is that the probe path did not complete in
+the helper's fixed window.
+
+The helper also reused a fixed probe client id, which made repeated calls share
+client-session state and could blur the meaning of a probe response.
+
+### Fix
+
+Leader discovery is now condition-driven:
+
+```go
+deadline := time.Now().Add(30 * time.Second)
+for time.Now().Before(deadline) {
+    for _, node := range c.nodes {
+        if node.IsStopped() || node.State() != raft.Leader {
+            continue
+        }
+
+        sequenceNum++
+        args := &param.ClientArgs{
+            ClientID:    probeClientID,
+            SequenceNum: sequenceNum,
+            Command:     probeCmdBytes,
+        }
+        ...
+    }
+    time.Sleep(200 * time.Millisecond)
+}
+```
+
+The helper now:
+
+- scans local Raft state first and only probes leader candidates;
+- uses a unique probe client id per `getLeader` call;
+- uses a 30 second deadline for race-mode integration load;
+- prints all node states and the last probe response on failure.
+
+This keeps the stale-leader guard for candidates while avoiding serial
+ReadIndex/apply waits against every follower.
+
+### Validation
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_MembershipChange$/^grpc_simplefile$' -count=5 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_MembershipChange$' -count=1 -timeout=15m
+```
+
+The failing `grpc_simplefile` membership-change sub-scenario passed five times
+under the race detector after the helper rewrite, and the full membership-change
+transport/storage matrix passed under the race detector.
+
+## 22. 2026-06-23 Race-Load-Safe Network Partition Leader Detection
+
+Related issue: #124.
+
+### Symptom
+
+After #123, the full short race gate progressed further but failed in the
+network-partition integration test:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m
+```
+
+Failure:
+
+```text
+--- FAIL: TestCluster_NetworkPartition (70.77s)
+    --- FAIL: TestCluster_NetworkPartition/tcp_inmemory (12.03s)
+        integration_test.go:413: Leader: Node 3
+        integration_test.go:417: Isolating Node 3...
+        integration_test.go:436: Waiting for new leader in majority partition...
+        integration_test.go:473: Majority partition failed to elect a new leader
+FAIL github.com/xmh1011/go-kv/tests 1011.196s
+```
+
+Focused reruns again did not show a deterministic Raft partition-election
+failure:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./tests -run '^TestCluster_NetworkPartition$/^tcp_inmemory$' -count=5 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_NetworkPartition$/^tcp_inmemory$' -count=5 -timeout=12m
+```
+
+Both passed.
+
+### Root Cause
+
+`TestCluster_NetworkPartition` had its own hand-written leader detection loop
+inside the majority partition. It did not use the condition-driven helper added
+for #123:
+
+```go
+time.Sleep(5 * time.Second)
+for i := 0; i < 20 && !foundLeader; i++ {
+    time.Sleep(200 * time.Millisecond)
+    for _, node := range majorityNodes {
+        reply := &param.ClientReply{}
+        _ = node.ClientRequest(&param.ClientArgs{Command: probeCmdBytes}, reply)
+        ...
+    }
+}
+```
+
+This repeated the same test-design flaw:
+
+- fixed sleeps instead of condition-based waiting;
+- full `ClientRequest` probes against every majority node;
+- zero-value `ClientID` and `SequenceNum` for every probe;
+- no state diagnostics when the helper failed.
+
+The test was supposed to answer "did the majority partition elect a leader?", but
+the probe loop could fail because the read-probe path was slow under full
+race-mode load.
+
+### Fix
+
+The generic leader helper now accepts a candidate node set:
+
+```go
+func (c *cluster) getLeader(t *testing.T) *raft.Raft {
+    t.Helper()
+    return c.getLeaderFromCandidates(t, c.nodes, 30*time.Second)
+}
+```
+
+The network-partition test builds `majorityNodes` and reuses the same helper:
+
+```go
+newLeader = c.getLeaderFromCandidates(t, majorityNodes, 30*time.Second)
+```
+
+This makes partition leader detection follow the same rules as the rest of the
+integration suite:
+
+- only nodes whose local state is `Leader` are probed;
+- probes use a unique client id and increasing sequence number;
+- the deadline is long enough for race-mode TCP and storage overhead;
+- failures include node-state and last-probe diagnostics.
+
+### Validation
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_NetworkPartition$/^tcp_inmemory$' -count=5 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_NetworkPartition$' -count=1 -timeout=15m
+```
+
+The previously failing `tcp_inmemory` network-partition sub-scenario passed five
+times under the race detector after the helper reuse, and the full
+network-partition transport/storage matrix passed under the race detector.

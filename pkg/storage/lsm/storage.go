@@ -557,20 +557,29 @@ func (s *StorageAdapter) CompactLog(upToIndex uint64) error {
 	oldLastIndex := s.lastIndex
 	deleteTo := min(upToIndex, oldLastIndex)
 
+	if oldLastIndex >= oldFirstIndex {
+		for i := oldFirstIndex; i <= deleteTo; i++ {
+			key := s.getLogKey(i)
+			val, err := s.db.Get(key)
+			if err != nil {
+				return err
+			}
+			if val != nil {
+				s.logSize -= len(val)
+				if s.logSize < 0 {
+					s.logSize = 0
+				}
+			}
+			if err := s.db.Delete(key); err != nil {
+				return err
+			}
+		}
+	}
+
 	s.firstIndex = upToIndex + 1
 	if upToIndex >= s.lastIndex {
 		s.lastIndex = upToIndex
 		s.logSize = 0
-	} else if oldLastIndex >= oldFirstIndex {
-		totalEntries := oldLastIndex - oldFirstIndex + 1
-		compactedEntries := deleteTo - oldFirstIndex + 1
-		if totalEntries > 0 && compactedEntries > 0 {
-			compactedBytes := int((int64(s.logSize) * int64(compactedEntries)) / int64(totalEntries))
-			s.logSize -= compactedBytes
-			if s.logSize < 0 {
-				s.logSize = 0
-			}
-		}
 	}
 
 	return s.saveMetadata()
