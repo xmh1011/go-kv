@@ -1563,17 +1563,36 @@ func TestWaitForAppliedLogRechecksLastAppliedOnTimeout(t *testing.T) {
 		notifyApply: make(map[uint64][]chan any),
 	}
 
+	type waitResult struct {
+		result any
+		ok     bool
+	}
+	results := make(chan waitResult, 1)
+
 	go func() {
-		time.Sleep(5 * time.Millisecond)
-		r.mu.Lock()
-		r.lastApplied = 7
-		r.mu.Unlock()
+		result, ok := r.waitForAppliedLog(7, 100*time.Millisecond)
+		results <- waitResult{result: result, ok: ok}
 	}()
 
-	result, ok := r.waitForAppliedLog(7, 20*time.Millisecond)
+	assert.Eventually(t, func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return len(r.notifyApply[7]) == 1
+	}, time.Second, time.Millisecond)
 
-	assert.True(t, ok)
-	assert.Nil(t, result)
+	r.mu.Lock()
+	r.lastApplied = 7
+	r.mu.Unlock()
+
+	var got waitResult
+	select {
+	case got = <-results:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for apply waiter")
+	}
+
+	assert.True(t, got.ok)
+	assert.Nil(t, got.result)
 	assert.Empty(t, r.notifyApply)
 }
 

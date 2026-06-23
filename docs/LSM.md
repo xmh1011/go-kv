@@ -585,9 +585,12 @@ The adapter caches `firstIndex`, `lastIndex`, and `logSize` under its own
 firstIndex <= visible log index <= lastIndex
 ```
 
-`GetEntry` returns nil outside that window even if old physical keys still exist
-below the LSM. `AppendEntries`, `TruncateLog`, and `CompactLog` must update this
-window consistently with the physical LSM operations.
+`GetEntry` returns nil outside that window. `AppendEntries`, `TruncateLog`, and
+`CompactLog` must update this window consistently with the physical LSM
+operations. In particular, `CompactLog` writes tombstones for compacted
+`log:<index>` keys before it advances `firstIndex`; otherwise the logical log
+window would shrink while obsolete Raft log payloads stayed alive in the LSM
+tree and could never be reclaimed by normal tombstone compaction.
 
 ## 19. Bug-prone Edges And Guardrails
 
@@ -601,6 +604,7 @@ or file encoding. They come from boundaries between modules:
 | Tombstone compaction | Deleted key reappears from an older level. | Keep tombstones until older versions are impossible. |
 | SSTable lazy data decode | Repeated reads append duplicate decoded values. | Reset `DataBlock` before every decode. |
 | Raft truncate/reappend | Old log payload and new log payload share an index. | Replacing an existing log key subtracts old size and writes the new value. |
+| Raft log compaction | `CompactLog` advances `firstIndex` but old `log:*` keys stay in the LSM tree. | Tombstone compacted physical log keys before saving the new logical log window. |
 | Raft compaction | Apply loop asks for a compacted committed entry. | Raft must either skip through a covering snapshot or fail loudly if no snapshot covers it. |
 | Compaction catalog cleanup | Metadata references a file that was already removed. | Prune missing-file metadata, but still fail existing corrupt files. |
 | WAL recovery hygiene | Temp files or notes exist beside committed WAL files. | Replay only `{id}.wal`; ignore non-WAL entries and fail corrupt committed WALs. |

@@ -300,6 +300,41 @@ func TestStorageAdapter_CompactBeyondLastIndexFromSnapshot(t *testing.T) {
 	assert.Equal(t, uint64(6), entry.Index)
 }
 
+func TestStorageAdapterCompactLogDeletesPhysicalLogKeys(t *testing.T) {
+	db, dir := setupTestDB(t, "lsm_storage_test_compact_physical_delete")
+	defer cleanupTestDB(t, dir)
+
+	adapter, err := NewStorageAdapter(db)
+	assert.NoError(t, err)
+	defer adapter.Close()
+
+	err = adapter.AppendEntries([]param.LogEntry{
+		{Term: 1, Index: 1, Command: []byte("cmd1")},
+		{Term: 1, Index: 2, Command: []byte("cmd2")},
+		{Term: 1, Index: 3, Command: []byte("cmd3")},
+	})
+	assert.NoError(t, err)
+
+	key1 := adapter.getLogKey(1)
+	key2 := adapter.getLogKey(2)
+	key3 := adapter.getLogKey(3)
+	raw, err := adapter.db.Get(key1)
+	assert.NoError(t, err)
+	assert.NotNil(t, raw)
+
+	assert.NoError(t, adapter.CompactLog(2))
+
+	raw, err = adapter.db.Get(key1)
+	assert.NoError(t, err)
+	assert.Nil(t, raw, "CompactLog must tombstone compacted physical log key 1")
+	raw, err = adapter.db.Get(key2)
+	assert.NoError(t, err)
+	assert.Nil(t, raw, "CompactLog must tombstone compacted physical log key 2")
+	raw, err = adapter.db.Get(key3)
+	assert.NoError(t, err)
+	assert.NotNil(t, raw, "CompactLog must keep entries after the compacted range")
+}
+
 func TestStorageAdapter_ReappendAfterTruncateSurvivesFlushCompactionAndRestart(t *testing.T) {
 	db, dir := setupTestDB(t, "lsm_storage_test_reappend_after_truncate")
 	defer cleanupTestDB(t, dir)

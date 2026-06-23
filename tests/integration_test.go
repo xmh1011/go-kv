@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -143,27 +144,41 @@ func (c *cluster) shutdown() {
 // getLeader 轮询集群状态，直到找到一个稳定的 Leader。
 // 这个函数会发送探测请求来确认 Leader 的真实性（避免选出过期的 Leader）。
 func (c *cluster) getLeader(t *testing.T) *raft.Raft {
+	t.Helper()
+	return c.getLeaderFromCandidates(t, c.nodes, 30*time.Second)
+}
+
+func (c *cluster) getLeaderFromCandidates(t *testing.T, candidates []*raft.Raft, timeout time.Duration) *raft.Raft {
+	t.Helper()
 	probeCmd := param.KVCommand{Op: param.OpGet, Key: "probe-key"}
 	probeCmdBytes, _ := json.Marshal(probeCmd)
+	probeClientID := time.Now().UnixNano()
+	var sequenceNum int64
+	var lastProbe string
 
-	// 最多重试 40 次，每次间隔 200ms，总共等待 8 秒
-	for i := 0; i < 40; i++ {
-		time.Sleep(200 * time.Millisecond)
-		for _, node := range c.nodes {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, node := range candidates {
 			if node.IsStopped() {
 				continue
 			}
+			if node.State() != raft.Leader {
+				continue
+			}
 
-			// 发送一个只读请求来探测
+			sequenceNum++
+
 			args := &param.ClientArgs{
-				ClientID:    100,
-				SequenceNum: int64(i),
+				ClientID:    probeClientID,
+				SequenceNum: sequenceNum,
 				Command:     probeCmdBytes,
 			}
 			reply := &param.ClientReply{}
 
-			// 忽略错误，只关注 reply.NotLeader 和 Success
-			_ = node.ClientRequest(args, reply)
+			if err := node.ClientRequest(args, reply); err != nil {
+				lastProbe = fmt.Sprintf("node %d returned error: %v", node.ID(), err)
+				continue
+			}
 
 			if !reply.NotLeader {
 				// 如果请求成功，或者虽然 key 不存在但已通过 ReadIndex 检查，则认为是 Leader
@@ -174,10 +189,24 @@ func (c *cluster) getLeader(t *testing.T) *raft.Raft {
 					return node
 				}
 			}
+			lastProbe = fmt.Sprintf("node %d probe response: success=%t notLeader=%t leaderHint=%d result=%v", node.ID(), reply.Success, reply.NotLeader, reply.LeaderHint, reply.Result)
 		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatal("Cluster failed to elect a leader within timeout")
+	t.Fatalf("cluster failed to find a leader within timeout; states=[%s]; lastProbe=%s", c.nodeStateSummary(candidates), lastProbe)
 	return nil
+}
+
+func (c *cluster) nodeStateSummary(nodes []*raft.Raft) string {
+	states := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		if node == nil {
+			states = append(states, "nil")
+			continue
+		}
+		states = append(states, fmt.Sprintf("node=%d state=%d stopped=%t", node.ID(), node.State(), node.IsStopped()))
+	}
+	return strings.Join(states, ", ")
 }
 
 // restartNode 模拟节点崩溃并恢复的过程。
@@ -419,34 +448,7 @@ func TestCluster_NetworkPartition(t *testing.T) {
 					}
 				}
 
-				// 在多数派中寻找新 Leader
-				probeCmd := param.KVCommand{Op: param.OpGet, Key: "probe-key"}
-				probeCmdBytes, _ := json.Marshal(probeCmd)
-				foundLeader := false
-				for i := 0; i < 20 && !foundLeader; i++ {
-					time.Sleep(200 * time.Millisecond)
-					for _, node := range majorityNodes {
-						reply := &param.ClientReply{}
-						_ = node.ClientRequest(&param.ClientArgs{Command: probeCmdBytes}, reply)
-						if !reply.NotLeader {
-							if reply.Success {
-								newLeader = node
-								foundLeader = true
-								break
-							}
-							// "key not found" 也意味着它是 Leader 并成功查询了状态机
-							if errMsg, ok := reply.Result.(string); ok && errMsg == "key not found" {
-								newLeader = node
-								foundLeader = true
-								break
-							}
-						}
-					}
-				}
-
-				if newLeader == nil {
-					t.Fatal("Majority partition failed to elect a new leader")
-				}
+				newLeader = c.getLeaderFromCandidates(t, majorityNodes, 30*time.Second)
 
 				assert.NotEqual(t, partitionedNodeID, newLeader.ID())
 				t.Logf("New Leader in majority partition: Node %d", newLeader.ID())

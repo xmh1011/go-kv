@@ -526,7 +526,10 @@ N bytes   tagged command payload
 firstIndex <= 可见日志索引 <= lastIndex
 ```
 
-`GetEntry` 对窗口外索引返回 nil，即使底层 LSM 里还残留旧物理 key。`AppendEntries`、`TruncateLog`、`CompactLog` 必须同时维护物理 LSM 操作和这个逻辑窗口。
+`GetEntry` 对窗口外索引返回 nil。`AppendEntries`、`TruncateLog`、`CompactLog`
+必须同时维护物理 LSM 操作和这个逻辑窗口。特别是 `CompactLog` 必须先为已压缩的
+`log:<index>` key 写入 tombstone，再推进 `firstIndex`；否则逻辑日志窗口虽然缩小，
+旧 Raft log payload 仍会留在 LSM tree 里，也无法被普通 tombstone compaction 回收。
 
 ## 19. 容易出错的边界和防线
 
@@ -539,6 +542,7 @@ firstIndex <= 可见日志索引 <= lastIndex
 | Tombstone compaction | 已删除 key 从旧层重新出现。 | 只有确定不存在更旧版本时才丢弃 tombstone。 |
 | SSTable 懒加载 | 重复读取追加重复 value。 | 每次 decode 前 reset `DataBlock`。 |
 | Raft truncate/reappend | 同一 index 上旧日志 payload 和新日志 payload 混用。 | 重写已有 log key 时先扣除旧大小，再写新值。 |
+| Raft log compaction | `CompactLog` 推进 `firstIndex`，但旧 `log:*` key 仍留在 LSM tree。 | 保存新的逻辑日志窗口前，先 tombstone 已压缩的物理 log key。 |
 | Raft compaction | apply loop 读取已被压缩的 committed entry。 | Raft 必须通过覆盖该 index 的 snapshot 跳过；没有覆盖 snapshot 时才应明显失败。 |
 | Compaction 目录清理 | 元数据引用已经删除的文件。 | 缺失文件可以剪掉元数据，但存在且损坏的文件仍然是硬错误。 |
 | WAL recovery 卫生 | 已提交 WAL 旁边残留临时文件或说明文件。 | 只重放 `{id}.wal`；忽略非 WAL 条目，损坏的已提交 WAL 必须失败。 |
