@@ -10,6 +10,41 @@ import (
 	"github.com/xmh1011/go-kv/pkg/log"
 )
 
+// ScheduleCompaction runs compaction outside the foreground write/flush path.
+// Multiple calls while a worker is active are coalesced into one extra pass.
+func (m *Manager) ScheduleCompaction() {
+	m.mu.Lock()
+	if m.compactionRunning {
+		m.compactionQueued = true
+		m.mu.Unlock()
+		return
+	}
+	m.compactionRunning = true
+	m.compactionWG.Add(1)
+	m.mu.Unlock()
+
+	go m.runScheduledCompactions()
+}
+
+func (m *Manager) runScheduledCompactions() {
+	defer m.compactionWG.Done()
+
+	for {
+		if err := m.Compaction(); err != nil {
+			log.Errorf("[Compaction] Scheduled compaction error: %v", err)
+		}
+
+		m.mu.Lock()
+		if !m.compactionQueued {
+			m.compactionRunning = false
+			m.mu.Unlock()
+			return
+		}
+		m.compactionQueued = false
+		m.mu.Unlock()
+	}
+}
+
 // Compaction 执行 Level0 的同步合并，并触发 Level1 及以上的异步合并。
 // 合并流程：
 // 1. 收集 Level0 文件，解码其 DataBlock，并统计全局 key 区间。

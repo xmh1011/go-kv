@@ -37,10 +37,12 @@ type Manager struct {
 	sparseIndexes [][]*SSTable
 
 	// 异步合并控制
-	compactionCond   *sync.Cond
-	compactingLevels map[int]bool // 记录各层级的压缩状态
-	compactionWG     sync.WaitGroup
-	nextID           atomic.Uint64
+	compactionCond    *sync.Cond
+	compactingLevels  map[int]bool // 记录各层级的压缩状态
+	compactionWG      sync.WaitGroup
+	compactionRunning bool
+	compactionQueued  bool
+	nextID            atomic.Uint64
 
 	minSSTableLevel int
 	maxSSTableLevel int
@@ -134,11 +136,7 @@ func (m *Manager) CreateNewSSTable(imem *memtable.IMemTable) error {
 	m.addTable(sst)
 	log.Debugf("[SSTableManager] Created new SSTable %s at level %d", sst.FilePath(), sst.level)
 
-	// 执行合并逻辑
-	if err := m.Compaction(); err != nil {
-		log.Errorf("[SSTableManager] Compaction error: %s", err.Error())
-		return fmt.Errorf("compaction failed: %w", err)
-	}
+	m.ScheduleCompaction()
 
 	imem.Clean() // 删除已经成功落盘的 WAL 文件
 	return nil

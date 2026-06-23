@@ -253,6 +253,37 @@ Compaction 将某一层 SSTable 合并到下一层。
 
 Compaction 还要区分 stale metadata 和真实文件损坏。如果内存目录引用的文件已经不存在，manager 会剪掉这个过期元数据并继续。如果文件存在但无法解码，compaction 仍然返回错误。这样既保持对真实损坏的严格性，又允许文件目录中的 stale entry 自恢复。
 
+前台 flush 和 compaction 必须解耦。Flush 的职责是把 immutable memtable
+持久化并发布为 Level-0 SSTable；它不应该同步等待 compaction 完成。原因是
+Raft apply 路径会在持有 `stateMachineMu` 时写入 LSM-backed 状态机。如果
+`Database.Put` 或 `ForceFlush` 在这个锁内等待一次大型 compaction，那么后续所有
+已提交 Raft entry 都无法继续 apply，客户端 waiter 也可能触发 apply timeout。
+
+当前发布路径是：
+
+```text
+immutable memtable
+        |
+        v
+EncodeTo 同目录临时文件
+        |
+        v
+fsync + close + rename 为最终 .sst
+        |
+        v
+在 Manager.mu 下发布 Level-0 metadata
+        |
+        v
+清理 immutable WAL
+        |
+        v
+ScheduleCompaction 合并到后台 worker
+```
+
+`ScheduleCompaction` 保证同一时间最多只有一个前台调度的 compaction worker。
+worker 运行期间新的调度请求会被合并为下一轮 pass。测试和关闭流程仍可使用
+`WaitForCompactions()` 等待后台 compaction 完全收敛。
+
 ## 12. Raft 日志存储适配器
 
 `pkg/storage/lsm/storage.go` 基于 LSM 实现 `storage.Storage`。
@@ -402,6 +433,7 @@ t.DataBlock = block.NewDataBlock()
 | `totalMap map[int][]string` | 按层保存文件路径。 |
 | `sparseIndexes [][]*SSTable` | Level 1 及更深层按最小 key 排序的稀疏索引。 |
 | `compactingLevels map[int]bool` | 正在 compaction 的层级。 |
+| `compactionRunning`, `compactionQueued` | 合并后台 compaction 请求，让 flush 不在前台等待 compaction。 |
 
 一次 flush 只有在 SSTable 元数据发布之后，才算对读请求可见：
 

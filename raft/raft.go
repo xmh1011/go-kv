@@ -57,7 +57,10 @@ const (
 	maxBatchSize   = 64  // 单批最大 proposal 数量
 )
 
-const clientApplyTimeout = 5 * time.Second
+const (
+	clientApplyTimeout         = 5 * time.Second
+	minReadIndexConfirmTimeout = 2 * time.Second
+)
 
 type Raft struct {
 	// mu 保护对 Raft 状态的并发访问
@@ -774,7 +777,7 @@ func (r *Raft) confirmLeadership() bool {
 	}
 
 	// 5. 统计票数
-	timeout := time.After(electionTimeout * 2)
+	timeout := time.After(readIndexConfirmTimeout(electionTimeout))
 
 	for i := 0; i < len(requests); i++ {
 		select {
@@ -811,6 +814,14 @@ func (r *Raft) confirmLeadership() bool {
 	r.mu.Unlock()
 
 	return hasQuorum
+}
+
+func readIndexConfirmTimeout(electionTimeout time.Duration) time.Duration {
+	timeout := electionTimeout * 2
+	if timeout < minReadIndexConfirmTimeout {
+		return minReadIndexConfirmTimeout
+	}
+	return timeout
 }
 
 // tryRenewLease 检查是否有足够的多数派确认，如果有则更新租约。
@@ -987,9 +998,6 @@ func (r *Raft) CommitClient(command any, clientID, sequenceNum int64, trackClien
 		result, ok = r.waitForAppliedClientLog(index, clientApplyTimeout, clientID, sequenceNum)
 	} else {
 		result, ok = r.waitForAppliedLog(index, clientApplyTimeout)
-	}
-	if !ok && trackClient {
-		r.clearPendingClientRequest(index)
 	}
 	return result, ok, r.id
 }

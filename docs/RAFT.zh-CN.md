@@ -203,6 +203,13 @@ store.AppendEntries
 
 这让客户端重试具备幂等性。即使同一个逻辑请求在日志中出现多次，状态机也只应用一次。
 
+leader 侧 apply timeout 不能清理 pending client request。Timeout 只表示本次调用方停止等待，并不证明该日志 entry 已经失败或永远不会被 apply。`(ClientID, SequenceNum)` 对应的记录会保留在 `pendingClientRequests` 和 `pendingLogClients` 中，直到下面两种情况之一发生：
+
+- `completeAppliedEntry` 观察到该 client command，并更新 `clientSessions`；
+- 当前节点降级为 follower，终止旧 leader 的等待者。
+
+这样，同一个 client identity 的重试会重新绑定到原来的 log index，而不是在第一条 entry 仍可能提交时追加重复工作。
+
 ## 9. Follower 上的 AppendEntries
 
 `AppendEntries` 做三件事：
@@ -323,6 +330,20 @@ stateMachine.Get(key)
 - `lease`：在 lease 时间内复用最近多数派确认。
 
 联合共识期间，leader 确认必须同时满足旧配置多数派和新配置多数派。
+
+超时预算必须和传输层 RPC 预算对齐。Follower 不能在一次健康 AppendEntries RPC
+允许返回之前就发起新选举。gRPC 传输中 `DefaultAppendEntriesTimeout` 是 2s，
+因此默认 election timeout 是 2.5s。ReadIndex 的 heartbeat 确认也有下限：
+
+```go
+timeout := electionTimeout * 2
+if timeout < minReadIndexConfirmTimeout {
+    timeout = minReadIndexConfirmTimeout
+}
+```
+
+这样可以避免线性一致读在健康 heartbeat ack 仍处于配置允许的 RPC timeout 内时，
+就误判 leader 已经失效。
 
 ## 14. 快照和日志压缩
 

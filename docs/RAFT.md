@@ -222,6 +222,20 @@ wait for apply result
 That makes client retries idempotent. If the same logical request appears twice
 in the log, the state machine applies it once and resolves the duplicate waiter.
 
+Pending client requests must survive a leader-side apply timeout. A timeout only
+means the caller stopped waiting for the current attempt; it does not prove the
+log entry failed or will never apply. The `(ClientID, SequenceNum)` entry stays
+in `pendingClientRequests` and `pendingLogClients` until one of two events
+happens:
+
+- `completeAppliedEntry` observes the client command and updates
+  `clientSessions`;
+- the node steps down and aborts stale leader waiters.
+
+This lets a retry with the same client identity bind back to the original log
+index instead of appending duplicate work while the first entry is still
+committing.
+
 ## 9. AppendEntries On Followers
 
 `AppendEntries` does three jobs:
@@ -356,6 +370,21 @@ stateMachine.Get(key)
 
 During joint consensus, leadership confirmation requires a quorum from both old
 and new configurations.
+
+Timeouts must be aligned with transport budgets. A follower must not start a new
+election before a healthy AppendEntries RPC is allowed to return. With the gRPC
+transport, `DefaultAppendEntriesTimeout` is 2s, so the default election timeout
+is 2.5s. ReadIndex heartbeat confirmation also uses a floor:
+
+```go
+timeout := electionTimeout * 2
+if timeout < minReadIndexConfirmTimeout {
+    timeout = minReadIndexConfirmTimeout
+}
+```
+
+This prevents a linearizable read from declaring leadership lost while healthy
+heartbeat acknowledgements are still inside the configured RPC timeout.
 
 ## 14. Snapshots And Log Compaction
 

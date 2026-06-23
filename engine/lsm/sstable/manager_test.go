@@ -142,6 +142,41 @@ func writeRecoverableSSTableWithID(t *testing.T, dir string, id uint64, key stri
 	}
 }
 
+func TestCreateNewSSTableDoesNotBlockBehindCompaction(t *testing.T) {
+	manager := NewSSTableManager(t.TempDir())
+	level := manager.minSSTableLevel
+
+	manager.mu.Lock()
+	manager.compactingLevels[level] = true
+	manager.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.CreateNewSSTable(testIMemWithPair("key", "value"))
+	}()
+
+	completed := false
+	defer func() {
+		manager.endCompactionLevels([]int{level})
+		if !completed {
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("CreateNewSSTable goroutine did not finish after releasing compaction")
+			}
+		}
+		manager.WaitForCompactions()
+	}()
+
+	select {
+	case err := <-done:
+		completed = true
+		assert.NoError(t, err)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("CreateNewSSTable should publish the new table without waiting for compaction")
+	}
+}
+
 func TestSSTableManagerOpenFilesSnapshotReleasesManagerLock(t *testing.T) {
 	tmp := t.TempDir()
 

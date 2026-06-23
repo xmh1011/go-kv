@@ -143,6 +143,21 @@ func TestLongRunningStopGateDoesNotCancelIssuedRequest(t *testing.T) {
 	}
 }
 
+func TestLongRunningRetryBudgetExtendsAfterRequestIssued(t *testing.T) {
+	now := time.Now()
+	issuedAt := now.Add(-longRunningIssuedRequestRetryTimeout / 2)
+
+	if shouldContinueLongRunningRetry(longRunningClientRetries, longRunningClientRetries, false, time.Time{}, now) {
+		t.Fatal("not-yet-issued requests should stop at the normal retry limit")
+	}
+	if !shouldContinueLongRunningRetry(longRunningClientRetries, longRunningClientRetries, true, issuedAt, now) {
+		t.Fatal("issued requests should continue beyond the normal retry count")
+	}
+	if shouldContinueLongRunningRetry(longRunningClientRetries, longRunningClientRetries, true, now.Add(-longRunningIssuedRequestRetryTimeout-time.Millisecond), now) {
+		t.Fatal("issued requests should stop after the issued-request retry timeout")
+	}
+}
+
 type longRunningValidationOptions struct {
 	RequireNoFailedOps         bool
 	RequireConsistency         bool
@@ -229,8 +244,9 @@ func (fs *failureStats) snapshot() []FailureReasonCount {
 }
 
 const (
-	longRunningSnapshotThreshold = 2 * 1024 * 1024
-	longRunningClientRetries     = 20
+	longRunningSnapshotThreshold         = 2 * 1024 * 1024
+	longRunningClientRetries             = 20
+	longRunningIssuedRequestRetryTimeout = 30 * time.Second
 )
 
 // latencySampler 延迟采样器，限制采样数量以控制内存使用
@@ -609,6 +625,7 @@ func (c *longRunningCluster) sendRequest(node *raft.Raft, cmd param.KVCommand) (
 func (c *longRunningCluster) sendRequestToAnyNode(cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, error) {
 	var totalLatency time.Duration
 	requestIssued := false
+	requestIssuedAt := time.Time{}
 
 	// 初始随机选择一个节点
 	nodeIdx := rand.Intn(c.nodeCount())
@@ -620,7 +637,7 @@ func (c *longRunningCluster) sendRequestToAnyNode(cmd param.KVCommand, maxRetrie
 		Command:     cmdBytes,
 	}
 
-	for retry := 0; retry < maxRetries; retry++ {
+	for retry := 0; shouldContinueLongRunningRetry(retry, maxRetries, requestIssued, requestIssuedAt, time.Now()); retry++ {
 		// Stop only gates new operations. Once this client identity has been
 		// sent, keep retrying it so the test's expected-value model cannot miss
 		// an operation that commits after shutdown starts.
@@ -631,6 +648,9 @@ func (c *longRunningCluster) sendRequestToAnyNode(cmd param.KVCommand, maxRetrie
 		reply := &param.ClientReply{}
 
 		start := time.Now()
+		if !requestIssued {
+			requestIssuedAt = start
+		}
 		requestIssued = true
 		err := node.ClientRequest(args, reply)
 		latency := time.Since(start)
@@ -719,6 +739,16 @@ func waitBeforeRetryAfterIssued(stopCh <-chan struct{}, delay time.Duration, req
 	return waitBeforeRetry(stopCh, delay)
 }
 
+func shouldContinueLongRunningRetry(retry, maxRetries int, requestIssued bool, requestIssuedAt, now time.Time) bool {
+	if !requestIssued {
+		return retry < maxRetries
+	}
+	if requestIssuedAt.IsZero() {
+		return true
+	}
+	return now.Sub(requestIssuedAt) < longRunningIssuedRequestRetryTimeout
+}
+
 // findLeader 遍历所有节点找到当前 Leader
 func (c *longRunningCluster) findLeader() *raft.Raft {
 	for _, node := range c.nodesSnapshot() {
@@ -752,6 +782,7 @@ func (c *longRunningCluster) sendRequestWithClientLeaderTrackingDetailed(current
 	var totalLatency time.Duration
 	lastFailureReason := "max_retries_exceeded"
 	requestIssued := false
+	requestIssuedAt := time.Time{}
 	cmdBytes, _ := json.Marshal(cmd)
 	args := &param.ClientArgs{
 		ClientID:    clientID,
@@ -759,7 +790,7 @@ func (c *longRunningCluster) sendRequestWithClientLeaderTrackingDetailed(current
 		Command:     cmdBytes,
 	}
 
-	for retry := 0; retry < maxRetries; retry++ {
+	for retry := 0; shouldContinueLongRunningRetry(retry, maxRetries, requestIssued, requestIssuedAt, time.Now()); retry++ {
 		// Stop only gates new operations. Once the command has been sent, keep
 		// retrying the same client request so a late Raft commit is still
 		// reflected in the long-running consistency tracker.
@@ -784,6 +815,9 @@ func (c *longRunningCluster) sendRequestWithClientLeaderTrackingDetailed(current
 		reply := &param.ClientReply{}
 
 		start := time.Now()
+		if !requestIssued {
+			requestIssuedAt = start
+		}
 		requestIssued = true
 		err := leader.ClientRequest(args, reply)
 		latency := time.Since(start)

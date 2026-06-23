@@ -228,7 +228,7 @@ func TestStartElection(t *testing.T) {
 				select {
 				case msg := <-stateChangeCh:
 					assert.Equal(t, "reverted", msg)
-				case <-time.After(2 * time.Second):
+				case <-time.After(r.electionTimeout + time.Second):
 					t.Fatal("timed out waiting for node to revert to follower")
 				}
 

@@ -14,6 +14,10 @@ English version: [BUG_FIX_RETROSPECTIVE.md](BUG_FIX_RETROSPECTIVE.md)
 - #93 Keep LSM compaction metadata consistent when SSTable files disappear
 - #94 Skip long-running E2E scenarios in short mode
 - #95 Preserve LSM data across TCP leader restart
+- #113 Investigate ReadIndex timeouts and long E2E throughput regression
+- #115 Concurrent gRPC LSM writes can fail and leave missing keys
+- #116 Long mixed-failure E2E exhausts retries during leader changes
+- #117 Mixed-failure long E2E can return apply timeouts despite final consistency
 
 ## 1. 真正改变结果的调试原则
 
@@ -592,3 +596,156 @@ GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_Consi
 
 聚焦 10 分钟重放完成：总操作 1,104,337，失败操作 0，最终 barrier 成功，
 3,600 个严格 node-key 一致性检查通过。
+
+## 17. 2026-06-23 ReadIndex、选举超时和 LSM Compaction 修复
+
+这一轮长测重点不是小边界，而是内核层可用性问题。它暴露了一条连续故障链：
+健康 heartbeat 可能比 ReadIndex 确认预算更慢；follower 可能在健康
+AppendEntries RPC 允许返回前就发起新选举；长测客户端可能在 leader churn
+期间放弃已经发出的请求；前台 LSM compaction 还可能让 Raft apply 停顿到
+客户端出现 apply timeout。
+
+### #113：ReadIndex 确认必须尊重 RPC 预算
+
+症状：长时间 E2E 最终安全通过，但出现 ReadIndex quorum timeout warning。
+聚焦单测进一步证明：`confirmLeadership` 使用 `electionTimeout * 2` 作为等待时间，
+即使两个 heartbeat ack 都是健康的，只要它们慢于这个本地预算，也会被误判失败。
+
+修复方案是给 ReadIndex heartbeat 确认增加下限：
+
+```go
+func readIndexConfirmTimeout(electionTimeout time.Duration) time.Duration {
+    timeout := electionTimeout * 2
+    if timeout < minReadIndexConfirmTimeout {
+        return minReadIndexConfirmTimeout
+    }
+    return timeout
+}
+```
+
+这样线性一致读不会在健康 AppendEntries 回复仍处于传输层 timeout 内时，就误报
+leader 失效。
+
+### #115：Election Timeout 必须大于健康 AppendEntries Timeout
+
+症状：包级并发 race 测试下，`TestCluster_ConcurrentClientRequests/grpc_lsm`
+偶发缺失 key。根因是默认超时预算不一致：
+
+```go
+DefaultElectionTimeout      = 500 * time.Millisecond
+DefaultAppendEntriesTimeout = 2 * time.Second
+```
+
+Follower 可以在一次健康 AppendEntries RPC 仍允许 in-flight 时发起新选举，
+在 race detector 和包并发负载下放大 leader churn。
+
+默认 election timeout 调整为 2.5s，并增加配置回归测试：
+
+```go
+assert.Greater(t,
+    config.DefaultElectionTimeout,
+    transportgrpc.DefaultAppendEntriesTimeout,
+)
+```
+
+这不是修改 Raft 论文中的选举规则，而是让实现的超时预算与传输层一致。
+
+### #116：已发出的长测请求需要时间预算，而不是固定重试次数
+
+症状：10 分钟 mixed-failure E2E 中出现少量 `not_leader` 失败，但最终 barrier
+和严格一致性都通过。请求已经发出后，集群仍可能提交它；但测试 helper 只按固定次数重试：
+
+```go
+for retry := 0; retry < maxRetries; retry++ {
+    ...
+}
+```
+
+长测 helper 现在区分两种状态：
+
+- 请求发出前，仍使用普通重试次数上限；
+- 请求发出后，使用有界 wall-clock 时间窗口继续追踪同一逻辑请求。
+
+```go
+func shouldContinueLongRunningRetry(retry, maxRetries int, requestIssued bool, requestIssuedAt, now time.Time) bool {
+    if !requestIssued {
+        return retry < maxRetries
+    }
+    return now.Sub(requestIssuedAt) < longRunningIssuedRequestRetryTimeout
+}
+```
+
+这样可以保护期望值模型：一旦某个逻辑 client request 可能进入 Raft，测试就继续跟踪同一个 `(ClientID, SequenceNum)`，直到得到终态结果。
+
+### #117：Apply Timeout 的深层原因是前台 Compaction 停顿
+
+#116 之后，mixed-failure 场景暴露了新的 `apply_timeout`。随后全量长测在
+Comprehensive 和 WriteHeavy 中复现了同类问题。关键线索是 WriteHeavy 有 8 个
+客户端，而一次窗口里正好失败 8 个 apply timeout。这说明问题不是随机客户端失败，
+而是一次全局 apply 停顿。
+
+第一步修复是 leader 侧 apply timeout 后不能清理 pending client request：
+
+```go
+// 旧行为：timeout 后删除 pending request
+if !ok && trackClient {
+    r.clearPendingClientRequest(index)
+}
+```
+
+删除是错误的。Timeout 不证明原 entry 失败。保留 `pendingClientRequests` 后，
+同一个 client identity 的重试可以重新挂到原始 log index，而不是在第一条 entry
+仍可能提交时追加重复工作。
+
+更深层根因在 LSM。`CreateNewSSTable` 每次 flush 后同步执行 compaction：
+
+```go
+if err := m.Compaction(); err != nil {
+    return fmt.Errorf("compaction failed: %w", err)
+}
+```
+
+Raft apply 已提交 entry 时，会在持有 `stateMachineMu` 的情况下写入 LSM-backed
+状态机。如果 flush 在这条路径里触发大型 compaction，后续所有 committed entry
+都会停止 apply，客户端 waiter 就可能耗尽 apply/retry 窗口，尽管集群最终仍能收敛。
+
+修复后，前台只发布持久化 Level-0 SSTable，compaction 由合并调度的后台 worker 执行：
+
+```go
+func (m *Manager) CreateNewSSTable(imem *memtable.IMemTable) error {
+    ...
+    m.addTable(sst)
+    m.ScheduleCompaction()
+    imem.Clean()
+    return nil
+}
+```
+
+`ScheduleCompaction` 保证只有一个 worker 活跃，并把新增请求合并为下一轮 pass：
+
+```go
+if m.compactionRunning {
+    m.compactionQueued = true
+    return
+}
+m.compactionRunning = true
+go m.runScheduledCompactions()
+```
+
+存储不变量没有改变：`CreateNewSSTable` 返回时，数据已经在 Level 0 持久化且可见。
+被移出 Raft apply 关键路径的只是昂贵的跨层 merge。
+
+### 验证
+
+最终验证命令：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=10m
+GO_KV_LOG_LEVEL=warn go test ./raft -count=1 -timeout=8m
+GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_WriteHeavy$' -count=1
+GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m
+```
+
+最终六场景长时间 E2E 全部失败操作为 0。重启/快照类场景的 final barrier
+和逐节点严格一致性检查也全部通过。最新指标记录在 [PERFORMANCE.zh-CN.md](PERFORMANCE.zh-CN.md)。
