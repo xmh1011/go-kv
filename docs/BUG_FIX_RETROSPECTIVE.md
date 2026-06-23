@@ -21,6 +21,7 @@ Related issues:
 - #115 Concurrent gRPC LSM writes can fail and leave missing keys
 - #116 Long mixed-failure E2E exhausts retries during leader changes
 - #117 Mixed-failure long E2E can return apply timeouts despite final consistency
+- #119 Avoid unnecessary LSM compaction scheduling below threshold
 
 ## 1. The Debugging Rule That Changed The Result
 
@@ -808,7 +809,9 @@ compaction on a coalesced background worker:
 func (m *Manager) CreateNewSSTable(imem *memtable.IMemTable) error {
     ...
     m.addTable(sst)
-    m.ScheduleCompaction()
+    if m.isLevelNeedToBeMerged(m.minSSTableLevel) {
+        m.ScheduleCompaction()
+    }
     imem.Clean()
     return nil
 }
@@ -846,3 +849,116 @@ The final six-scenario long E2E run completed with zero failed operations in
 all scenarios. The strict restart/snapshot scenarios passed their final barrier
 and node-by-node consistency checks. The latest numbers are recorded in
 [PERFORMANCE.md](PERFORMANCE.md).
+
+## 18. 2026-06-23 Threshold-Gated LSM Compaction Scheduling
+
+Related issue: #119.
+
+### Symptom
+
+The first baseline after #118 failed in the SSTable package:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./raft ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=12m
+```
+
+The failure was:
+
+```text
+--- FAIL: TestSSTableManagerOpenFilesSnapshotReleasesManagerLock
+    manager_test.go:201: OpenFilesSnapshot kept the manager lock while callers read files
+```
+
+A focused rerun reproduced it without the race detector:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run '^TestSSTableManagerOpenFilesSnapshotReleasesManagerLock$' -count=10 -timeout=2m
+```
+
+### Root Cause
+
+#117 correctly moved compaction out of the foreground flush path, but the first
+implementation scheduled a background worker after every non-empty flush:
+
+```go
+m.addTable(sst)
+m.ScheduleCompaction()
+imem.Clean()
+```
+
+That was too broad. A single new Level-0 SSTable is below the compaction
+threshold, so the worker has no merge work to do. It can still briefly take
+`Manager.mu` while checking the catalog. The existing snapshot-lock test then
+failed because it observed this unrelated no-op worker, not because
+`OpenFilesSnapshot` kept the lock after returning.
+
+The production issue is the same: a below-threshold flush should not create a
+goroutine and contend on the manager lock just to discover that compaction is
+unnecessary.
+
+### Regression Test
+
+The deterministic test blocks Level-0 compaction before creating one SSTable. If
+the flush schedules a worker below the threshold, that worker remains visible as
+`compactionRunning`:
+
+```go
+func TestCreateNewSSTableSkipsCompactionWhenBelowThreshold(t *testing.T) {
+    manager := NewSSTableManager(t.TempDir())
+    level := manager.minSSTableLevel
+
+    manager.mu.Lock()
+    manager.compactingLevels[level] = true
+    manager.mu.Unlock()
+    defer func() {
+        manager.endCompactionLevels([]int{level})
+        manager.WaitForCompactions()
+    }()
+
+    assert.NoError(t, manager.CreateNewSSTable(testIMemWithPair("key", "value")))
+
+    manager.mu.Lock()
+    running := manager.compactionRunning
+    queued := manager.compactionQueued
+    manager.mu.Unlock()
+
+    assert.False(t, running)
+    assert.False(t, queued)
+}
+```
+
+Before the fix this failed with:
+
+```text
+below-threshold flush must not start a no-op compaction worker
+```
+
+### Fix
+
+`CreateNewSSTable` now checks the Level-0 threshold after publishing the new
+table and schedules background compaction only when there is real work:
+
+```go
+m.addTable(sst)
+log.Debugf("[SSTableManager] Created new SSTable %s at level %d", sst.FilePath(), sst.level)
+
+if m.isLevelNeedToBeMerged(m.minSSTableLevel) {
+    m.ScheduleCompaction()
+}
+
+imem.Clean()
+```
+
+This preserves the #117 invariant that foreground flush does not wait for
+compaction. It adds a second invariant: background compaction should not be
+created for below-threshold states.
+
+### Validation
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run '^(TestCreateNewSSTableSkipsCompactionWhenBelowThreshold|TestSSTableManagerOpenFilesSnapshotReleasesManagerLock)$' -count=10 -timeout=2m
+GO_KV_LOG_LEVEL=warn go test ./raft ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -count=100 -timeout=5m
+GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test ./tests -run '^(TestCluster_ConcurrentClientRequests|TestCluster_TakeSnapshot|TestCluster_InstallSnapshot|TestCluster_FullClusterRestart|TestCluster_LeaderFailover)$' -count=3 -timeout=12m
+```

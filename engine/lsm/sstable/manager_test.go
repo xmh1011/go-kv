@@ -177,6 +177,29 @@ func TestCreateNewSSTableDoesNotBlockBehindCompaction(t *testing.T) {
 	}
 }
 
+func TestCreateNewSSTableSkipsCompactionWhenBelowThreshold(t *testing.T) {
+	manager := NewSSTableManager(t.TempDir())
+	level := manager.minSSTableLevel
+
+	manager.mu.Lock()
+	manager.compactingLevels[level] = true
+	manager.mu.Unlock()
+	defer func() {
+		manager.endCompactionLevels([]int{level})
+		manager.WaitForCompactions()
+	}()
+
+	assert.NoError(t, manager.CreateNewSSTable(testIMemWithPair("key", "value")))
+
+	manager.mu.Lock()
+	running := manager.compactionRunning
+	queued := manager.compactionQueued
+	manager.mu.Unlock()
+
+	assert.False(t, running, "below-threshold flush must not start a no-op compaction worker")
+	assert.False(t, queued, "below-threshold flush must not queue a no-op compaction pass")
+}
+
 func TestSSTableManagerOpenFilesSnapshotReleasesManagerLock(t *testing.T) {
 	tmp := t.TempDir()
 

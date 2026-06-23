@@ -20,6 +20,10 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 | 目的 | 命令 | 结果 |
 |---|---|---|
 | LSM/WAL recovery 回归 | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=10m` | 通过 |
+| LSM compaction 调度回归 | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run '^(TestCreateNewSSTableSkipsCompactionWhenBelowThreshold|TestSSTableManagerOpenFilesSnapshotReleasesManagerLock)$' -count=10 -timeout=2m` | 通过 |
+| SSTable 包稳定性循环 | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -count=100 -timeout=5m` | 114.758s 通过 |
+| LSM/storage race 门禁 | `GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=12m` | 通过 |
+| 聚焦集群回归循环 | `GO_KV_LOG_LEVEL=warn go test ./tests -run '^(TestCluster_ConcurrentClientRequests|TestCluster_TakeSnapshot|TestCluster_InstallSnapshot|TestCluster_FullClusterRestart|TestCluster_LeaderFailover)$' -count=3 -timeout=12m` | 527.110s 通过 |
 | 全量 short 单元/集成门禁 | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m` | 通过；最新 `tests` 包 977.155s |
 | 单个 10 分钟写入密集触发场景 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_WriteHeavy$' -count=1` | 异步 compaction 调度修复后 613.049s 通过 |
 | 全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | 3657.132s 通过 |
@@ -47,6 +51,9 @@ ReadIndex 与 apply-timeout 回归。对写入稳定性最关键的变化是：
 SSTable compaction 不再同步运行在 Raft apply 前台路径里。MemTable flush
 仍会先发布持久化的 Level-0 SSTable，然后把 compaction 合并到后台 worker
 里执行；测试或关闭流程可以通过 `WaitForCompactions()` 等待后台任务收敛。
+Issue #119 进一步收紧了这个路径：低于阈值的 flush 不再启动无实际 merge 工作的
+compaction worker，普通小 flush 不会额外创建 goroutine，也不会为 no-op compaction
+竞争 `Manager.mu`。
 
 ## #109 后的重启/快照聚焦重放
 
@@ -139,4 +146,4 @@ make test
 5. 应用到 LSM-backed 状态机；
 6. 对客户端返回可见结果。
 
-最新性能修复已经把 LSM compaction 移出了前台 flush 路径。后续有价值的性能优化方向包括 batch 大小、follower 追赶、Raft log adapter 写放大降低，以及后台 compaction worker 的背压指标。任何优化都不应削弱上面的正确性门禁。
+最新性能修复已经把 LSM compaction 移出了前台 flush 路径，并且让后台调度受阈值门禁控制。后续有价值的性能优化方向包括 batch 大小、follower 追赶、Raft log adapter 写放大降低，以及后台 compaction worker 的背压指标。任何优化都不应削弱上面的正确性门禁。

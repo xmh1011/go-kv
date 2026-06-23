@@ -303,16 +303,22 @@ fsync + close + rename final .sst
 publish Level-0 metadata under Manager.mu
         |
         v
-clean immutable WAL
+if Level 0 exceeds its file threshold:
+    ScheduleCompaction in a coalesced background worker
         |
         v
-ScheduleCompaction in a coalesced background worker
+clean immutable WAL
 ```
 
 `ScheduleCompaction` keeps at most one foreground worker active. Additional
 schedule requests while that worker is running are coalesced into one extra pass.
 Tests and shutdown can still call `WaitForCompactions()` when they need a fully
 settled file layout.
+
+The scheduler is threshold-gated. A normal below-threshold flush publishes the
+new Level-0 SSTable and returns without starting a no-op worker. This avoids
+creating goroutines and taking `Manager.mu` for compaction checks that cannot
+produce any merge work.
 
 ## 12. Raft Log Storage Adapter
 

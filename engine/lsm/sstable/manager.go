@@ -136,7 +136,9 @@ func (m *Manager) CreateNewSSTable(imem *memtable.IMemTable) error {
 	m.addTable(sst)
 	log.Debugf("[SSTableManager] Created new SSTable %s at level %d", sst.FilePath(), sst.level)
 
-	m.ScheduleCompaction()
+	if m.isLevelNeedToBeMerged(m.minSSTableLevel) {
+		m.ScheduleCompaction()
+	}
 
 	imem.Clean() // 删除已经成功落盘的 WAL 文件
 	return nil

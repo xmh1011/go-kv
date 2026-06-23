@@ -23,6 +23,10 @@ LSM compaction, client retries, and final data consistency.
 | Purpose | Command | Result |
 |---|---|---|
 | LSM/WAL recovery regression | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=10m` | Passed |
+| LSM compaction scheduling regression | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run '^(TestCreateNewSSTableSkipsCompactionWhenBelowThreshold|TestSSTableManagerOpenFilesSnapshotReleasesManagerLock)$' -count=10 -timeout=2m` | Passed |
+| SSTable package stability loop | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -count=100 -timeout=5m` | Passed in 114.758s |
+| LSM/storage race gate | `GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=12m` | Passed |
+| Focused cluster regression loop | `GO_KV_LOG_LEVEL=warn go test ./tests -run '^(TestCluster_ConcurrentClientRequests|TestCluster_TakeSnapshot|TestCluster_InstallSnapshot|TestCluster_FullClusterRestart|TestCluster_LeaderFailover)$' -count=3 -timeout=12m` | Passed in 527.110s |
 | Full short unit/integration gate | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m` | Passed; latest `tests` package 977.155s |
 | Single 10-minute write-heavy trigger scenario | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_WriteHeavy$' -count=1` | Passed in 613.049s after async compaction scheduling |
 | Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | Passed in 3657.132s |
@@ -56,7 +60,9 @@ change for write-heavy stability is that SSTable compaction is no longer run
 synchronously in the foreground Raft apply path. MemTable flush still publishes
 durable Level-0 SSTables before returning, but compaction is scheduled on a
 coalesced background worker and can be joined with `WaitForCompactions()` during
-shutdown or tests.
+shutdown or tests. Follow-up issue #119 tightened this further: below-threshold
+flushes now return without starting a no-op compaction worker, so ordinary small
+flushes do not create avoidable goroutines or contend on `Manager.mu`.
 
 ## Post-#109 Focused Restart/Snapshot Replay
 
@@ -157,8 +163,9 @@ write must:
 5. apply to the LSM-backed state machine;
 6. become visible to the client.
 
-The latest performance fix moved LSM compaction out of the foreground flush
-path. The next meaningful performance work should target batch sizing, follower
-catch-up, lower write-amplification in the Raft log adapter, and backpressure
-metrics for the background compaction worker. These optimizations should not
-weaken the consistency gates above.
+The latest performance fixes moved LSM compaction out of the foreground flush
+path and made background scheduling threshold-gated. The next meaningful
+performance work should target batch sizing, follower catch-up, lower
+write-amplification in the Raft log adapter, and backpressure metrics for the
+background compaction worker. These optimizations should not weaken the
+consistency gates above.

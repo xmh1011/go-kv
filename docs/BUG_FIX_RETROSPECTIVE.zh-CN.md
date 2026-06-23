@@ -18,6 +18,7 @@ English version: [BUG_FIX_RETROSPECTIVE.md](BUG_FIX_RETROSPECTIVE.md)
 - #115 Concurrent gRPC LSM writes can fail and leave missing keys
 - #116 Long mixed-failure E2E exhausts retries during leader changes
 - #117 Mixed-failure long E2E can return apply timeouts despite final consistency
+- #119 Avoid unnecessary LSM compaction scheduling below threshold
 
 ## 1. 真正改变结果的调试原则
 
@@ -715,7 +716,9 @@ Raft apply 已提交 entry 时，会在持有 `stateMachineMu` 的情况下写�
 func (m *Manager) CreateNewSSTable(imem *memtable.IMemTable) error {
     ...
     m.addTable(sst)
-    m.ScheduleCompaction()
+    if m.isLevelNeedToBeMerged(m.minSSTableLevel) {
+        m.ScheduleCompaction()
+    }
     imem.Clean()
     return nil
 }
@@ -749,3 +752,111 @@ GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m
 
 最终六场景长时间 E2E 全部失败操作为 0。重启/快照类场景的 final barrier
 和逐节点严格一致性检查也全部通过。最新指标记录在 [PERFORMANCE.zh-CN.md](PERFORMANCE.zh-CN.md)。
+
+## 18. 2026-06-23 LSM Compaction 调度增加阈值门禁
+
+相关 issue：#119。
+
+### 症状
+
+#118 合并后的第一轮核心包基线失败：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./raft ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=12m
+```
+
+失败点：
+
+```text
+--- FAIL: TestSSTableManagerOpenFilesSnapshotReleasesManagerLock
+    manager_test.go:201: OpenFilesSnapshot kept the manager lock while callers read files
+```
+
+单独重复运行也能复现：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run '^TestSSTableManagerOpenFilesSnapshotReleasesManagerLock$' -count=10 -timeout=2m
+```
+
+### 根因
+
+#117 把 compaction 从前台 flush 路径移到后台，这是正确方向；但初版实现对每次非空 flush
+都调度后台 worker：
+
+```go
+m.addTable(sst)
+m.ScheduleCompaction()
+imem.Clean()
+```
+
+这太宽了。只有一个新的 Level-0 SSTable 时，文件数量低于 compaction 阈值，worker
+没有任何 merge 工作可做，但它仍会短暂竞争 `Manager.mu` 去检查目录状态。已有的
+snapshot-lock 测试观测到了这个无意义 worker，而不是 `OpenFilesSnapshot` 返回后仍持锁。
+
+生产上的问题也一样：低于阈值的 flush 不应该创建 goroutine，也不应该为了确认“无需
+compaction”而竞争 manager lock。
+
+### 回归测试
+
+测试先人为阻塞 Level-0 compaction，然后只创建一个 SSTable。若低于阈值仍调度 worker，
+`compactionRunning` 会稳定暴露出来：
+
+```go
+func TestCreateNewSSTableSkipsCompactionWhenBelowThreshold(t *testing.T) {
+    manager := NewSSTableManager(t.TempDir())
+    level := manager.minSSTableLevel
+
+    manager.mu.Lock()
+    manager.compactingLevels[level] = true
+    manager.mu.Unlock()
+    defer func() {
+        manager.endCompactionLevels([]int{level})
+        manager.WaitForCompactions()
+    }()
+
+    assert.NoError(t, manager.CreateNewSSTable(testIMemWithPair("key", "value")))
+
+    manager.mu.Lock()
+    running := manager.compactionRunning
+    queued := manager.compactionQueued
+    manager.mu.Unlock()
+
+    assert.False(t, running)
+    assert.False(t, queued)
+}
+```
+
+修复前，它会失败在：
+
+```text
+below-threshold flush must not start a no-op compaction worker
+```
+
+### 修复方案
+
+`CreateNewSSTable` 在发布新表后检查 Level-0 阈值，只有确实超过阈值时才调度后台
+compaction：
+
+```go
+m.addTable(sst)
+log.Debugf("[SSTableManager] Created new SSTable %s at level %d", sst.FilePath(), sst.level)
+
+if m.isLevelNeedToBeMerged(m.minSSTableLevel) {
+    m.ScheduleCompaction()
+}
+
+imem.Clean()
+```
+
+这样保留了 #117 的不变量：前台 flush 不等待 compaction；同时新增一个不变量：
+低于阈值时不创建无意义的后台 compaction worker。
+
+### 验证
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run '^(TestCreateNewSSTableSkipsCompactionWhenBelowThreshold|TestSSTableManagerOpenFilesSnapshotReleasesManagerLock)$' -count=10 -timeout=2m
+GO_KV_LOG_LEVEL=warn go test ./raft ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -count=100 -timeout=5m
+GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=12m
+GO_KV_LOG_LEVEL=warn go test ./tests -run '^(TestCluster_ConcurrentClientRequests|TestCluster_TakeSnapshot|TestCluster_InstallSnapshot|TestCluster_FullClusterRestart|TestCluster_LeaderFailover)$' -count=3 -timeout=12m
+```
