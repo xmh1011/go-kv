@@ -22,7 +22,7 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 | LSM/WAL recovery 回归 | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=5m` | 通过 |
 | 全量 short 单元/集成门禁 | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=25m` | 通过；最新 `tests` 包 776.861s |
 | 单个 10 分钟重启/快照触发场景 | `GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1 -timeout=25m` | 最新 post-#111 运行 607.722s 通过 |
-| 全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | 3672.630s 通过 |
+| 全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | 最新运行 3684.450s 通过 |
 
 现在 short 模式行为是明确的：10 分钟 E2E 在 `testing.Short()` 下会跳过。这样 `go test -short ./...` 可以继续作为 PR 覆盖率入口，而真实 10 分钟场景必须显式运行。
 
@@ -32,22 +32,28 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 
 | 场景 | 总操作数 | 失败操作 | 吞吐量 | P50 | P95 | P99 | Leader 切换 | 快照节点数 | 最大快照 index | 一致性 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Comprehensive | 741,998 | 0 | 1,236.66 ops/s | 2.947709ms | 13.335041ms | 29.132709ms | 34 | 3 | 557,264 | 通过，1,994 个 key |
-| WriteHeavy | 651,910 | 0 | 1,086.52 ops/s | 2.319708ms | 6.559708ms | 14.27275ms | 76 | 3 | 634,129 | 通过，2,000 个 key |
-| MixedWithFailures | 667,024 | 0 | 1,111.71 ops/s | 1.45125ms | 6.477083ms | 19.660041ms | 34 | 3 | 467,029 | 通过，3,600 个 node-key 检查 |
-| ConsistencyWithRestartsAndSnapshots | 649,820 | 0 | 1,083.03 ops/s | 2.218459ms | 12.986833ms | 35.574416ms | 44 | 3 | 445,972 | 通过，3,600 个 node-key 检查 |
-| ReadHeavy | 29,051,853 | 0 | 48,419.75 ops/s | 24.667us | 472.458us | 1.695083ms | 0 | 0 | 0 | 通过，2,000 个 key |
-| DeleteStress | 397,732 | 0 | 662.89 ops/s | 4.177875ms | 20.314792ms | 58.492375ms | 30 | 3 | 397,665 | 通过，3,600 个 node-key 检查 |
+| Comprehensive | 502,428 | 0 | 837.38 ops/s | 3.5285ms | 25.564834ms | 66.73125ms | 23 | 3 | 371,551 | 通过，1,994 个 key |
+| WriteHeavy | 326,298 | 0 | 543.83 ops/s | 3.841292ms | 24.972667ms | 70.632083ms | 35 | 3 | 326,489 | 通过，2,000 个 key |
+| MixedWithFailures | 464,357 | 0 | 773.93 ops/s | 2.070792ms | 13.270042ms | 35.819375ms | 31 | 3 | 311,698 | 通过，3,600 个 node-key 检查 |
+| ConsistencyWithRestartsAndSnapshots | 681,847 | 0 | 1,136.41 ops/s | 2.518375ms | 10.924792ms | 28.547208ms | 41 | 3 | 462,404 | 通过，3,600 个 node-key 检查 |
+| ReadHeavy | 16,729,989 | 0 | 27,883.31 ops/s | 29.5us | 467.625us | 2.115667ms | 0 | 0 | 0 | 通过，2,000 个 key |
+| DeleteStress | 539,492 | 0 | 899.15 ops/s | 2.93875ms | 11.89325ms | 29.039792ms | 58 | 3 | 536,558 | 通过，3,600 个 node-key 检查 |
 
-`Comprehensive` 在 snapshot 和 compaction 压力下出现过一次 ReadIndex 等待日志：
+最新全量运行保持了全部正确性门禁，但也暴露了性能和 ReadIndex 可用性信号，已在
+[issue #113](https://github.com/xmh1011/go-kv/issues/113) 跟踪。多个场景出现
+ReadIndex timeout warning，但失败操作仍然是 0：
 
 ```text
-[ReadIndex] Node 1 timed out waiting for lastApplied to reach 446053 (current: 445844)
+[ReadIndex] Node 3 timed out waiting for heartbeat quorum.
+[ReadIndex] Node 3 timed out waiting for lastApplied to reach 234016 (current: 233759)
+[ReadIndex] Node 2 timed out waiting for heartbeat quorum.
+[ReadIndex] Node 1 timed out waiting for heartbeat quorum.
 ```
 
 请求流最终仍然是 0 失败，并且最终一致性通过。这个日志是有价值的性能信号：
-写入密集 compaction 或 snapshot 压力会短暂拖慢 `lastApplied` 追赶，但最新运行没有
-暴露数据丢失或节点分歧。
+写入密集 compaction、snapshot 压力或 ReadIndex heartbeat 调度可能会短暂拖慢
+线性一致读。和上一版报告相比，WriteHeavy 与 ReadHeavy 吞吐明显下降，因此 #113
+应作为后续性能 bug 跟进，而不是正确性失败。
 
 ## #109 后的重启/快照聚焦重放
 
