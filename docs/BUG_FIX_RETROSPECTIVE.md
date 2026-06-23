@@ -17,6 +17,10 @@ Related issues:
 - #93 Keep LSM compaction metadata consistent when SSTable files disappear
 - #94 Skip long-running E2E scenarios in short mode
 - #95 Preserve LSM data across TCP leader restart
+- #113 Investigate ReadIndex timeouts and long E2E throughput regression
+- #115 Concurrent gRPC LSM writes can fail and leave missing keys
+- #116 Long mixed-failure E2E exhausts retries during leader changes
+- #117 Mixed-failure long E2E can return apply timeouts despite final consistency
 
 ## 1. The Debugging Rule That Changed The Result
 
@@ -670,3 +674,175 @@ GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_Consi
 The focused 10-minute replay completed with 1,104,337 total operations, 0
 failed operations, final barrier success, and 3,600 strict node-key consistency
 checks passed.
+
+## 17. 2026-06-23 ReadIndex, Election Timeout, And LSM Compaction Fixes
+
+The next long-running pass was focused on kernel-level behavior rather than
+small boundary cases. It found a chain of related availability bugs: healthy
+heartbeats could outlive ReadIndex confirmation, followers could start elections
+before a healthy AppendEntries RPC was allowed to return, long E2E clients could
+give up on an already-issued request during leader churn, and foreground LSM
+compaction could stall Raft apply long enough to produce client apply timeouts.
+
+### #113: ReadIndex Confirmation Must Respect RPC Budgets
+
+Symptom: long E2E runs completed safely, but emitted ReadIndex quorum timeout
+warnings. A focused unit test reproduced the smaller invariant violation:
+`confirmLeadership` could time out after `electionTimeout * 2`, even when both
+heartbeat acknowledgements were healthy but slower than that local budget.
+
+The fix adds a floor to the ReadIndex heartbeat confirmation timeout:
+
+```go
+func readIndexConfirmTimeout(electionTimeout time.Duration) time.Duration {
+    timeout := electionTimeout * 2
+    if timeout < minReadIndexConfirmTimeout {
+        return minReadIndexConfirmTimeout
+    }
+    return timeout
+}
+```
+
+This keeps linearizable reads from reporting leadership loss while healthy
+AppendEntries replies are still inside the configured transport timeout.
+
+### #115: Election Timeout Must Exceed Healthy AppendEntries Timeout
+
+Symptom: `TestCluster_ConcurrentClientRequests/grpc_lsm` could fail under
+package-parallel race testing with missing keys after concurrent writes. The
+root cause was a timeout budget mismatch:
+
+```go
+DefaultElectionTimeout      = 500 * time.Millisecond
+DefaultAppendEntriesTimeout = 2 * time.Second
+```
+
+A follower could start a new election while a healthy AppendEntries RPC was
+still allowed to be in flight. That created avoidable leader churn under race
+detector and package-parallel load.
+
+The default election timeout is now 2.5s, and a config regression test asserts
+the invariant:
+
+```go
+assert.Greater(t,
+    config.DefaultElectionTimeout,
+    transportgrpc.DefaultAppendEntriesTimeout,
+)
+```
+
+This does not change the Raft paper's election rule. It makes the implementation
+timeout budget coherent with its transport layer.
+
+### #116: Already-Issued Long E2E Requests Need A Time Budget, Not A Retry Count
+
+Symptom: the 10-minute mixed-failure E2E scenario failed with a few
+`not_leader` operations even though the final barrier and strict consistency
+checks passed. The request had already been issued, so the cluster might still
+commit it, but the test helper gave up after a fixed retry count:
+
+```go
+for retry := 0; retry < maxRetries; retry++ {
+    ...
+}
+```
+
+The long-running helper now distinguishes two states:
+
+- before a request is issued, the normal retry limit still applies;
+- after a request is issued, retries continue for a bounded wall-clock window.
+
+```go
+func shouldContinueLongRunningRetry(retry, maxRetries int, requestIssued bool, requestIssuedAt, now time.Time) bool {
+    if !requestIssued {
+        return retry < maxRetries
+    }
+    return now.Sub(requestIssuedAt) < longRunningIssuedRequestRetryTimeout
+}
+```
+
+This preserves the expected-value model: once a logical client request may have
+entered Raft, the test keeps following that same `(ClientID, SequenceNum)` until
+it reaches a terminal result.
+
+### #117: Apply Timeout Was A Foreground Compaction Stall
+
+After #116, the mixed-failure scenario exposed a new failure reason:
+`apply_timeout`. Later, full long E2E showed the same pattern in Comprehensive
+and WriteHeavy runs. The key clue was that WriteHeavy used 8 clients and failed
+with exactly 8 apply timeouts in one window. That pointed to a global apply
+stall rather than random client failures.
+
+The first fix was to keep pending client requests after a leader-side apply
+timeout:
+
+```go
+// old behavior removed the pending request on timeout
+if !ok && trackClient {
+    r.clearPendingClientRequest(index)
+}
+```
+
+That removal was wrong. A timeout does not prove the original entry failed.
+Keeping `pendingClientRequests` lets a retry attach to the original log index
+instead of appending duplicate work.
+
+The deeper root cause was in LSM. `CreateNewSSTable` synchronously ran
+compaction after every flush:
+
+```go
+if err := m.Compaction(); err != nil {
+    return fmt.Errorf("compaction failed: %w", err)
+}
+```
+
+Raft applies committed entries to the LSM-backed state machine while holding
+`stateMachineMu`. If a flush triggered a large compaction inside that path, all
+later committed entries stopped applying. Client waiters could then exhaust
+their apply/retry windows even though the cluster eventually converged.
+
+The fix publishes durable Level-0 SSTables in the foreground and schedules
+compaction on a coalesced background worker:
+
+```go
+func (m *Manager) CreateNewSSTable(imem *memtable.IMemTable) error {
+    ...
+    m.addTable(sst)
+    m.ScheduleCompaction()
+    imem.Clean()
+    return nil
+}
+```
+
+`ScheduleCompaction` keeps one worker active and merges additional requests into
+one extra pass:
+
+```go
+if m.compactionRunning {
+    m.compactionQueued = true
+    return
+}
+m.compactionRunning = true
+go m.runScheduledCompactions()
+```
+
+The storage invariant is unchanged: once `CreateNewSSTable` returns, the data is
+durable and visible in Level 0. Only the expensive merge into deeper levels was
+moved out of the Raft apply critical path.
+
+### Validation
+
+The final validation set was:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=10m
+GO_KV_LOG_LEVEL=warn go test ./raft -count=1 -timeout=8m
+GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_WriteHeavy$' -count=1
+GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1
+GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m
+```
+
+The final six-scenario long E2E run completed with zero failed operations in
+all scenarios. The strict restart/snapshot scenarios passed their final barrier
+and node-by-node consistency checks. The latest numbers are recorded in
+[PERFORMANCE.md](PERFORMANCE.md).

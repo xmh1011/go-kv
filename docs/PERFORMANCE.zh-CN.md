@@ -8,8 +8,8 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 
 | 项目 | 值 |
 |---|---|
-| 日期 | 2026-06-22 |
-| 机器 | macOS Darwin 26.3.1, Apple Silicon |
+| 日期 | 2026-06-23 |
+| 机器 | macOS Darwin 25.5.0, Apple Silicon |
 | Go | 1.25.5 |
 | 传输层 | 长时间 E2E 使用 gRPC；聚焦集成测试额外覆盖 TCP |
 | 存储 | Raft 日志和状态机均使用 LSM |
@@ -19,10 +19,10 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 
 | 目的 | 命令 | 结果 |
 |---|---|---|
-| LSM/WAL recovery 回归 | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=5m` | 通过 |
-| 全量 short 单元/集成门禁 | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=25m` | 通过；最新 `tests` 包 776.861s |
-| 单个 10 分钟重启/快照触发场景 | `GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1 -timeout=25m` | 最新 post-#111 运行 607.722s 通过 |
-| 全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | 最新运行 3684.450s 通过 |
+| LSM/WAL recovery 回归 | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=10m` | 通过 |
+| 全量 short 单元/集成门禁 | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m` | 通过；最新 `tests` 包 977.155s |
+| 单个 10 分钟写入密集触发场景 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_WriteHeavy$' -count=1` | 异步 compaction 调度修复后 613.049s 通过 |
+| 全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | 3657.132s 通过 |
 
 现在 short 模式行为是明确的：10 分钟 E2E 在 `testing.Short()` 下会跳过。这样 `go test -short ./...` 可以继续作为 PR 覆盖率入口，而真实 10 分钟场景必须显式运行。
 
@@ -32,28 +32,21 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 
 | 场景 | 总操作数 | 失败操作 | 吞吐量 | P50 | P95 | P99 | Leader 切换 | 快照节点数 | 最大快照 index | 一致性 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Comprehensive | 502,428 | 0 | 837.38 ops/s | 3.5285ms | 25.564834ms | 66.73125ms | 23 | 3 | 371,551 | 通过，1,994 个 key |
-| WriteHeavy | 326,298 | 0 | 543.83 ops/s | 3.841292ms | 24.972667ms | 70.632083ms | 35 | 3 | 326,489 | 通过，2,000 个 key |
-| MixedWithFailures | 464,357 | 0 | 773.93 ops/s | 2.070792ms | 13.270042ms | 35.819375ms | 31 | 3 | 311,698 | 通过，3,600 个 node-key 检查 |
-| ConsistencyWithRestartsAndSnapshots | 681,847 | 0 | 1,136.41 ops/s | 2.518375ms | 10.924792ms | 28.547208ms | 41 | 3 | 462,404 | 通过，3,600 个 node-key 检查 |
-| ReadHeavy | 16,729,989 | 0 | 27,883.31 ops/s | 29.5us | 467.625us | 2.115667ms | 0 | 0 | 0 | 通过，2,000 个 key |
-| DeleteStress | 539,492 | 0 | 899.15 ops/s | 2.93875ms | 11.89325ms | 29.039792ms | 58 | 3 | 536,558 | 通过，3,600 个 node-key 检查 |
+| Comprehensive | 655,382 | 0 | 1,092.30 ops/s | 3.457458ms | 12.997042ms | 40.629916ms | 4 | 3 | 482,995 | 通过，1,998 个 key |
+| WriteHeavy | 512,565 | 0 | 854.27 ops/s | 3.519625ms | 14.7735ms | 44.532042ms | 16 | 3 | 507,421 | 通过，2,000 个 key |
+| MixedWithFailures | 948,673 | 0 | 1,581.12 ops/s | 1.426167ms | 4.114709ms | 11.605334ms | 1 | 3 | 659,881 | 通过，3,600 个 node-key 检查 |
+| ConsistencyWithRestartsAndSnapshots | 1,299,458 | 0 | 2,165.76 ops/s | 1.554667ms | 3.969875ms | 8.658667ms | 5 | 3 | 908,296 | 通过，3,600 个 node-key 检查 |
+| ReadHeavy | 50,159,859 | 0 | 83,599.76 ops/s | 17.25us | 331.375us | 897.375us | 0 | 0 | 0 | 通过，2,000 个 key |
+| DeleteStress | 714,117 | 0 | 1,190.19 ops/s | 2.473625ms | 9.325959ms | 25.642416ms | 13 | 3 | 695,088 | 通过，3,600 个 node-key 检查 |
 
-最新全量运行保持了全部正确性门禁，但也暴露了性能和 ReadIndex 可用性信号，已在
-[issue #113](https://github.com/xmh1011/go-kv/issues/113) 跟踪。多个场景出现
-ReadIndex timeout warning，但失败操作仍然是 0：
-
-```text
-[ReadIndex] Node 3 timed out waiting for heartbeat quorum.
-[ReadIndex] Node 3 timed out waiting for lastApplied to reach 234016 (current: 233759)
-[ReadIndex] Node 2 timed out waiting for heartbeat quorum.
-[ReadIndex] Node 1 timed out waiting for heartbeat quorum.
-```
-
-请求流最终仍然是 0 失败，并且最终一致性通过。这个日志是有价值的性能信号：
-写入密集 compaction、snapshot 压力或 ReadIndex heartbeat 调度可能会短暂拖慢
-线性一致读。和上一版报告相比，WriteHeavy 与 ReadHeavy 吞吐明显下降，因此 #113
-应作为后续性能 bug 跟进，而不是正确性失败。
+最新全量运行修复了此前由
+[issue #113](https://github.com/xmh1011/go-kv/issues/113)、
+[issue #116](https://github.com/xmh1011/go-kv/issues/116) 和
+[issue #117](https://github.com/xmh1011/go-kv/issues/117) 跟踪的
+ReadIndex 与 apply-timeout 回归。对写入稳定性最关键的变化是：
+SSTable compaction 不再同步运行在 Raft apply 前台路径里。MemTable flush
+仍会先发布持久化的 Level-0 SSTable，然后把 compaction 合并到后台 worker
+里执行；测试或关闭流程可以通过 `WaitForCompactions()` 等待后台任务收敛。
 
 ## #109 后的重启/快照聚焦重放
 
@@ -146,4 +139,4 @@ make test
 5. 应用到 LSM-backed 状态机；
 6. 对客户端返回可见结果。
 
-后续有价值的性能优化方向包括 batch 大小、follower 追赶、LSM compaction 调度，以及 Raft log adapter 的写放大降低。任何优化都不应削弱上面的正确性门禁。
+最新性能修复已经把 LSM compaction 移出了前台 flush 路径。后续有价值的性能优化方向包括 batch 大小、follower 追赶、Raft log adapter 写放大降低，以及后台 compaction worker 的背压指标。任何优化都不应削弱上面的正确性门禁。

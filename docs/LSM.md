@@ -280,6 +280,40 @@ entry and continues. If the file still exists but cannot be decoded, compaction
 returns an error. This keeps the engine strict about corrupt data while allowing
 self-healing for stale file catalog entries.
 
+Foreground flush and compaction are intentionally separated. A flush must make
+the immutable memtable durable and visible as a Level-0 SSTable before it
+returns, but it must not synchronously wait for compaction. This matters because
+the Raft apply path writes to the LSM-backed state machine while holding
+`stateMachineMu`. If `Database.Put` or `ForceFlush` also waited for a large
+compaction, every committed Raft entry behind it would stop applying and client
+waiters could hit apply timeouts.
+
+The current publication path is:
+
+```text
+immutable memtable
+        |
+        v
+EncodeTo same-directory temp file
+        |
+        v
+fsync + close + rename final .sst
+        |
+        v
+publish Level-0 metadata under Manager.mu
+        |
+        v
+clean immutable WAL
+        |
+        v
+ScheduleCompaction in a coalesced background worker
+```
+
+`ScheduleCompaction` keeps at most one foreground worker active. Additional
+schedule requests while that worker is running are coalesced into one extra pass.
+Tests and shutdown can still call `WaitForCompactions()` when they need a fully
+settled file layout.
+
 ## 12. Raft Log Storage Adapter
 
 `pkg/storage/lsm/storage.go` implements `storage.Storage` on top of the LSM
@@ -444,6 +478,7 @@ state is protected by `Manager.mu`.
 | `totalMap map[int][]string` | File paths grouped by level. |
 | `sparseIndexes [][]*SSTable` | Level 1 and deeper tables sorted by minimum key. |
 | `compactingLevels map[int]bool` | Levels currently being compacted. |
+| `compactionRunning`, `compactionQueued` | Coalesces background compaction requests so flush does not wait in the foreground path. |
 
 The manager treats metadata publication as the boundary where a flushed SSTable
 becomes visible to reads:

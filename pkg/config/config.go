@@ -54,8 +54,8 @@ const (
 	DefaultLogMaxAge         = 30 // days
 	DefaultRaftTransport     = "grpc"
 	DefaultRaftEngine        = "lsm"
-	DefaultHeartbeatTimeout  = 100 * time.Millisecond // 增加到 100ms，给高负载场景更多时间
-	DefaultElectionTimeout   = 500 * time.Millisecond // 增加到 500ms，减少不必要的选举
+	DefaultHeartbeatTimeout  = 100 * time.Millisecond
+	DefaultElectionTimeout   = 2500 * time.Millisecond
 	DefaultSnapshotThreshold = 8192
 	DefaultMaxMemTableSize   = 2 * 1024 * 1024 // 2MB
 	DefaultMaxSSTableSize    = 2 * 1024 * 1024 // 2MB

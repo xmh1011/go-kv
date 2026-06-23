@@ -223,7 +223,7 @@ MemTable 满后提升为 immutable MemTable
 flush immutable MemTable 到 Level-0 SSTable
         |
         v
-后台 compaction 将数据移动到更低层级
+调度后台 compaction 将数据移动到更低层级
 ```
 
 读取路径从新到旧：
@@ -234,6 +234,11 @@ flush immutable MemTable 到 Level-0 SSTable
 4. Level-1 及更深层，通过稀疏索引和布隆过滤器定位。
 
 删除使用 tombstone 表示。tombstone 必须遮蔽旧值，直到 compaction 能证明旧值不会再出现。
+
+Flush 和 compaction 的职责是分开的。前台写路径只需要发布一个持久化的 Level-0
+SSTable，并在发布成功后删除 immutable memtable 的 WAL。更大的 SSTable merge
+通过合并调度的后台 compaction worker 执行，这样 LSM compaction 不会进入 Raft
+apply 关键路径。
 
 ## 12. 持久化与恢复
 
@@ -310,11 +315,16 @@ make long-test
 
 - `lastApplied` 只能在状态机真正应用对应命令之后推进。
 - 读请求必须等待 `lastApplied >= readIndex`。
+- election 和 ReadIndex timeout 必须覆盖健康传输 RPC 的超时预算。
 - `(ClientID, SequenceNum)` 标识的客户端命令最多应用一次。
+- pending client request 不能仅因为某次 leader 侧 apply 等待超时就被删除；
+  重试需要重新绑定到原始 log index。
 - follower 落后到已压缩日志之前时，应该发送快照，而不是继续补缺失日志。
 - 正在 flush 的 immutable memtable 必须保持可搜索，直到 SSTable 安全发布。
 - tombstone 必须遮蔽旧值，直到 compaction 可以安全丢弃它。
 - 从读者视角看，SSTable 元数据更新必须是原子的。
+- LSM flush 可以在前台发布 Level-0 SSTable，但 compaction 必须在 Raft apply
+  前台路径之外运行。
 - WAL recovery 必须忽略非提交目录项；但如果某个已提交 `{id}.wal` 文件内容
   损坏，仍然必须失败。
 - Raft `Stop()` 必须等待 in-flight apply、snapshot、AppendEntries 和

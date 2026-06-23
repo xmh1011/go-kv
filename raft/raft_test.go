@@ -889,6 +889,39 @@ func TestWaitForAppliedLogRejectsOverwrittenClientCommand(t *testing.T) {
 	}
 }
 
+func TestCommitClientRetainsPendingRequestAfterApplyTimeout(t *testing.T) {
+	clientKey := clientRequestKey{clientID: 1001, sequenceNum: 42}
+	r := &Raft{
+		id:                    1,
+		currentTerm:           3,
+		clientSessions:        make(map[int64]int64),
+		notifyApply:           make(map[uint64][]chan any),
+		pendingClientRequests: make(map[clientRequestKey]uint64),
+		pendingLogClients:     make(map[uint64]clientRequestKey),
+		proposalCh:            make(chan proposalRequest, 1),
+		shutdownChan:          make(chan struct{}),
+	}
+	r.setState(Leader)
+
+	go func() {
+		req := <-r.proposalCh
+		r.mu.Lock()
+		r.pendingClientRequests[req.clientKey] = 10
+		r.pendingLogClients[10] = req.clientKey
+		r.mu.Unlock()
+		req.result <- proposalResult{index: 10, term: r.currentTerm, ok: true}
+	}()
+
+	_, ok, leaderID := r.CommitClient([]byte("cmd"), clientKey.clientID, clientKey.sequenceNum, true)
+
+	assert.False(t, ok)
+	assert.Equal(t, 1, leaderID)
+	r.mu.Lock()
+	assert.Equal(t, uint64(10), r.pendingClientRequests[clientKey], "timed-out client requests must stay pending so retries wait on the original index")
+	assert.Equal(t, clientKey, r.pendingLogClients[10])
+	r.mu.Unlock()
+}
+
 func TestBecomeFollowerAbortsPendingApplyWaiters(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -1716,6 +1749,41 @@ func TestConfirmLeadershipStepsDownOnHigherTermReply(t *testing.T) {
 	assert.False(t, r.confirmLeadership())
 	assert.Equal(t, Follower, r.getState())
 	assert.Equal(t, uint64(3), r.currentTerm)
+}
+
+func TestConfirmLeadershipWaitsForHealthySlowHeartbeatAcks(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockTrans := transport.NewMockTransport(ctrl)
+	mockSM := storage.NewMockStateMachine(ctrl)
+
+	mockStore.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
+	mockStore.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
+	mockStore.EXPECT().FirstLogIndex().Return(uint64(1), nil).AnyTimes()
+	mockStore.EXPECT().GetEntry(gomock.Any()).Return(&param.LogEntry{Term: 2, Index: 5}, nil).AnyTimes()
+
+	mockTrans.EXPECT().
+		SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ string, args *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
+			time.Sleep(75 * time.Millisecond)
+			reply.Term = args.Term
+			reply.Success = true
+			return nil
+		}).
+		Times(2)
+
+	r := NewRaft(1, []int{2, 3}, mockStore, mockSM, mockTrans, nil)
+	r.currentTerm = 2
+	r.setState(Leader)
+	r.electionTimeout = 20 * time.Millisecond
+	r.nextIndex[2] = 6
+	r.nextIndex[3] = 6
+	r.cachedLastLogIndex = 5
+	r.commitIndex = 5
+
+	assert.True(t, r.confirmLeadership())
 }
 
 // TestLeaseRead_NotLeader 测试非 Leader 节点的读取请求

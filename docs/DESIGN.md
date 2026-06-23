@@ -243,7 +243,7 @@ promote full MemTable to immutable MemTable
 flush immutable MemTable to Level-0 SSTable
         |
         v
-background compaction moves data to lower levels
+schedule background compaction to move data to lower levels
 ```
 
 The read path is newest-to-oldest:
@@ -255,6 +255,11 @@ The read path is newest-to-oldest:
 
 Deletes are represented as tombstones. A tombstone must hide older values until
 compaction can prove that no older value can reappear.
+
+Flush is deliberately smaller than compaction. The foreground write path only
+needs to publish a durable Level-0 SSTable and remove the immutable memtable's
+WAL after publication. Larger SSTable merges run on a coalesced background
+compaction worker. This keeps LSM compaction out of Raft's apply critical path.
 
 ## 12. Persistence And Recovery
 
@@ -336,14 +341,19 @@ These invariants are useful when reading or modifying the code:
 - `lastApplied` must advance only after the state machine has applied the
   corresponding command.
 - Reads must wait for `lastApplied >= readIndex`.
+- Election and ReadIndex timeouts must cover healthy transport RPC budgets.
 - A client command identified by `(ClientID, SequenceNum)` must apply at most
   once.
+- Pending client requests must not be removed merely because one leader-side
+  apply wait timed out; retries need to reattach to the original log index.
 - A follower that is behind the compacted log must receive a snapshot instead
   of missing log entries.
 - A flushing immutable memtable must remain searchable until its SSTable is
   safely published.
 - A tombstone must suppress older values until compaction can safely discard it.
 - SSTable metadata updates must be atomic from the reader's point of view.
+- LSM flush may publish Level-0 SSTables in the foreground, but compaction must
+  run outside the foreground Raft apply path.
 - WAL recovery must ignore non-committed directory entries but still fail on a
   committed `{id}.wal` file whose contents are corrupt.
 - Raft `Stop()` must wait for in-flight apply, snapshot, AppendEntries, and
