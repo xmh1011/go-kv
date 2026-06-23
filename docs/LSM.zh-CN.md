@@ -274,15 +274,20 @@ fsync + close + rename 为最终 .sst
 在 Manager.mu 下发布 Level-0 metadata
         |
         v
-清理 immutable WAL
+如果 Level 0 超过文件数阈值：
+    ScheduleCompaction 合并到后台 worker
         |
         v
-ScheduleCompaction 合并到后台 worker
+清理 immutable WAL
 ```
 
 `ScheduleCompaction` 保证同一时间最多只有一个前台调度的 compaction worker。
 worker 运行期间新的调度请求会被合并为下一轮 pass。测试和关闭流程仍可使用
 `WaitForCompactions()` 等待后台 compaction 完全收敛。
+
+调度本身有阈值门禁。普通的低于阈值 flush 只发布新的 Level-0 SSTable，然后直接返回，
+不会启动一个无实际 merge 工作的后台 worker。这样可以避免每次 flush 都创建 goroutine
+并短暂竞争 `Manager.mu`。
 
 ## 12. Raft 日志存储适配器
 
