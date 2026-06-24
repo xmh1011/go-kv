@@ -158,6 +158,40 @@ func TestLongRunningRetryBudgetExtendsAfterRequestIssued(t *testing.T) {
 	}
 }
 
+func TestLongRunningCounterSnapshotDoesNotReportImpossibleProgress(t *testing.T) {
+	var totalOps int64 = 10
+	var successOps int64 = 11
+	var failedOps int64
+
+	snapshot := snapshotLongRunningCounters(&totalOps, &successOps, &failedOps)
+	if snapshot.TotalOps < snapshot.SuccessOps+snapshot.FailedOps {
+		t.Fatalf("snapshot reported impossible counters: total=%d success=%d failed=%d",
+			snapshot.TotalOps, snapshot.SuccessOps, snapshot.FailedOps)
+	}
+}
+
+type longRunningCounterSnapshot struct {
+	TotalOps   int64
+	SuccessOps int64
+	FailedOps  int64
+}
+
+func snapshotLongRunningCounters(totalOps, successOps, failedOps *int64) longRunningCounterSnapshot {
+	success := atomic.LoadInt64(successOps)
+	failed := atomic.LoadInt64(failedOps)
+	total := atomic.LoadInt64(totalOps)
+	accounted := success + failed
+	if total < accounted {
+		total = accounted
+	}
+
+	return longRunningCounterSnapshot{
+		TotalOps:   total,
+		SuccessOps: success,
+		FailedOps:  failed,
+	}
+}
+
 type longRunningValidationOptions struct {
 	RequireNoFailedOps         bool
 	RequireConsistency         bool
@@ -1400,12 +1434,10 @@ func TestLongRunning_10Min_Comprehensive(t *testing.T) {
 	// 使用 testRunner 管理超时和进度报告
 	runner := newTestRunner(duration, stopCh, &wg)
 	runner.run(t, func(elapsed time.Duration) {
-		ops := atomic.LoadInt64(&totalOps)
-		success := atomic.LoadInt64(&successOps)
-		failed := atomic.LoadInt64(&failedOps)
+		counters := snapshotLongRunningCounters(&totalOps, &successOps, &failedOps)
 
 		t.Logf("[进度报告] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 吞吐量: %.2f ops/sec, 延迟样本: %d",
-			elapsed, ops, success, failed, float64(success)/elapsed.Seconds(), latencySampler.count())
+			elapsed, counters.TotalOps, counters.SuccessOps, counters.FailedOps, float64(counters.SuccessOps)/elapsed.Seconds(), latencySampler.count())
 	})
 
 	sampleKeysMutex.Lock()
@@ -1546,11 +1578,12 @@ func TestLongRunning_10Min_WriteHeavy(t *testing.T) {
 	// 使用 testRunner 管理超时和进度报告
 	runner := newTestRunner(duration, stopCh, &wg)
 	runner.run(t, func(elapsed time.Duration) {
+		counters := snapshotLongRunningCounters(&totalOps, &successOps, &failedOps)
 		t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 写入流量: %.2f MB/s, 延迟样本: %d",
 			elapsed,
-			atomic.LoadInt64(&totalOps),
-			atomic.LoadInt64(&successOps),
-			atomic.LoadInt64(&failedOps),
+			counters.TotalOps,
+			counters.SuccessOps,
+			counters.FailedOps,
 			float64(atomic.LoadInt64(&bytesWritten))/1024/1024/elapsed.Seconds(),
 			latencySampler.count())
 	})
@@ -1667,6 +1700,7 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
+						atomic.AddInt64(&totalOps, 1)
 						atomic.AddInt64(&writeOps, 1)
 
 						if success {
@@ -1679,7 +1713,6 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 							atomic.AddInt64(&failedOps, 1)
 							failures.record(failureReason)
 						}
-						atomic.AddInt64(&totalOps, 1)
 
 					} else { // 30% 读取
 						var key string
@@ -1695,6 +1728,7 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 						if errors.Is(err, errLongRunningTestStopped) {
 							return
 						}
+						atomic.AddInt64(&totalOps, 1)
 						atomic.AddInt64(&readOps, 1)
 
 						if success {
@@ -1707,7 +1741,6 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 							atomic.AddInt64(&failedOps, 1)
 							failures.record(failureReason)
 						}
-						atomic.AddInt64(&totalOps, 1)
 					}
 				}
 			}
@@ -1719,11 +1752,12 @@ func TestLongRunning_10Min_MixedWithFailures(t *testing.T) {
 	failureCount := 0
 	runner.runWithFailureInjection(t,
 		func(elapsed time.Duration) {
+			counters := snapshotLongRunningCounters(&totalOps, &successOps, &failedOps)
 			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, Leader切换: %d, 延迟样本: %d",
 				elapsed,
-				atomic.LoadInt64(&totalOps),
-				atomic.LoadInt64(&successOps),
-				atomic.LoadInt64(&failedOps),
+				counters.TotalOps,
+				counters.SuccessOps,
+				counters.FailedOps,
 				atomic.LoadInt32(&c.leaderElections),
 				latencySampler.count())
 		},
@@ -1921,12 +1955,13 @@ func TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots(t *testing.T) {
 	runner := newTestRunner(duration, stopCh, &wg)
 	runner.runWithFailureInjection(t,
 		func(elapsed time.Duration) {
+			counters := snapshotLongRunningCounters(&totalOps, &successOps, &failedOps)
 			snapshotNodes, maxSnapshotIndex := c.snapshotStats()
 			t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 重启: %d, 手动快照: %d, 快照节点: %d, 最大快照索引: %d, Leader切换: %d, 延迟样本: %d",
 				elapsed,
-				atomic.LoadInt64(&totalOps),
-				atomic.LoadInt64(&successOps),
-				atomic.LoadInt64(&failedOps),
+				counters.TotalOps,
+				counters.SuccessOps,
+				counters.FailedOps,
 				atomic.LoadInt32(&restartCount),
 				atomic.LoadInt32(&snapshotCount),
 				snapshotNodes,
@@ -2109,11 +2144,12 @@ func TestLongRunning_10Min_ReadHeavy(t *testing.T) {
 	// 使用 testRunner 管理超时和进度报告
 	runner := newTestRunner(duration, stopCh, &wg)
 	runner.run(t, func(elapsed time.Duration) {
+		counters := snapshotLongRunningCounters(&totalOps, &successOps, &failedOps)
 		t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 读取流量: %.2f MB/s, 延迟样本: %d",
 			elapsed,
-			atomic.LoadInt64(&totalOps),
-			atomic.LoadInt64(&successOps),
-			atomic.LoadInt64(&failedOps),
+			counters.TotalOps,
+			counters.SuccessOps,
+			counters.FailedOps,
 			float64(atomic.LoadInt64(&bytesRead))/1024/1024/elapsed.Seconds(),
 			latencySampler.count())
 	})
@@ -2276,11 +2312,12 @@ func TestLongRunning_10Min_DeleteStress(t *testing.T) {
 	// 使用 testRunner 管理超时和进度报告
 	runner := newTestRunner(duration, stopCh, &wg)
 	runner.run(t, func(elapsed time.Duration) {
+		counters := snapshotLongRunningCounters(&totalOps, &successOps, &failedOps)
 		t.Logf("[进度] 已运行: %v, 总操作: %d, 成功: %d, 失败: %d, 写入: %d, 删除: %d, 延迟样本: %d",
 			elapsed,
-			atomic.LoadInt64(&totalOps),
-			atomic.LoadInt64(&successOps),
-			atomic.LoadInt64(&failedOps),
+			counters.TotalOps,
+			counters.SuccessOps,
+			counters.FailedOps,
 			atomic.LoadInt64(&writeOps),
 			atomic.LoadInt64(&deleteOps),
 			latencySampler.count())
