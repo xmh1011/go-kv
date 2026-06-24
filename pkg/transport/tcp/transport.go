@@ -64,7 +64,9 @@ func (t *Transport) SetPeers(peers map[int]string) {
 	}
 
 	for _, client := range t.peers {
-		client.Close()
+		if err := client.Close(); err != nil {
+			log.Warnf("[TCPTransport] Failed to close cached client while resetting peers: %v", err)
+		}
 	}
 	t.peers = make(map[string]*rpc.Client)
 }
@@ -113,15 +115,16 @@ func (t *Transport) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	var closeErr error
 	for _, client := range t.peers {
-		client.Close()
+		closeErr = errors.Join(closeErr, client.Close())
 	}
 	t.peers = make(map[string]*rpc.Client)
 
 	if t.listener != nil {
-		return t.listener.Close()
+		closeErr = errors.Join(closeErr, t.listener.Close())
 	}
-	return nil
+	return closeErr
 }
 
 // getPeerAddress 根据 NodeID 获取地址。
@@ -193,7 +196,9 @@ func (t *Transport) remoteCall(targetID, method string, args any, reply any, tim
 		t.mu.Lock()
 		if cachedClient, ok := t.peers[targetID]; ok && cachedClient == client {
 			delete(t.peers, targetID)
-			client.Close()
+			if closeErr := client.Close(); closeErr != nil {
+				log.Warnf("[TCPTransport] Failed to close cached client after RPC error: %v", closeErr)
+			}
 		}
 		t.mu.Unlock()
 		return err
