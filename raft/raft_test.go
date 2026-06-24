@@ -2,6 +2,7 @@ package raft
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -483,6 +484,45 @@ func TestClientRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFinalizeClientReplyReturnsNotLeaderWhenApplyTimeoutLosesQuorum(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStore := storage.NewMockStorage(ctrl)
+	mockTrans := transport.NewMockTransport(ctrl)
+
+	mockTrans.EXPECT().
+		SendAppendEntries(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(errors.New("network unavailable")).
+		Times(2)
+
+	r := &Raft{
+		id:                    1,
+		peerIDs:               []int{1, 2, 3},
+		currentTerm:           7,
+		electionTimeout:       50 * time.Millisecond,
+		leaseDuration:         time.Second,
+		leadershipCacheTime:   0,
+		store:                 mockStore,
+		trans:                 mockTrans,
+		nextIndex:             map[int]uint64{2: 1, 3: 1},
+		lastAck:               make(map[int]time.Time),
+		notifyApply:           make(map[uint64][]chan any),
+		pendingClientRequests: make(map[clientRequestKey]uint64),
+		pendingLogClients:     make(map[uint64]clientRequestKey),
+	}
+	r.setState(Leader)
+	r.lastAppliedCond = sync.NewCond(&r.mu)
+
+	reply := &param.ClientReply{}
+	r.finalizeClientReply(&param.ClientArgs{ClientID: 10, SequenceNum: 1}, reply, nil, false, r.id)
+
+	assert.False(t, reply.Success)
+	assert.True(t, reply.NotLeader)
+	assert.Equal(t, 0, reply.LeaderHint)
+	assert.NotEqual(t, "apply timeout", reply.Result)
 }
 
 func TestHandleLinearizableRead(t *testing.T) {

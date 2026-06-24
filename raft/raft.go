@@ -1020,13 +1020,24 @@ func (r *Raft) finalizeClientReply(args *param.ClientArgs, reply *param.ClientRe
 	} else {
 		// 如果失败，可能是因为超时，也可能是因为中途失去了 Leader 身份。
 		reply.Success = false
-		if !r.isLeader() {
+		if !r.isLeader() || !r.confirmLeadership() {
 			reply.NotLeader = true
-			reply.LeaderHint = leaderID
+			reply.LeaderHint = r.bestLeaderHint(leaderID)
 		} else {
 			reply.Result = "apply timeout"
 		}
 	}
+}
+
+func (r *Raft) bestLeaderHint(fallback int) int {
+	leaderHint := r.currentLeaderHint()
+	if leaderHint > 0 && leaderHint != r.id {
+		return leaderHint
+	}
+	if fallback > 0 && fallback != r.id {
+		return fallback
+	}
+	return 0
 }
 
 // Submit 将一个普通的客户端命令追加到 Raft 日志中。
