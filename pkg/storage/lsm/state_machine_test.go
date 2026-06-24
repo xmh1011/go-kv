@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/xmh1011/go-kv/engine/lsm/database"
 	"github.com/xmh1011/go-kv/pkg/config"
@@ -122,6 +124,41 @@ func TestApplySnapshotRejectsInvalidFilePathBeforeClearingDB(t *testing.T) {
 	assert.Equal(t, "value", val)
 }
 
+func TestApplySnapshotDoesNotRaceWithConcurrentReads(t *testing.T) {
+	db, dir := setupTestDB(t, "lsm_sm_concurrent_snapshot")
+	defer cleanupTestDB(t, dir)
+
+	adapter := NewStateMachineAdapter(db)
+	defer adapter.Close()
+
+	require.NoError(t, applyCommand(adapter, param.OpSet, "stable", "value"))
+	snapData, err := adapter.GetSnapshot()
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_, _ = adapter.Get("stable")
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < 32; i++ {
+		require.NoError(t, adapter.ApplySnapshot(snapData))
+	}
+	close(stop)
+	wg.Wait()
+}
+
 func setupTestDB(t *testing.T, name string) (*database.Database, string) {
 	dir, err := os.MkdirTemp("", name)
 	assert.NoError(t, err)
@@ -141,4 +178,14 @@ func mustMarshal(v any) []byte {
 		panic(err)
 	}
 	return b
+}
+
+func applyCommand(adapter *StateMachineAdapter, op param.OpType, key, value string) error {
+	result := adapter.Apply(param.LogEntry{
+		Command: mustMarshal(param.KVCommand{Op: op, Key: key, Value: value}),
+	})
+	if err, ok := result.(error); ok {
+		return err
+	}
+	return nil
 }
