@@ -278,9 +278,12 @@ func (fs *failureStats) snapshot() []FailureReasonCount {
 }
 
 const (
-	longRunningSnapshotThreshold         = 2 * 1024 * 1024
-	longRunningClientRetries             = 20
-	longRunningIssuedRequestRetryTimeout = 30 * time.Second
+	longRunningSnapshotThreshold = 2 * 1024 * 1024
+	longRunningClientRetries     = 20
+	// Already-issued commands must survive several server-side apply waits plus
+	// leader re-election and snapshot catch-up. If the command is truly stuck,
+	// the long-running test still fails after this bounded window.
+	longRunningIssuedRequestRetryTimeout = 90 * time.Second
 )
 
 // latencySampler 延迟采样器，限制采样数量以控制内存使用
