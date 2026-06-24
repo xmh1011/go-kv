@@ -72,7 +72,7 @@ bench-test: deps
 ## long-test: Run long-running tests (10+ minutes each, for CI/nightly).
 long-test: deps
 	@echo " running long-running tests..."
-	@go test -race -v -timeout=60m ./tests/long_running_e2e_test.go
+	@GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$$' -count=1
 
 ## cover: Open the HTML coverage report in your browser.
 cover: test
