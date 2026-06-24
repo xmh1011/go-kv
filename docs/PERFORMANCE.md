@@ -11,7 +11,7 @@ LSM compaction, client retries, and final data consistency.
 
 | Field | Value |
 |---|---|
-| Date | 2026-06-23 |
+| Date | 2026-06-24 |
 | Machine | macOS Darwin 25.5.0, Apple Silicon |
 | Go | 1.25.5 |
 | Transport | gRPC for long E2E; focused integration also covers TCP |
@@ -26,6 +26,8 @@ LSM compaction, client retries, and final data consistency.
 | LSM compaction scheduling regression | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run '^(TestCreateNewSSTableSkipsCompactionWhenBelowThreshold|TestSSTableManagerOpenFilesSnapshotReleasesManagerLock)$' -count=10 -timeout=2m` | Passed |
 | SSTable package stability loop | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -count=100 -timeout=5m` | Passed in 114.758s |
 | LSM/storage race gate | `GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=12m` | Passed |
+| LSM snapshot reload race regression | `GO_KV_LOG_LEVEL=warn go test -race -run '^TestApplySnapshotDoesNotRaceWithConcurrentReads$' ./pkg/storage/lsm -count=1` | Passed after reproducing the pre-fix `Database.Reload` / `Database.Get` race |
+| LSM snapshot reload package race gate | `GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1` | Passed after the database lifecycle lock and atomic state-machine replacement fix |
 | LSM-backed Raft log physical compaction regression | `GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm -run '^(TestStorageAdapterCompactLogDeletesPhysicalLogKeys|TestStorageAdapter_Snapshot|TestStorageAdapter_CompactBeyondLastIndexFromSnapshot|TestStorageAdapter_LogEntries|TestStorageAdapter_ReappendAfterTruncateSurvivesFlushCompactionAndRestart)$' -count=1 -timeout=5m` | Passed in 2.753s |
 | LSM package regression after physical log tombstones | `GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm ./engine/lsm/... -count=1 -timeout=12m` | Passed |
 | LSM/storage race gate after physical log tombstones | `GO_KV_LOG_LEVEL=warn go test -race ./pkg/storage/lsm ./engine/lsm/... -count=1 -timeout=12m` | Passed; slowest package `engine/lsm/database` 33.343s |
@@ -40,7 +42,8 @@ LSM compaction, client retries, and final data consistency.
 | Full short unit/integration gate | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m` | Passed; latest `tests` package 1005.048s after issues #122, #123, and #124 |
 | Single 10-minute write-heavy trigger scenario | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_WriteHeavy$' -count=1` | Passed in 613.049s after async compaction scheduling |
 | Post-#121 10-minute restart/snapshot consistency scenario | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=25m ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1` | Passed in 611.921s with 0 failed operations |
-| Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | Passed in 3657.132s |
+| Mixed-failure issued-request retry regression | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_MixedWithFailures$' -count=1` | Passed in 619.602s with 666,692 operations, 0 failures, final barrier true, and strict consistency true |
+| Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn make long-test` | Passed in 3674.858s across all six 10-minute scenarios |
 
 The short-mode behavior is now explicit: the 10-minute E2E tests skip when
 `testing.Short()` is enabled. That keeps `go test -short ./...` usable for PR
@@ -56,17 +59,19 @@ node data.
 
 | Scenario | Total ops | Failed ops | Throughput | P50 | P95 | P99 | Leader changes | Snapshot nodes | Max snapshot index | Consistency |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Comprehensive | 655,382 | 0 | 1,092.30 ops/s | 3.457458ms | 12.997042ms | 40.629916ms | 4 | 3 | 482,995 | Passed, 1,998 keys |
-| WriteHeavy | 512,565 | 0 | 854.27 ops/s | 3.519625ms | 14.7735ms | 44.532042ms | 16 | 3 | 507,421 | Passed, 2,000 keys |
-| MixedWithFailures | 948,673 | 0 | 1,581.12 ops/s | 1.426167ms | 4.114709ms | 11.605334ms | 1 | 3 | 659,881 | Passed, 3,600 node-key checks |
-| ConsistencyWithRestartsAndSnapshots | 1,299,458 | 0 | 2,165.76 ops/s | 1.554667ms | 3.969875ms | 8.658667ms | 5 | 3 | 908,296 | Passed, 3,600 node-key checks |
-| ReadHeavy | 50,159,859 | 0 | 83,599.76 ops/s | 17.25us | 331.375us | 897.375us | 0 | 0 | 0 | Passed, 2,000 keys |
-| DeleteStress | 714,117 | 0 | 1,190.19 ops/s | 2.473625ms | 9.325959ms | 25.642416ms | 13 | 3 | 695,088 | Passed, 3,600 node-key checks |
+| Comprehensive | 507,391 | 0 | 845.65 ops/s | 3.929333ms | 18.049458ms | 52.540375ms | 14 | 3 | 371,463 | Passed, 1,990 keys |
+| WriteHeavy | 558,608 | 0 | 931.01 ops/s | 2.68175ms | 12.287542ms | 35.588666ms | 14 | 3 | 543,609 | Passed, 2,000 keys |
+| MixedWithFailures | 678,178 | 0 | 1,130.30 ops/s | 1.598333ms | 5.805333ms | 15.755125ms | 6 | 3 | 467,015 | Passed, final barrier true, 3,600 node-key checks |
+| ConsistencyWithRestartsAndSnapshots | 808,862 | 0 | 1,348.10 ops/s | 2.131125ms | 7.693208ms | 20.98475ms | 2 | 3 | 561,412 | Passed, final barrier true, 3,600 node-key checks |
+| ReadHeavy | 36,043,150 | 0 | 60,071.92 ops/s | 30.083us | 421.208us | 1.436458ms | 0 | 0 | 0 | Passed, 2,000 keys |
+| DeleteStress | 468,936 | 0 | 781.56 ops/s | 3.394583ms | 15.347333ms | 46.558125ms | 10 | 3 | 457,143 | Passed, final barrier true, 3,600 node-key checks |
 
 The latest run fixes the previous ReadIndex and apply-timeout regressions
 tracked by [issue #113](https://github.com/xmh1011/go-kv/issues/113),
 [issue #116](https://github.com/xmh1011/go-kv/issues/116), and
-[issue #117](https://github.com/xmh1011/go-kv/issues/117). The important
+[issue #117](https://github.com/xmh1011/go-kv/issues/117),
+[issue #150](https://github.com/xmh1011/go-kv/issues/150), and
+[issue #151](https://github.com/xmh1011/go-kv/issues/151). The important
 change for write-heavy stability is that SSTable compaction is no longer run
 synchronously in the foreground Raft apply path. MemTable flush still publishes
 durable Level-0 SSTables before returning, but compaction is scheduled on a
@@ -86,6 +91,20 @@ for local leader candidates before issuing ReadIndex probes, avoiding slow
 serial probes against every follower. Issue #124 reused that helper inside the
 network-partition test's majority partition, removing a second hand-written
 fixed-sleep probe loop.
+
+Issue #150 fixed the LSM state-machine snapshot replacement boundary. Snapshot
+apply can close and replace the database directory, so `Database.Get`, `Put`,
+`Delete`, `Recover`, `ForceFlush`, `Reload`, and `Close` now share a database
+lifecycle lock. Snapshot generation also opens a pinned SSTable snapshot before
+copying bytes. The result is that concurrent reads cannot observe a half-closed
+database while a Raft InstallSnapshot path replaces local state.
+
+Issue #151 fixed the mixed-failure long-test harness. Already-issued commands
+use stable `(ClientID, SequenceNum)` identity and are safe to retry, but the old
+30-second issued-request retry window could expire while the cluster was still
+recovering from leader re-election and snapshot catch-up. The window is now a
+bounded 90 seconds: stuck commands still fail, but normal Raft recovery no
+longer appears as a false failed operation after the final barrier succeeds.
 
 ## Post-#109 Focused Restart/Snapshot Replay
 

@@ -279,6 +279,27 @@ LSM-backed Raft 日志使用带 magic header 的紧凑二进制格式。这避�
 
 关键安全规则：Raft 不能压缩尚未被持久化状态机快照覆盖的日志。
 
+对 LSM-backed 状态机来说，snapshot 导出和应用同时也是文件系统生命周期操作：
+
+```text
+snapshot export:
+    force-flush 状态机 memtable
+    在 catalog lock 下打开要复制的 SSTable 文件
+    从已打开的文件描述符复制字节
+
+snapshot apply:
+    先验证完整 snapshot manifest
+    写入临时状态机目录
+    关闭旧数据库
+    原子替换数据库内容
+    从新目录重新打开数据库
+```
+
+数据库 facade 有一把 lifecycle `RWMutex`。普通 `Get`、`Put`、`Delete`、
+`ForceFlush`、`Recover` 和 catalog 读取走读锁；`Reload`、`ReplaceData`、`Close`
+这类破坏性操作走写锁。这样 Raft InstallSnapshot 替换本地状态时，不会和正在遍历
+memtable 或 SSTable 的并发读取重叠。
+
 ## 14. 测试策略
 
 仓库有多个层级的测试：
@@ -323,6 +344,7 @@ make long-test
 - 正在 flush 的 immutable memtable 必须保持可搜索，直到 SSTable 安全发布。
 - tombstone 必须遮蔽旧值，直到 compaction 可以安全丢弃它。
 - 从读者视角看，SSTable 元数据更新必须是原子的。
+- LSM 数据库替换必须和普通读写串行化；状态机 snapshot apply 不能暴露半关闭数据库。
 - LSM flush 可以在前台发布 Level-0 SSTable，但 compaction 必须在 Raft apply
   前台路径之外运行。
 - WAL recovery 必须忽略非提交目录项；但如果某个已提交 `{id}.wal` 文件内容

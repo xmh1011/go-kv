@@ -390,6 +390,37 @@ file descriptors. This protects snapshot creation from concurrent compaction:
 even if compaction removes a directory entry later, the already-open file
 descriptor still points at the bytes selected for the snapshot.
 
+Snapshot apply is more destructive than a normal write. It installs a complete
+replacement of the state-machine database. The adapter therefore validates the
+snapshot manifest first, writes a temporary replacement directory, and then asks
+the database facade to replace its contents under the database lifecycle write
+lock. Normal `Get`, `Put`, `Delete`, `Recover`, `ForceFlush`, and SSTable
+catalog reads take the lifecycle read lock.
+
+That lock is deliberately above the memtable and SSTable locks:
+
+```text
+Database.Get
+        |
+        v
+lifecycle RLock
+        |
+        v
+read memtables and SSTables
+
+Database.ReplaceData / Reload / Close
+        |
+        v
+lifecycle Lock
+        |
+        v
+close old files, replace directory, reopen catalog
+```
+
+Without this outer lifecycle boundary, a Raft InstallSnapshot could close or
+reload the LSM database while a concurrent read still holds references to the
+old memtable manager or SSTable manager.
+
 ## 14. Recovery
 
 Recovery happens in layers:
@@ -611,6 +642,7 @@ or file encoding. They come from boundaries between modules:
 | SSTable publication | Recovery sees a partially written table. | Publish via temp file, fsync, close, and rename before metadata publication. |
 | SSTable rewrite | A reused in-memory table carries stale footer sizes into a new file. | Reset all derived layout metadata before each encode pass. |
 | Snapshot apply | Malformed snapshot path clears the local state machine. | Validate every snapshot path before closing or deleting the current DB. |
+| Snapshot reload | Concurrent reads use a database while InstallSnapshot closes or replaces it. | Serialize database replacement with normal reads and writes using the lifecycle lock. |
 
 These guardrails should be mentioned in code reviews. They are correctness
 requirements, not performance details.
@@ -636,6 +668,8 @@ When modifying the LSM code, keep these invariants true:
 - Snapshot export and apply must not race with state-machine writes.
 - Snapshot apply must validate the full file manifest before destructive
   replacement starts; invalid paths are hard errors, not skipped files.
+- Snapshot apply, database reload, and database close must hold the lifecycle
+  write lock so no normal read or write can observe half-replaced state.
 
 Most storage bugs are violations of one of these invariants.
 

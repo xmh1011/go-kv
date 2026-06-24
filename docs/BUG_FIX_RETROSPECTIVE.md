@@ -26,6 +26,12 @@ Related issues:
 - #122 Make waitForAppliedLog timeout recheck test deterministic
 - #123 Make integration leader discovery reliable under race load
 - #124 Make network partition leader detection race-load safe
+- #142 Bound mixed workload benchmark concurrency
+- #143 Close LSM benchmark databases
+- #145 Stabilize benchmark leader readiness
+- #146 Propagate benchmark test failures
+- #150 Prevent LSM snapshot reload races
+- #151 Extend mixed-failure issued-request retry budget
 
 ## 1. The Debugging Rule That Changed The Result
 
@@ -1427,3 +1433,241 @@ GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_NetworkPartition$'
 The previously failing `tcp_inmemory` network-partition sub-scenario passed five
 times under the race detector after the helper reuse, and the full
 network-partition transport/storage matrix passed under the race detector.
+
+## 23. 2026-06-24 Benchmark Harness And Long E2E Hardening
+
+Related issues: #142, #143, #145, #146, #150, and #151.
+
+This pass was different from the earlier Raft-only fixes. The visible failures
+were mostly in benchmarks and long E2E accounting, but the investigation still
+found one real LSM/Raft snapshot race at the storage-engine boundary.
+
+### #142: Benchmark Concurrency Must Match The Cluster Under Test
+
+Symptom: the mixed workload benchmark created too much client pressure for a
+small three-node local cluster. That made benchmark output noisy and made it
+hard to separate a core bug from a synthetic overload condition.
+
+The principle is simple: a benchmark should stress the subsystem it claims to
+measure, not an accidental unbounded client scheduler. For Raft write
+benchmarks, each logical write already crosses leader append, stable storage,
+quorum replication, commit, and state-machine apply. Unbounded goroutine fanout
+can turn a storage benchmark into a client-side queue benchmark.
+
+The fix bounded mixed workload concurrency so the benchmark still creates
+pressure but remains explainable. The important test-design rule is:
+
+```text
+benchmark concurrency should be explicit input
+        |
+        v
+load should saturate the Raft/LSM path gradually
+        |
+        v
+failures should identify system behavior, not harness overload
+```
+
+### #146: Benchmark Failures Must Propagate
+
+Symptom: benchmark helpers could observe internal operation failures while the
+outer benchmark command still exited successfully. That is dangerous because it
+creates false performance data: a benchmark that silently drops failed writes is
+measuring a different system.
+
+The fix made the harness treat hidden operation errors as benchmark failures.
+The invariant is:
+
+```text
+performance number is valid only if correctness counters are clean
+```
+
+This matches the long E2E rule used elsewhere in the project: throughput and
+latency are only meaningful when failed operations, final barrier, and strict
+consistency checks are all clean.
+
+### #145: Leader Readiness Is A Condition, Not A Sleep
+
+Symptom: benchmark startup could race leader election and report failures that
+depended on timing. The root cause was the same pattern as #123 and #124: the
+test wanted "a usable leader exists", but the harness used fixed waiting and
+weak readiness assumptions.
+
+The fix made benchmark startup wait for a concrete leader-ready condition before
+issuing load. This keeps benchmark failures focused on the workload phase. It
+also keeps leader election from being accidentally included in steady-state
+latency numbers unless that is the scenario being measured.
+
+### #143: Benchmarks Must Close LSM Databases
+
+Symptom: LSM benchmark runs left database instances open. That can leak file
+descriptors, background compaction goroutines, and temporary directories across
+benchmark iterations.
+
+The principle is that LSM benchmarks are not pure CPU microbenchmarks. They own
+files, WALs, SSTables, and compaction workers. A correct benchmark lifecycle is:
+
+```text
+create isolated database directory
+        |
+        v
+run workload
+        |
+        v
+wait for or stop background workers
+        |
+        v
+close database
+        |
+        v
+remove test directory
+```
+
+Closing matters for correctness too. If one benchmark leaves a database open,
+the next benchmark can observe resource contention that is not part of the
+scenario.
+
+### #150: Snapshot Apply Must Serialize Database Replacement
+
+Symptom: a focused race test exposed a real data race between `Database.Reload`
+and concurrent `Database.Get`. The problematic production-shaped path is Raft
+InstallSnapshot. Installing a state-machine snapshot can close and replace the
+LSM database while client reads still walk memtables or SSTables.
+
+The old mental model was incomplete:
+
+```text
+stateMachineMu protects Raft apply/read/snapshot calls
+```
+
+That is true at the Raft adapter boundary, but the LSM database facade also has
+direct methods used by tests and storage utilities. The LSM database itself
+needed a lifecycle boundary so destructive operations cannot overlap normal
+reads and writes.
+
+The fix added a database-level lifecycle `RWMutex`:
+
+```go
+func (d *Database) Get(key kv.Key) ([]byte, bool) {
+    d.lifecycleMu.RLock()
+    defer d.lifecycleMu.RUnlock()
+    ...
+}
+
+func (d *Database) ReplaceData(fn func(tmpDir string) error) error {
+    d.lifecycleMu.Lock()
+    defer d.lifecycleMu.Unlock()
+    ...
+}
+```
+
+Snapshot export was also tightened. Instead of listing SSTable names and opening
+them later, the state machine asks the database for a flushed, opened SSTable
+snapshot:
+
+```go
+files, closeSnapshot, err := db.FlushAndOpenSSTableSnapshot()
+defer closeSnapshot()
+```
+
+Open file descriptors pin the selected bytes on Unix-like filesystems. The
+lifecycle lock then protects the opposite direction: applying a snapshot cannot
+close or replace the database while a reader is already using the old one.
+
+Validation:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race -run '^TestApplySnapshotDoesNotRaceWithConcurrentReads$' ./pkg/storage/lsm -count=1
+GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1
+GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_DeleteStress$' -count=1
+GO_KV_LOG_LEVEL=warn make test
+```
+
+The pre-fix focused race test reported a race between `Database.Reload` and
+`Database.Get`. After the fix it passed, the wider LSM/storage race gate passed,
+and the 10-minute delete-stress run completed with 986,369 operations, zero
+failures, and strict consistency true.
+
+### #151: Already-Issued Requests Need A Recovery Window
+
+Symptom: the 10-minute mixed-failure workload could report a small number of
+`apply_timeout` failures even though the final barrier and strict consistency
+both passed. The reproduced failure had this shape:
+
+```text
+apply_timeout=4
+final barrier: true
+strict consistency: true
+```
+
+That signal means "the harness gave up on observing four issued commands", not
+"the cluster lost committed data".
+
+The Raft principle is that retry identity matters. A client command is wrapped
+with stable identity:
+
+```go
+type ClientCommand struct {
+    ClientID    int64
+    SequenceNum int64
+    Command     any
+}
+```
+
+If the first RPC times out, the same logical command can be retried safely. The
+state machine uses `(ClientID, SequenceNum)` to apply it at most once and to
+return the previously observed result for duplicates.
+
+The old long-test harness used a 30-second retry window after a command had
+already been issued. During failure injection, that was too short because the
+request can cross several transient windows:
+
+1. a leader-side apply wait can expire;
+2. the leader may restart or step down;
+3. a new leader must be elected;
+4. followers may need snapshot catch-up before normal log replication resumes;
+5. the retried request must reattach to the original logical command outcome.
+
+The fix extends the bounded issued-request retry window:
+
+```go
+const (
+    longRunningSnapshotThreshold = 2 * 1024 * 1024
+    longRunningClientRetries     = 20
+    // Already-issued commands must survive several server-side apply waits plus
+    // leader re-election and snapshot catch-up. If the command is truly stuck,
+    // the long-running test still fails after this bounded window.
+    longRunningIssuedRequestRetryTimeout = 90 * time.Second
+)
+```
+
+This does not hide real failures. A command that remains stuck beyond the
+bounded window still counts as failed. The change only aligns the harness with
+the Raft retry contract: after a command is issued, the test must wait long
+enough to distinguish recoverable leadership/snapshot churn from a true stuck
+apply path.
+
+Validation:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_MixedWithFailures$' -count=1
+GO_KV_LOG_LEVEL=warn make long-test
+GO_KV_LOG_LEVEL=warn make test
+```
+
+The targeted mixed-failure run passed in 619.602s with 666,692 operations, zero
+failures, final barrier true, and strict consistency true. The full long E2E
+regression then passed in 3674.858s across all six 10-minute scenarios with
+zero failed operations.
+
+### Combined Lesson
+
+This pass reinforced a useful debugging split:
+
+- benchmark harness bugs usually distort the measurement surface;
+- long E2E harness bugs usually distort the failure classification surface;
+- LSM/Raft snapshot bugs corrupt the actual lifecycle boundary.
+
+The fix strategy should match the layer. Do not hide a storage race by relaxing
+the test. Do not rewrite Raft because a benchmark forgot to wait for a leader.
+And do not trust performance numbers until the harness proves zero failures and
+the data-consistency gates pass.

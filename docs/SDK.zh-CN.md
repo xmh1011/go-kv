@@ -6,6 +6,16 @@ English version: [SDK.md](SDK.md)
 
 在 `v1.0.0` 之前，公开 API 仍可能调整。`v0.x` 版本可以使用，但应视为仍在演进。
 
+版本发布来自 `v0.1.0` 这类 Git tag。应用代码建议在 `go.mod` 中固定 tag，不要直接跟踪
+`main`：
+
+```bash
+go get github.com/xmh1011/go-kv@v0.1.0
+```
+
+对 `v0.x` release 来说，patch 版本应尽量保持本文档描述的 SDK 表面兼容，除非 bug fix
+必须收紧行为；minor 版本在 `v1.0.0` 前仍可能调整 API。
+
 ## 1. 包地图
 
 | 包 | Import path | 应用侧用途 |
@@ -242,6 +252,17 @@ for _, peer := range cfg.Raft.Peers {
 ## 7. 错误和重试语义
 
 高层 client 在 5 秒内无法完成命令时返回 `(nil, false)`。
+
+重要重试规则：
+
+- `SendCommand` 对每个逻辑命令只递增一次 sequence number，而不是每次 RPC attempt 都递增。
+- 重试会使用同一个 `(ClientID, SequenceNum)` 身份。
+- 服务端用这个身份在状态机边界做去重。
+- 客户端 timeout 只表示调用方没有及时观察到结果，不一定证明集群没有提交该命令。
+
+如果应用需要比 `(result, ok)` 更强的可观测性，可以在 SDK 调用外包一层应用级 deadline，
+并记录业务层是否可以安全重试。内置 key-value 命令通过 client sequence number 保证幂等；
+如果扩展状态机，调用方仍应按自己的命令 payload 设计重试行为。
 
 常见原因：
 

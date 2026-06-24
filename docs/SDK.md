@@ -9,6 +9,17 @@ applications normally use `pkg/client`, `pkg/param`, and `pkg/transport`.
 The public API is not guaranteed to be stable before a `v1.0.0` release. Treat
 the `v0.x` API as usable but still evolving.
 
+Versioned releases are published from Git tags such as `v0.1.0`. Application
+code should pin a tag in `go.mod` instead of tracking `main`:
+
+```bash
+go get github.com/xmh1011/go-kv@v0.1.0
+```
+
+For `v0.x` releases, patch versions should preserve the documented SDK surface
+unless a bug fix requires tightening behavior. Minor versions may still adjust
+APIs before `v1.0.0`.
+
 ## 1. Package Map
 
 | Package | Import path | Use from applications |
@@ -258,6 +269,24 @@ useful when the application shares the same config file as the CLI.
 
 The high-level client returns `(nil, false)` when a command does not complete
 within 5 seconds.
+
+Important retry rules:
+
+- `SendCommand` increments the sequence number once per logical command, not
+  once per RPC attempt.
+- A retry uses the same `(ClientID, SequenceNum)` identity for that logical
+  command.
+- Servers use this identity to deduplicate commands at the state-machine
+  boundary.
+- A client timeout means the caller did not observe a result in time; it does
+  not necessarily prove the cluster failed to commit the command.
+
+For application code that needs stronger observability than `(result, ok)`,
+wrap the SDK call with an application-level deadline and record whether the
+operation is safe to retry at the business layer. The built-in key-value
+commands are idempotent by client sequence number, but callers should still
+design their own command payloads with retry behavior in mind if they extend the
+state machine.
 
 Common causes:
 

@@ -214,11 +214,15 @@ GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests/long_running_e2e_test
 ## 9. 发布流程
 
 发布流水线会在推送 `v*.*.*` 标签时发布 GitHub Release。也可以在 GitHub
-Actions 页面为一个已经存在的版本标签手动触发发布。
+Actions 页面为一个已经存在的版本标签手动触发发布。Release tag 必须使用
+`v0.1.0` 或 `v0.1.0-rc.1` 这种语义化版本格式，workflow 会在构建前验证 tag 已存在。
 
 创建 release tag：
 
 ```bash
+git switch main
+git pull --ff-only origin main
+GO_KV_LOG_LEVEL=warn make test
 git tag v0.1.0
 git push origin v0.1.0
 ```
@@ -228,4 +232,30 @@ git push origin v0.1.0
 - `version`：要发布的已有标签，例如 `v0.1.0`。
 - `prerelease`：是否把 GitHub Release 标记为预发布版本。
 
-流水线会运行 short tests，构建多平台 server/client 二进制，生成 checksum，并把产物附加到 GitHub Release。
+流水线会运行 short tests，构建多平台 server/client 二进制，生成每个平台的 checksum，
+再生成全量 `SHA256SUMS.txt` manifest，并把产物附加到 GitHub Release。
+
+Release 产物按平台命名：
+
+```text
+kv-server-linux-amd64
+kv-client-linux-amd64
+kv-server-darwin-arm64
+kv-client-darwin-arm64
+kv-server-windows-amd64.exe
+kv-client-windows-amd64.exe
+go-kv-<goos>-<goarch>.sha256
+SHA256SUMS.txt
+```
+
+下载 release 后，先校验 checksum：
+
+```bash
+sha256sum -c SHA256SUMS.txt
+```
+
+作为 Go module 使用时，固定同一个 tag：
+
+```bash
+go get github.com/xmh1011/go-kv@v0.1.0
+```

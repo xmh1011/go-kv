@@ -304,6 +304,29 @@ The safe snapshot order is:
 The key safety rule is that Raft must not compact entries that are not already
 represented by a durable state-machine snapshot.
 
+For the LSM-backed state machine, snapshot export and snapshot apply are also
+filesystem lifecycle operations:
+
+```text
+snapshot export:
+    force-flush state-machine memtables
+    open the SSTable files while the catalog lock is held
+    copy bytes from the open file descriptors
+
+snapshot apply:
+    validate the complete snapshot manifest
+    write files into a temporary state-machine directory
+    close the old database
+    atomically replace the database contents
+    reopen the database from the new directory
+```
+
+The database facade has a lifecycle `RWMutex`. Normal `Get`, `Put`, `Delete`,
+`ForceFlush`, `Recover`, and catalog reads take the read side. Destructive
+operations such as `Reload`, `ReplaceData`, and `Close` take the write side.
+That prevents a Raft InstallSnapshot path from closing or replacing the LSM
+database while a concurrent read is walking memtables or SSTables.
+
 ## 14. Testing Strategy
 
 The repository uses several levels of tests:
@@ -352,6 +375,8 @@ These invariants are useful when reading or modifying the code:
   safely published.
 - A tombstone must suppress older values until compaction can safely discard it.
 - SSTable metadata updates must be atomic from the reader's point of view.
+- LSM database replacement must be serialized against normal reads and writes;
+  a state-machine snapshot apply must never expose a half-closed database.
 - LSM flush may publish Level-0 SSTables in the foreground, but compaction must
   run outside the foreground Raft apply path.
 - WAL recovery must ignore non-committed directory entries but still fail on a
