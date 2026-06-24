@@ -1521,17 +1521,18 @@ func TestProcessAppendEntriesReply(t *testing.T) {
 		state State
 	}
 	tests := []struct {
-		name         string
-		initialState state
-		reply        *param.AppendEntriesReply
-		setupMocks   func(*storage.MockStorage, *transport.MockTransport, *storage.MockStateMachine)
-		verify       func(*testing.T, *Raft, time.Time)
+		name                  string
+		initialState          state
+		reply                 *param.AppendEntriesReply
+		setupMocks            func(*testing.T, *storage.MockStorage, *transport.MockTransport, *storage.MockStateMachine, chan struct{})
+		verify                func(*testing.T, *Raft, time.Time)
+		waitForFollowUpAppend bool
 	}{
 		{
 			name:         "StepsDownOnHigherTerm",
 			initialState: state{term: 5, state: Leader},
 			reply:        &param.AppendEntriesReply{Term: 6, Success: false},
-			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine) {
+			setupMocks: func(t *testing.T, s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine, followUpAppendDone chan struct{}) {
 				s.EXPECT().GetState().Return(param.HardState{CurrentTerm: 5}, nil).Times(1)
 				s.EXPECT().LastLogIndex().Return(uint64(0), nil).Times(1)
 				s.EXPECT().SetState(param.HardState{CurrentTerm: 6, VotedFor: math.MaxUint64}).Return(nil).Times(1)
@@ -1546,16 +1547,26 @@ func TestProcessAppendEntriesReply(t *testing.T) {
 			},
 		},
 		{
-			name:         "UpdatesLastAckOnSuccess",
-			initialState: state{term: 5, state: Leader},
-			reply:        &param.AppendEntriesReply{Term: 5, Success: true},
-			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine) {
+			name:                  "UpdatesLastAckOnSuccess",
+			initialState:          state{term: 5, state: Leader},
+			reply:                 &param.AppendEntriesReply{Term: 5, Success: true},
+			waitForFollowUpAppend: true,
+			setupMocks: func(t *testing.T, s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine, followUpAppendDone chan struct{}) {
 				s.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
 				s.EXPECT().LastLogIndex().Return(uint64(10), nil).Times(1)
+				s.EXPECT().FirstLogIndex().Return(uint64(1), nil).AnyTimes()
 				s.EXPECT().ReadSnapshot().Return(nil, nil).AnyTimes()
 				s.EXPECT().GetEntry(gomock.Any()).Return(&param.LogEntry{Term: 5}, nil).AnyTimes()
 				s.EXPECT().SetState(gomock.Any()).Return(nil).AnyTimes()
 				sm.EXPECT().Apply(gomock.Any()).Return(nil).AnyTimes()
+				tr.EXPECT().SendAppendEntries("2", gomock.Any(), gomock.Any()).DoAndReturn(
+					func(_ string, _ *param.AppendEntriesArgs, reply *param.AppendEntriesReply) error {
+						reply.Term = 5
+						reply.Success = true
+						close(followUpAppendDone)
+						return nil
+					},
+				).Times(1)
 			},
 			verify: func(t *testing.T, r *Raft, pastTime time.Time) {
 				assert.True(t, r.lastAck[2].After(pastTime))
@@ -1569,7 +1580,7 @@ func TestProcessAppendEntriesReply(t *testing.T) {
 			name:         "UpdatesLastAckOnFailureMatchingTerm",
 			initialState: state{term: 5, state: Leader},
 			reply:        &param.AppendEntriesReply{Term: 5, Success: false},
-			setupMocks: func(s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine) {
+			setupMocks: func(t *testing.T, s *storage.MockStorage, tr *transport.MockTransport, sm *storage.MockStateMachine, followUpAppendDone chan struct{}) {
 				s.EXPECT().GetState().Return(param.HardState{}, nil).Times(1)
 				s.EXPECT().LastLogIndex().Return(uint64(10), nil).Times(1)
 				s.EXPECT().ReadSnapshot().Return(nil, nil).AnyTimes()
@@ -1591,9 +1602,10 @@ func TestProcessAppendEntriesReply(t *testing.T) {
 			mockTrans := transport.NewMockTransport(ctrl)
 			mockSM := storage.NewMockStateMachine(ctrl)
 			commitChan := make(chan param.CommitEntry, 1)
+			followUpAppendDone := make(chan struct{})
 
 			if tt.setupMocks != nil {
-				tt.setupMocks(mockStore, mockTrans, mockSM)
+				tt.setupMocks(t, mockStore, mockTrans, mockSM, followUpAppendDone)
 			}
 
 			r := NewRaft(1, []int{2}, mockStore, mockSM, mockTrans, commitChan)
@@ -1609,6 +1621,19 @@ func TestProcessAppendEntriesReply(t *testing.T) {
 			r.mu.Lock()
 			r.processAppendEntriesReply(2, args, tt.reply, tt.initialState.term)
 			r.mu.Unlock()
+
+			if tt.waitForFollowUpAppend {
+				select {
+				case <-followUpAppendDone:
+				case <-time.After(time.Second):
+					t.Fatal("timeout waiting for follow-up AppendEntries after commit advancement")
+				}
+				assert.Eventually(t, func() bool {
+					r.mu.Lock()
+					defer r.mu.Unlock()
+					return !r.replicating[2]
+				}, time.Second, 10*time.Millisecond)
+			}
 
 			if tt.verify != nil {
 				tt.verify(t, r, pastTime)
