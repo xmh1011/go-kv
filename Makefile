@@ -67,7 +67,7 @@ e2e-test: deps
 bench-test: deps
 	@echo " running benchmark tests..."
 	@mkdir -p benchmark_results
-	@go test -run='^$$' -bench=. -benchmem -benchtime=3s -timeout=30m ./... 2>&1 | tee benchmark_results/benchmark.txt
+	@bash -o pipefail -c 'go test -run="^$$" -bench=. -benchmem -benchtime=3s -timeout=30m ./... 2>&1 | tee benchmark_results/benchmark.txt'
 	@echo " results saved to benchmark_results/benchmark.txt"
 
 ## long-test: Run long-running tests (10+ minutes each, for CI/nightly).
