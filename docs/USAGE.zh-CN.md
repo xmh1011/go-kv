@@ -213,7 +213,8 @@ GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests/long_running_e2e_test
 
 ## 9. 发布流程
 
-发布流水线会在推送 `v*.*.*` 标签时运行，也可以在 GitHub Actions 页面手动触发。
+发布流水线会在推送 `v*.*.*` 标签时发布 GitHub Release。也可以在 GitHub
+Actions 页面为一个已经存在的版本标签手动触发发布。
 
 创建 release tag：
 
@@ -221,5 +222,10 @@ GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests/long_running_e2e_test
 git tag v0.1.0
 git push origin v0.1.0
 ```
+
+如果要手动发布已有标签，在 GitHub Actions 页面运行 `Release` workflow，并设置：
+
+- `version`：要发布的已有标签，例如 `v0.1.0`。
+- `prerelease`：是否把 GitHub Release 标记为预发布版本。
 
 流水线会运行 short tests，构建多平台 server/client 二进制，生成 checksum，并把产物附加到 GitHub Release。

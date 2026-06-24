@@ -223,8 +223,9 @@ GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests/long_running_e2e_test
 
 ## 9. Release Flow
 
-The release workflow runs when a tag matching `v*.*.*` is pushed, or when it is
-started manually from GitHub Actions.
+The release workflow publishes a GitHub Release when a tag matching `v*.*.*` is
+pushed. It can also be started manually from GitHub Actions for an existing
+version tag.
 
 Create a release tag:
 
@@ -232,6 +233,12 @@ Create a release tag:
 git tag v0.1.0
 git push origin v0.1.0
 ```
+
+To publish an existing tag manually, run the `Release` workflow from GitHub
+Actions and set:
+
+- `version`: the existing tag to publish, for example `v0.1.0`.
+- `prerelease`: whether to mark the GitHub Release as a prerelease.
 
 The workflow runs short tests, builds cross-platform server and client
 binaries, generates checksums, and attaches artifacts to a GitHub release.
