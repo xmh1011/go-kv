@@ -249,33 +249,6 @@ func (c *e2eCluster) sendThroughNetwork(node *raft.Raft, cmd param.KVCommand) (b
 	return success, latency, err
 }
 
-// runE2ETest 运行端到端性能测试
-func runE2ETest(t *testing.T, testName string, testFunc func(*e2eCluster) PerfMetrics, duration time.Duration) PerfMetrics {
-	c := newE2ECluster(t, 3)
-	defer c.shutdown()
-
-	leader := c.getLeader(t)
-
-	// 预热数据
-	warmupCount := 1000
-	for i := 0; i < warmupCount; i++ {
-		key := fmt.Sprintf("warmup-key-%d", i)
-		value := fmt.Sprintf("warmup-value-%d", i)
-		cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
-		cmdBytes, _ := json.Marshal(cmd)
-		args := &param.ClientArgs{
-			ClientID:    int64(1),
-			SequenceNum: int64(i),
-			Command:     cmdBytes,
-		}
-		reply := &param.ClientReply{}
-		_ = leader.ClientRequest(args, reply)
-	}
-	time.Sleep(2 * time.Second)
-	metrics := testFunc(c)
-	return metrics
-}
-
 // TestE2E_WriteHeavy 写入密集型场景
 func TestE2E_WriteHeavy(t *testing.T) {
 	duration := 30 * time.Second

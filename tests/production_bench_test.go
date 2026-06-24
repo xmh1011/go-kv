@@ -140,19 +140,6 @@ func (c *productionCluster) getLeader(t *testing.T) *raft.Raft {
 	return nil
 }
 
-func (c *productionCluster) getAnyFollower(t *testing.T) *raft.Raft {
-	for _, node := range c.nodes {
-		if node.IsStopped() {
-			continue
-		}
-		if node.State() == raft.Follower {
-			return node
-		}
-	}
-	t.Fatal("No follower found")
-	return nil
-}
-
 // ========== 生产环境基准测试 ==========
 
 // BenchmarkProduction_GrpcLsm_3Nodes 测试3节点 gRPC+LSM 配置的生产性能

@@ -792,8 +792,8 @@ func TestApplyLogsReleasesApplyMuBeforeSnapshotExport(t *testing.T) {
 	applyMuAcquired := make(chan struct{})
 	go func() {
 		r.applyMu.Lock()
-		r.applyMu.Unlock()
 		close(applyMuAcquired)
+		r.applyMu.Unlock()
 	}()
 
 	select {

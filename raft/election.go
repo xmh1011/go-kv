@@ -476,19 +476,6 @@ func (r *Raft) isLeader() bool {
 	return r.getState() == Leader
 }
 
-// isDuplicateRequest 检查一个客户端请求是否是重复的。
-// 它通过比较请求的序列号和服务器记录的该客户端的最后一个序列号来判断。
-func (r *Raft) isDuplicateRequest(clientID int64, sequenceNum int64) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	lastSeqNum, exists := r.clientSessions[clientID]
-	if exists && sequenceNum <= lastSeqNum {
-		log.Debugf("[Client] Duplicate request detected from client %d (seq: %d)", clientID, sequenceNum)
-		return true
-	}
-	return false
-}
-
 // isLogUpToDate 检查候选人的日志是否至少和本节点一样新。
 // 这是 Raft 选举安全规则的核心实现。此函数必须在持有锁的情况下被调用。
 func (r *Raft) isLogUpToDate(candidateLastLogIndex, candidateLastLogTerm uint64) (bool, error) {

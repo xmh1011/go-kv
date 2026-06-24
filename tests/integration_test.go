@@ -684,6 +684,7 @@ func TestCluster_TakeSnapshot(t *testing.T) {
 
 			time.Sleep(500 * time.Millisecond)
 			val, err := c.stateMachines[leader.ID()-1].Get(newKey)
+			assert.NoError(t, err)
 			assert.Equal(t, newValue, val)
 		})
 	}
