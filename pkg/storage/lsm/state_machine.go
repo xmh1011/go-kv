@@ -108,23 +108,18 @@ func (lsm *StateMachineAdapter) GetSnapshot() ([]byte, error) {
 func (lsm *StateMachineAdapter) PrepareSnapshot() (func() ([]byte, error), error) {
 	log.Debug("[LSMAdapter] Creating snapshot...")
 
-	// 1. 强制 Flush
-	if err := lsm.db.ForceFlush(); err != nil {
-		log.Errorf("[LSMAdapter] Force flush failed during snapshot: %v", err)
+	// 1. Force flush and open all immutable SSTable files under the database
+	// lifecycle lock, then release the lock before reading file content. This
+	// keeps the manager pointers stable while the snapshot file set is captured.
+	files, sstRoot, err := lsm.db.FlushAndOpenSSTableSnapshot()
+	if err != nil {
+		log.Errorf("[LSMAdapter] Failed to prepare snapshot files: %v", err)
 		return nil, err
 	}
 
 	// 2. Open all immutable SSTable files under the manager lock, then release
 	// the lock before reading file content. Open descriptors pin the immutable
 	// files while avoiding long stalls for later memtable flushes.
-	files, err := lsm.db.SSTables.OpenFilesSnapshot()
-	if err != nil {
-		return nil, err
-	}
-	// dbRoot := lsm.db.Name()
-	// SSTable 路径是 dbRoot/sst
-	sstRoot := filepath.Join(lsm.db.Name(), "sst")
-
 	return func() ([]byte, error) {
 		defer func() {
 			for _, file := range files {
@@ -185,53 +180,48 @@ func (lsm *StateMachineAdapter) ApplySnapshot(snapshot []byte) error {
 		return err
 	}
 
-	// 2. 清空目录 (先关闭 DB)
-	if err := lsm.db.Close(); err != nil {
-		log.Errorf("[LSMAdapter] Failed to close DB before applying snapshot: %v", err)
-		return err
-	}
-
-	if err := os.RemoveAll(dbPath); err != nil {
-		log.Errorf("[LSMAdapter] Failed to remove DB directory %s: %v", dbPath, err)
-		return err
-	}
-	if err := os.MkdirAll(dbPath, 0755); err != nil {
-		return err
-	}
-
-	// 3. 写回文件
-	for _, file := range filesToRestore {
-		// 确保子目录存在 (例如 0-level)
-		if err := os.MkdirAll(filepath.Dir(file.fullPath), 0755); err != nil {
+	if err := lsm.db.ReplaceData(func(dbPath, walPath, sstPath string) error {
+		// 2. 清空目录。Database.ReplaceData already closed the active managers
+		// and holds the database lifecycle lock, so readers cannot observe a
+		// half-restored directory or swapped manager pointer.
+		if err := os.RemoveAll(dbPath); err != nil {
+			log.Errorf("[LSMAdapter] Failed to remove DB directory %s: %v", dbPath, err)
+			return err
+		}
+		if err := os.MkdirAll(dbPath, 0755); err != nil {
 			return err
 		}
 
-		if err := os.WriteFile(file.fullPath, file.content, 0644); err != nil {
-			log.Errorf("[LSMAdapter] Failed to write snapshot file %s: %v", file.fullPath, err)
+		// 3. 写回文件
+		for _, file := range filesToRestore {
+			// 确保子目录存在 (例如 0-level)
+			if err := os.MkdirAll(filepath.Dir(file.fullPath), 0755); err != nil {
+				return err
+			}
+
+			if err := os.WriteFile(file.fullPath, file.content, 0644); err != nil {
+				log.Errorf("[LSMAdapter] Failed to write snapshot file %s: %v", file.fullPath, err)
+				return err
+			}
+		}
+
+		// 4. 重新加载前，确保 WAL 和 SSTable 目录存在
+		if err := os.MkdirAll(walPath, 0755); err != nil {
+			log.Errorf("[LSMAdapter] Failed to create WAL directory %s: %v", walPath, err)
 			return err
 		}
+		if err := os.MkdirAll(sstPath, 0755); err != nil {
+			log.Errorf("[LSMAdapter] Failed to create SSTable directory %s: %v", sstPath, err)
+			return err
+		}
+
+		return nil
+	}); err != nil {
+		log.Errorf("[LSMAdapter] Failed to replace DB data after snapshot: %v", err)
+		return err
 	}
 
 	log.Debugf("[LSMAdapter] Snapshot applied. %d files restored.", len(snapshotData))
-
-	// 4. 重新加载
-	// 重新加载前，确保 WAL 目录存在
-	walPath := filepath.Join(dbPath, "wal")
-	if err := os.MkdirAll(walPath, 0755); err != nil {
-		log.Errorf("[LSMAdapter] Failed to create WAL directory %s: %v", walPath, err)
-		return err
-	}
-	// 重新加载前，确保 SSTable 目录存在
-	if err := os.MkdirAll(sstPath, 0755); err != nil {
-		log.Errorf("[LSMAdapter] Failed to create SSTable directory %s: %v", sstPath, err)
-		return err
-	}
-
-	if err := lsm.db.Reload(); err != nil {
-		log.Errorf("[LSMAdapter] Failed to reload DB after snapshot: %v", err)
-		return err
-	}
-
 	return nil
 }
 

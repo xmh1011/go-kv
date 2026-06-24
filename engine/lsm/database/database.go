@@ -1,7 +1,9 @@
 package database
 
 import (
+	"fmt"
 	"path/filepath"
+	"sync"
 
 	"github.com/xmh1011/go-kv/engine/lsm/kv"
 	"github.com/xmh1011/go-kv/engine/lsm/memtable"
@@ -10,6 +12,7 @@ import (
 )
 
 type Database struct {
+	mu        sync.RWMutex
 	name      string
 	MemTables *memtable.Manager
 	SSTables  *sstable.Manager
@@ -32,6 +35,9 @@ func (d *Database) Name() string {
 }
 
 func (d *Database) Get(key string) ([]byte, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
 	log.Debugf("[Database] Get key: %s", key)
 	value, found := d.MemTables.Search(kv.Key(key))
 	if found {
@@ -62,6 +68,9 @@ func (d *Database) Get(key string) ([]byte, error) {
 }
 
 func (d *Database) Put(key string, value []byte) error {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
 	log.Debugf("[Database] Put key: %s", key)
 	imem, err := d.MemTables.Insert(kv.KeyValuePair{Key: kv.Key(key), Value: value})
 	if err != nil {
@@ -73,6 +82,9 @@ func (d *Database) Put(key string, value []byte) error {
 }
 
 func (d *Database) Delete(key string) error {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
 	log.Debugf("[Database] Delete key: %s", key)
 	imem, err := d.MemTables.Delete(kv.Key(key))
 	if err != nil {
@@ -84,6 +96,13 @@ func (d *Database) Delete(key string) error {
 }
 
 func (d *Database) Recover() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.recoverLocked()
+}
+
+func (d *Database) recoverLocked() error {
 	log.Debug("[Database] Starting recovery...")
 	// 1. 恢复内存中的 MemTable
 	if err := d.MemTables.Recover(); err != nil {
@@ -104,6 +123,13 @@ func (d *Database) Recover() error {
 // ForceFlush 强制将当前的 MemTable 转换为 Immutable MemTable 并刷新到 SSTable。
 // 这通常用于快照操作。
 func (d *Database) ForceFlush() error {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	return d.forceFlushLocked()
+}
+
+func (d *Database) forceFlushLocked() error {
 	log.Debug("[Database] Force flushing MemTable to SSTable")
 	// 1. 强制 Promote 当前 MemTable。快照必须覆盖所有可读内存数据，
 	// 包括之前尚未因 IMemTable 数量超限而落盘的 immutable memtables。
@@ -133,7 +159,26 @@ func (d *Database) ForceFlush() error {
 // GetAllSSTables 返回当前所有 SSTable 的文件路径列表。
 // 这用于快照生成。
 func (d *Database) GetAllSSTables() []string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
 	return d.SSTables.GetAllFiles()
+}
+
+func (d *Database) FlushAndOpenSSTableSnapshot() ([]sstable.SnapshotFile, string, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if err := d.forceFlushLocked(); err != nil {
+		return nil, "", err
+	}
+
+	files, err := d.SSTables.OpenFilesSnapshot()
+	if err != nil {
+		return nil, "", err
+	}
+
+	return files, filepath.Join(d.name, "sst"), nil
 }
 
 func (d *Database) createNewSSTable(imem *memtable.IMemTable) {
@@ -151,6 +196,13 @@ func (d *Database) createNewSSTable(imem *memtable.IMemTable) {
 
 // Close 关闭数据库，释放资源。
 func (d *Database) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.closeLocked()
+}
+
+func (d *Database) closeLocked() error {
 	log.Debug("[Database] Closing database...")
 	d.SSTables.WaitForCompactions()
 	// 关闭 MemTable Manager (主要是关闭 WAL)
@@ -163,16 +215,45 @@ func (d *Database) Close() error {
 
 // Reload 关闭并重新打开数据库（用于快照恢复后）
 func (d *Database) Reload() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.reloadLocked()
+}
+
+func (d *Database) reloadLocked() error {
 	log.Debug("[Database] Reloading database...")
-	if err := d.Close(); err != nil {
+	if err := d.closeLocked(); err != nil {
 		return err
 	}
 
-	// 重新初始化 Managers
+	return d.reopenLocked()
+}
+
+func (d *Database) ReplaceData(rebuild func(dbPath, walPath, sstPath string) error) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if err := d.closeLocked(); err != nil {
+		return err
+	}
+
+	walPath := filepath.Join(d.name, "wal")
+	sstPath := filepath.Join(d.name, "sst")
+	if err := rebuild(d.name, walPath, sstPath); err != nil {
+		if reopenErr := d.reopenLocked(); reopenErr != nil {
+			return fmt.Errorf("%w; additionally failed to reopen database: %v", err, reopenErr)
+		}
+		return err
+	}
+
+	return d.reopenLocked()
+}
+
+func (d *Database) reopenLocked() error {
 	walPath := filepath.Join(d.name, "wal")
 	sstPath := filepath.Join(d.name, "sst")
 	d.MemTables = memtable.NewMemTableManager(walPath)
 	d.SSTables = sstable.NewSSTableManager(sstPath)
-
-	return d.Recover()
+	return d.recoverLocked()
 }
