@@ -47,6 +47,16 @@ This uses:
 Each file sets a different `raft.id` and shares the same peer list. The default
 transport is gRPC and the default storage engine is LSM.
 
+`make cluster` waits until ports `8001`, `8002`, and `8003` are listening
+before reporting success. Per-node logs are written to `raft-node-N.log`; early
+process output is captured in `raft-node-N.out`.
+
+Run the full startup and CLI smoke path:
+
+```bash
+make cluster-smoke
+```
+
 Stop the cluster:
 
 ```bash

@@ -45,6 +45,15 @@ make cluster
 
 每个文件设置不同的 `raft.id`，但共享同一份 peer 列表。默认传输层是 gRPC，默认存储引擎是 LSM。
 
+`make cluster` 会等到 `8001`、`8002`、`8003` 三个端口都开始监听后才报告成功。
+每个节点的日志写入 `raft-node-N.log`，早期进程输出写入 `raft-node-N.out`。
+
+运行完整的本地启动和 CLI smoke 路径：
+
+```bash
+make cluster-smoke
+```
+
 停止集群：
 
 ```bash

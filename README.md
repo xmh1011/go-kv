@@ -121,6 +121,16 @@ The command starts three server processes using:
 - `conf/config-2.yaml`
 - `conf/config-3.yaml`
 
+`make cluster` waits until ports `8001`, `8002`, and `8003` are listening
+before reporting success. Per-node logs are written to `raft-node-N.log`; early
+process output is captured in `raft-node-N.out`.
+
+Verify the full local startup and CLI path:
+
+```bash
+make cluster-smoke
+```
+
 Stop the cluster:
 
 ```bash

@@ -111,6 +111,15 @@ make cluster
 - `conf/config-2.yaml`
 - `conf/config-3.yaml`
 
+`make cluster` 会等到 `8001`、`8002`、`8003` 三个端口都开始监听后才报告成功。
+每个节点的日志写入 `raft-node-N.log`，早期进程输出写入 `raft-node-N.out`。
+
+验证完整的本地启动和 CLI 路径：
+
+```bash
+make cluster-smoke
+```
+
 停止集群：
 
 ```bash
