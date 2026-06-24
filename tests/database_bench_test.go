@@ -14,6 +14,7 @@ func BenchmarkPut(b *testing.B) {
 	dir := b.TempDir()
 
 	db := database.Open(dir)
+	cleanupBenchmarkDatabase(b, db)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -33,6 +34,7 @@ func BenchmarkGet(b *testing.B) {
 	dir := b.TempDir()
 
 	db := database.Open(dir)
+	cleanupBenchmarkDatabase(b, db)
 
 	// 预先写入固定数量的 key-value，后续循环中周期性获取这些 key 的数据
 	keyCount := 100000
@@ -69,6 +71,7 @@ func BenchmarkDelete(b *testing.B) {
 	dir := b.TempDir()
 
 	db := database.Open(dir)
+	cleanupBenchmarkDatabase(b, db)
 
 	keyCount := 100000
 	for i := 0; i < keyCount; i++ {
@@ -96,4 +99,13 @@ func BenchmarkDelete(b *testing.B) {
 		}
 	}
 	b.StopTimer()
+}
+
+func cleanupBenchmarkDatabase(b *testing.B, db *database.Database) {
+	b.Helper()
+	b.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			b.Errorf("Close database error: %v", err)
+		}
+	})
 }
