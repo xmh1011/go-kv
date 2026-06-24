@@ -545,26 +545,15 @@ func TestCluster_ConcurrentClientRequests(t *testing.T) {
 			wg.Wait()
 
 			t.Log("Verifying data consistency after concurrent requests...")
-			time.Sleep(2 * time.Second)
 
-			// 验证所有 Key 都正确写入
+			// 验证所有 Key 最终在每个节点上都正确写入。Follower apply 是异步的，
+			// 不能用固定 sleep 作为一致性屏障。
 			for i := 0; i < concurrentRequests; i++ {
 				key := fmt.Sprintf("concurrent-key-%d", i)
 				expectedValue := fmt.Sprintf("value-%d", i)
 
-				// 检查 Leader
-				leaderVal, err := c.stateMachines[leader.ID()-1].Get(key)
-				assert.NoError(t, err)
-				assert.Equal(t, expectedValue, leaderVal)
-
-				// 检查 Followers
 				for j := 0; j < 3; j++ {
-					if c.nodes[j].ID() == leader.ID() {
-						continue
-					}
-					followerVal, err := c.stateMachines[j].Get(key)
-					assert.NoError(t, err)
-					assert.Equal(t, expectedValue, followerVal)
+					c.waitForStateMachineValue(t, j, key, expectedValue, 10*time.Second)
 				}
 			}
 		})
