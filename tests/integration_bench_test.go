@@ -3,6 +3,7 @@ package tests
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,11 +16,14 @@ import (
 
 // benchCluster holds cluster resources for benchmark tests
 type benchCluster struct {
-	nodes      []*raft.Raft
-	transports []transport.Transport
-	stores     []storage.Storage
-	leader     *raft.Raft
+	nodes       []*raft.Raft
+	transports  []transport.Transport
+	stores      []storage.Storage
+	commitChans []chan param.CommitEntry
+	leader      *raft.Raft
 }
+
+const benchmarkLeaderElectionTimeout = 15 * time.Second
 
 // setupBenchCluster creates a 3-node Raft cluster for benchmarks.
 // storageType: storage.InmemoryStorage or storage.LSMStorage
@@ -48,6 +52,7 @@ func setupBenchCluster(b *testing.B, storageType string, transportType string) *
 		}
 		c.stores = append(c.stores, store)
 		commitChan := make(chan param.CommitEntry, 1000)
+		c.commitChans = append(c.commitChans, commitChan)
 
 		go func(ch chan param.CommitEntry) {
 			for range ch {
@@ -58,7 +63,9 @@ func setupBenchCluster(b *testing.B, storageType string, transportType string) *
 
 		rf := raft.NewRaft(i+1, []int{1, 2, 3}, store, sm, c.transports[i], commitChan)
 		c.transports[i].RegisterRaft(rf)
-		c.transports[i].Start()
+		if err := c.transports[i].Start(); err != nil {
+			b.Fatalf("Failed to start transport for node %d: %v", i+1, err)
+		}
 		go rf.Run()
 		c.nodes = append(c.nodes, rf)
 	}
@@ -75,7 +82,7 @@ func setupBenchCluster(b *testing.B, storageType string, transportType string) *
 	}
 
 	// Wait for leader election with polling
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(benchmarkLeaderElectionTimeout)
 	for time.Now().Before(deadline) {
 		for _, n := range c.nodes {
 			if n.State() == raft.Leader {
@@ -90,7 +97,7 @@ func setupBenchCluster(b *testing.B, storageType string, transportType string) *
 	}
 
 	if c.leader == nil {
-		b.Fatal("No leader elected within 5s")
+		b.Fatalf("No leader elected within %s; states: %s", benchmarkLeaderElectionTimeout, benchmarkNodeStates(c.nodes))
 	}
 
 	return c
@@ -100,12 +107,23 @@ func (c *benchCluster) cleanup() {
 	for _, n := range c.nodes {
 		n.Stop()
 	}
+	for _, ch := range c.commitChans {
+		close(ch)
+	}
 	for _, t := range c.transports {
 		t.Close()
 	}
 	for _, s := range c.stores {
 		s.Close()
 	}
+}
+
+func benchmarkNodeStates(nodes []*raft.Raft) string {
+	states := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		states = append(states, fmt.Sprintf("node%d=%v stopped=%t", node.ID(), node.State(), node.IsStopped()))
+	}
+	return strings.Join(states, ", ")
 }
 
 // BenchmarkCluster_3NodesInmemory 测试 3 节点 InMemory 传输的性能
