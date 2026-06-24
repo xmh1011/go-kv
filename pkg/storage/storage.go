@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -124,7 +125,9 @@ func NewStorage(storageType, dataDir string, nodeID int) (Storage, StateMachine,
 
 		stateMachine, err := simplefile.NewStateMachine(smPath)
 		if err != nil {
-			store.Close()
+			if closeErr := store.Close(); closeErr != nil {
+				return nil, nil, fmt.Errorf("failed to create simplefile state machine: %w", errors.Join(err, fmt.Errorf("close simplefile storage: %w", closeErr)))
+			}
 			return nil, nil, fmt.Errorf("failed to create simplefile state machine: %w", err)
 		}
 		log.Debugf("Using simple file storage at %s", nodeDir)
@@ -141,14 +144,21 @@ func NewStorage(storageType, dataDir string, nodeID int) (Storage, StateMachine,
 		raftLogDB := database.Open(filepath.Join(nodeDir, "lsm_raftlog"))
 		if err := raftLogDB.Recover(); err != nil {
 			// 如果 raft log 恢复失败，需要关闭 state machine
-			lsmStateMachine.Close()
+			if closeErr := lsmStateMachine.Close(); closeErr != nil {
+				return nil, nil, fmt.Errorf("failed to recover lsm database for raft log: %w", errors.Join(err, fmt.Errorf("close lsm state machine: %w", closeErr)))
+			}
 			return nil, nil, fmt.Errorf("failed to recover lsm database for raft log: %w", err)
 		}
 		lsmStorage, err := lsm.NewStorageAdapter(raftLogDB)
 		if err != nil {
 			// 如果 storage adapter 创建失败，需要关闭 state machine 和 raft log db
-			lsmStateMachine.Close()
-			raftLogDB.Close()
+			closeErr := errors.Join(
+				wrapCloseError("close lsm state machine", lsmStateMachine.Close()),
+				wrapCloseError("close lsm raft log database", raftLogDB.Close()),
+			)
+			if closeErr != nil {
+				return nil, nil, fmt.Errorf("failed to create lsm storage adapter: %w", errors.Join(err, closeErr))
+			}
 			return nil, nil, fmt.Errorf("failed to create lsm storage adapter: %w", err)
 		}
 
@@ -157,4 +167,11 @@ func NewStorage(storageType, dataDir string, nodeID int) (Storage, StateMachine,
 	default:
 		return nil, nil, fmt.Errorf("unknown storage type: %s", storageType)
 	}
+}
+
+func wrapCloseError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", operation, err)
 }

@@ -58,12 +58,16 @@ func NewStorage(filePath string) (*Storage, error) {
 	return s, nil
 }
 
-func (s *Storage) load() error {
+func (s *Storage) load() (err error) {
 	f, err := os.Open(s.filePath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 
 	var data persistentData
 	if err := gob.NewDecoder(f).Decode(&data); err != nil {

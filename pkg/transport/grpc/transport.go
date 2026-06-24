@@ -131,7 +131,9 @@ func (t *Transport) SetPeers(peers map[int]string) {
 
 	// Close existing connections to force reconnection with new addresses if needed
 	for _, conn := range t.conns {
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			log.Warnf("[GRPCTransport] Failed to close cached connection while resetting peers: %v", err)
+		}
 	}
 	t.conns = make(map[string]*grpc.ClientConn)
 	t.clients = make(map[string]pb.RaftServiceClient)
@@ -167,13 +169,14 @@ func (t *Transport) Close() error {
 
 	t.grpcServer.Stop()
 
+	var closeErr error
 	for _, conn := range t.conns {
-		conn.Close()
+		closeErr = errors.Join(closeErr, conn.Close())
 	}
 	t.conns = make(map[string]*grpc.ClientConn)
 	t.clients = make(map[string]pb.RaftServiceClient)
 
-	return nil
+	return closeErr
 }
 
 func (t *Transport) getPeerAddress(nodeIDStr string) (string, error) {

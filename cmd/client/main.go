@@ -91,7 +91,11 @@ func runCommand(op, key, value string) {
 		log.Fatalf("Failed to initialize transport: %v", err)
 	}
 	trans.SetPeers(peerMap)
-	defer trans.Close()
+	defer func() {
+		if err := trans.Close(); err != nil {
+			log.Printf("Failed to close transport: %v", err)
+		}
+	}()
 
 	// 3. Create client instance
 	c := client.NewClient(peerMap, trans)
