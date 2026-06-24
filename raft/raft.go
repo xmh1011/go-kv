@@ -377,10 +377,15 @@ func (r *Raft) Stop() {
 	// Stop may race with RPC handlers that intentionally release r.mu while
 	// doing storage or state-machine I/O. Wait for those critical sections
 	// before callers close or reopen the underlying storage directory.
-	r.stateMachineMu.Lock()
-	r.stateMachineMu.Unlock()
-	r.appendEntriesMu.Lock()
-	r.appendEntriesMu.Unlock()
+	waitForNoActiveCriticalSection(&r.stateMachineMu)
+	waitForNoActiveCriticalSection(&r.appendEntriesMu)
+}
+
+// waitForNoActiveCriticalSection waits until any current holder of lock exits.
+// The acquisition is the synchronization point; no protected work is needed.
+func waitForNoActiveCriticalSection(lock sync.Locker) {
+	lock.Lock()
+	defer lock.Unlock()
 }
 
 // randomizedElectionTimeout 返回一个在 [electionTimeout, 2 * electionTimeout) 范围内的随机超时时间。
@@ -1489,19 +1494,6 @@ func (r *Raft) waitForAppliedLogMatching(index uint64, timeout time.Duration, ex
 func (r *Raft) isClientRequestAppliedLocked(key clientRequestKey) bool {
 	lastSeq, exists := r.clientSessions[key.clientID]
 	return exists && key.sequenceNum <= lastSeq
-}
-
-func (r *Raft) clearPendingClientRequest(index uint64) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	key, ok := r.pendingLogClients[index]
-	if !ok {
-		return
-	}
-	delete(r.pendingLogClients, index)
-	if r.pendingClientRequests[key] == index {
-		delete(r.pendingClientRequests, key)
-	}
 }
 
 // initLeaderState initializes leader state after election

@@ -62,7 +62,7 @@ func (s *StorageAdapter) init() error {
 	if err != nil {
 		return fmt.Errorf("get log meta failed: %w", err)
 	}
-	if val != nil && len(val) == 24 {
+	if len(val) == 24 {
 		s.firstIndex = binary.BigEndian.Uint64(val[0:8])
 		s.lastIndex = binary.BigEndian.Uint64(val[8:16])
 		s.logSize = int(binary.BigEndian.Uint64(val[16:24]))

@@ -147,36 +147,6 @@ func (c *perfCluster) sendThroughRPC(node *raft.Raft, cmd param.KVCommand, timeo
 	return success, latency, err
 }
 
-// runPerfTest 运行端到端性能测试
-func runPerfTest(t *testing.T, testName string, testFunc func(*perfCluster) PerfMetrics, duration time.Duration) PerfMetrics {
-	c := newPerfCluster(t, 3)
-	defer c.shutdown()
-
-	leader := c.getLeader(t)
-	t.Logf("Test: %s, Leader: Node %d", testName, leader.ID())
-
-	warmupCount := 500
-	t.Logf("Warmup: writing %d entries...", warmupCount)
-	for i := 0; i < warmupCount; i++ {
-		key := fmt.Sprintf("warmup-key-%d", i)
-		value := fmt.Sprintf("warmup-value-%d", i)
-		cmd := param.KVCommand{Op: param.OpSet, Key: key, Value: value}
-		cmdBytes, _ := json.Marshal(cmd)
-		args := &param.ClientArgs{
-			ClientID:    int64(1),
-			SequenceNum: int64(i),
-			Command:     cmdBytes,
-		}
-		reply := &param.ClientReply{}
-		_ = leader.ClientRequest(args, reply)
-	}
-	time.Sleep(2 * time.Second)
-
-	metrics := testFunc(c)
-
-	return metrics
-}
-
 // PerfTestSuite 端到端性能测试套件
 type PerfTestSuite struct{}
 

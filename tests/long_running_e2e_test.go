@@ -636,100 +636,6 @@ func (c *longRunningCluster) monitorLeaderChanges(ctx chan struct{}) {
 	}
 }
 
-// sendRequest 发送请求并返回结果（不处理重定向）
-func (c *longRunningCluster) sendRequest(node *raft.Raft, cmd param.KVCommand) (bool, time.Duration, error) {
-	cmdBytes, _ := json.Marshal(cmd)
-	args := &param.ClientArgs{
-		ClientID:    rand.Int63(),
-		SequenceNum: rand.Int63(),
-		Command:     cmdBytes,
-	}
-	reply := &param.ClientReply{}
-
-	start := time.Now()
-	err := node.ClientRequest(args, reply)
-	latency := time.Since(start)
-
-	success := err == nil && reply.Success
-	return success, latency, err
-}
-
-// sendRequestToAnyNode 向任意节点发送请求，自动处理 NotLeader 重定向
-// 这是正确的 Raft 客户端实现方式：
-// 1. 可以向任意节点发送请求
-// 2. 如果节点是 Leader，正常处理
-// 3. 如果节点是 Follower，返回 NotLeader + LeaderHint，客户端重定向
-func (c *longRunningCluster) sendRequestToAnyNode(cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, error) {
-	var totalLatency time.Duration
-	requestIssued := false
-	requestIssuedAt := time.Time{}
-
-	// 初始随机选择一个节点
-	nodeIdx := rand.Intn(c.nodeCount())
-	node := c.nodeAt(nodeIdx)
-	cmdBytes, _ := json.Marshal(cmd)
-	args := &param.ClientArgs{
-		ClientID:    rand.Int63(),
-		SequenceNum: rand.Int63(),
-		Command:     cmdBytes,
-	}
-
-	for retry := 0; shouldContinueLongRunningRetry(retry, maxRetries, requestIssued, requestIssuedAt, time.Now()); retry++ {
-		// Stop only gates new operations. Once this client identity has been
-		// sent, keep retrying it so the test's expected-value model cannot miss
-		// an operation that commits after shutdown starts.
-		if shouldStopBeforeRequest(stopCh, requestIssued) {
-			return false, totalLatency, errLongRunningTestStopped
-		}
-
-		reply := &param.ClientReply{}
-
-		start := time.Now()
-		if !requestIssued {
-			requestIssuedAt = start
-		}
-		requestIssued = true
-		err := node.ClientRequest(args, reply)
-		latency := time.Since(start)
-		totalLatency += latency
-
-		if err == nil && reply.Success {
-			return true, totalLatency, nil
-		}
-
-		// 如果收到 NotLeader 响应，使用 LeaderHint 重定向
-		if reply.NotLeader {
-			updatedLeader := false
-			if reply.LeaderHint > 0 && reply.LeaderHint <= c.nodeCount() {
-				// 使用 LeaderHint 定位新 Leader
-				node = c.nodeAt(reply.LeaderHint - 1)
-				updatedLeader = true
-			} else {
-				// LeaderHint 无效，随机选择一个节点重试
-				if leader := c.findLeader(); leader != nil {
-					node = leader
-					updatedLeader = true
-				} else {
-					node = c.nodeAt(rand.Intn(c.nodeCount()))
-				}
-			}
-			if !updatedLeader && !waitBeforeRetryAfterIssued(stopCh, retryBackoff(retry), requestIssued) {
-				return false, totalLatency, errLongRunningTestStopped
-			}
-			continue
-		}
-
-		// 其他错误或 leader 端暂时未完成 apply，按真实客户端语义继续重试。
-		node = c.findLeader()
-		if node == nil {
-			time.Sleep(100 * time.Millisecond)
-			node = c.nodeAt(rand.Intn(c.nodeCount()))
-		}
-	}
-
-	return false, totalLatency, fmt.Errorf("max retries exceeded")
-}
-
 func retryBackoff(retry int) time.Duration {
 	delay := time.Duration(retry+1) * 25 * time.Millisecond
 	if delay > 150*time.Millisecond {
@@ -794,25 +700,6 @@ func (c *longRunningCluster) findLeader() *raft.Raft {
 		}
 	}
 	return nil
-}
-
-// getLeaderByID 根据 LeaderHint ID 获取 Leader 节点
-func (c *longRunningCluster) getLeaderByID(leaderID int) *raft.Raft {
-	if leaderID <= 0 || leaderID > c.nodeCount() {
-		return nil
-	}
-	return c.nodeAt(leaderID - 1)
-}
-
-// sendRequestWithLeaderTracking 向当前 Leader 发送请求，自动跟踪 Leader 变化
-// 当收到 NotLeader 响应时，更新 currentLeader 并重试
-func (c *longRunningCluster) sendRequestWithLeaderTracking(currentLeader *atomic.Value, cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, error) {
-	success, latency, _, err := c.sendRequestWithLeaderTrackingDetailed(currentLeader, cmd, maxRetries, stopCh)
-	return success, latency, err
-}
-
-func (c *longRunningCluster) sendRequestWithLeaderTrackingDetailed(currentLeader *atomic.Value, cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, string, error) {
-	return c.sendRequestWithClientLeaderTrackingDetailed(currentLeader, rand.Int63(), rand.Int63(), cmd, maxRetries, stopCh)
 }
 
 func (c *longRunningCluster) sendRequestWithClientLeaderTrackingDetailed(currentLeader *atomic.Value, clientID, sequenceNum int64, cmd param.KVCommand, maxRetries int, stopCh <-chan struct{}) (bool, time.Duration, string, error) {
@@ -932,16 +819,6 @@ func classifyClientFailure(err error, reply *param.ClientReply) string {
 		return "unsuccessful_reply"
 	}
 	return "reply_" + strings.ReplaceAll(result, " ", "_")
-}
-
-// getCurrentLeader 获取当前 Leader
-func (c *longRunningCluster) getCurrentLeader() *raft.Raft {
-	for _, node := range c.nodesSnapshot() {
-		if node.State() == raft.Leader {
-			return node
-		}
-	}
-	return nil
 }
 
 type observedValue struct {

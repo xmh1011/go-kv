@@ -3,7 +3,6 @@ package database
 import (
 	"fmt"
 	"math/rand"
-	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -235,8 +234,4 @@ func TestDatabaseFlushToSSTable(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, value, val)
 	}
-}
-
-func cleanup(dir string) {
-	os.RemoveAll(dir)
 }

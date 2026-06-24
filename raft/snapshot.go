@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"errors"
 	"strconv"
 	"time"
 
@@ -219,49 +218,6 @@ func (r *Raft) TakeSnapshot() bool {
 	return true
 }
 
-// handleSnapshotTerm 负责处理 InstallSnapshot RPC 中的任期检查和心跳逻辑。
-// 如果 Leader 的任期有效，返回 true。此函数必须在持有锁的情况下被调用。
-func (r *Raft) handleSnapshotTerm(args *param.InstallSnapshotArgs, reply *param.InstallSnapshotReply) bool {
-	reply.Term = r.currentTerm
-	if args.Term < r.currentTerm {
-		return false
-	}
-
-	if args.Term > r.currentTerm {
-		if err := r.becomeFollower(args.Term); err != nil {
-			return false
-		}
-		reply.Term = r.currentTerm
-	}
-	r.electionResetEvent = time.Now()
-	return true
-}
-
-// persistSnapshot 负责将快照保存到稳定存储，并根据快照索引压缩日志。
-func (r *Raft) persistSnapshot(snapshot *param.Snapshot) error {
-	// 将快照持久化到存储。
-	if err := r.store.SaveSnapshot(snapshot); err != nil {
-		log.Errorf("[Snapshot] Node %d failed to save received snapshot: %v", r.id, err)
-		return err
-	}
-	// 更新内存中的快照引用，避免频繁从存储读取。
-	r.snapshot = snapshot
-
-	// 压缩本地日志，删除所有已被快照覆盖的条目。
-	if err := r.store.CompactLog(snapshot.LastIncludedIndex); err != nil {
-		log.Errorf("[Snapshot] Node %d failed to compact log after installing snapshot: %v", r.id, err)
-		return err
-	}
-	return nil
-}
-
-// updateStateAfterSnapshot 在成功安装快照后，更新节点的内部状态索引。
-func (r *Raft) updateStateAfterSnapshot(snapshotIndex uint64) {
-	r.commitIndex = max(r.commitIndex, snapshotIndex)
-	r.lastApplied = max(r.lastApplied, snapshotIndex)
-	r.cachedLastLogIndex = max(r.cachedLastLogIndex, snapshotIndex)
-}
-
 // sendSnapshot 是 Leader 用于向落后的 Follower 发送快照
 //
 // 优化：将快照读取操作移到锁外执行，减少锁持有时间。
@@ -300,23 +256,6 @@ func (r *Raft) sendSnapshot(peerID int) {
 
 	// 5. 处理 RPC 响应（持锁）
 	r.processSnapshotReply(peerID, reply, snapshot.LastIncludedIndex, savedCurrentTerm)
-}
-
-// readSnapshotForSending 负责从存储中读取最新的快照。
-// 已废弃：使用 sendSnapshot 中的内联实现替代，避免不必要的锁持有。
-// 保留此函数以兼容可能的外部调用。
-func (r *Raft) readSnapshotForSending(peerID int) (*param.Snapshot, error) {
-	// 不再持有锁，直接读取
-	snapshot, err := r.store.ReadSnapshot()
-	if err != nil {
-		log.Errorf("[Snapshot] Node %d failed to read snapshot to send to peer %d: %v", r.id, peerID, err)
-		return nil, err
-	}
-	if snapshot == nil {
-		log.Errorf("[Snapshot] Node %d tried to send snapshot to peer %d, but no snapshot is available.", r.id, peerID)
-		return nil, errors.New("no snapshot available to send")
-	}
-	return snapshot, nil
 }
 
 // processSnapshotReply 负责处理来自 Follower 的 InstallSnapshot RPC 响应。
