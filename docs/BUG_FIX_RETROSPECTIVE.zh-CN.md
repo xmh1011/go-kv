@@ -23,6 +23,12 @@ English version: [BUG_FIX_RETROSPECTIVE.md](BUG_FIX_RETROSPECTIVE.md)
 - #122 Make waitForAppliedLog timeout recheck test deterministic
 - #123 Make integration leader discovery reliable under race load
 - #124 Make network partition leader detection race-load safe
+- #142 Bound mixed workload benchmark concurrency
+- #143 Close LSM benchmark databases
+- #145 Stabilize benchmark leader readiness
+- #146 Propagate benchmark test failures
+- #150 Prevent LSM snapshot reload races
+- #151 Extend mixed-failure issued-request retry budget
 
 ## 1. 真正改变结果的调试原则
 
@@ -1298,3 +1304,205 @@ GO_KV_LOG_LEVEL=warn go test -race ./tests -run '^TestCluster_NetworkPartition$'
 
 修复后，原失败的 `tcp_inmemory` network-partition 子场景在 race detector 下连续 5
 次通过；完整 network-partition transport/storage 矩阵也在 race detector 下通过。
+
+## 23. 2026-06-24 Benchmark Harness 与长时间 E2E 强化
+
+相关 issue：#142、#143、#145、#146、#150、#151。
+
+这轮排查和前面的 Raft 修复不完全一样。可见失败大多出现在 benchmark 和长时间 E2E
+计数逻辑里，但深入排查后，仍然在 LSM/Raft snapshot 的存储边界发现了一个真实 race。
+
+### #142：Benchmark 并发度必须匹配被测集群
+
+症状：mixed workload benchmark 给一个本地三节点集群施加了过高客户端压力，导致输出噪声很大，
+也让人很难区分到底是核心 bug，还是测试 harness 制造的过载。
+
+原则很简单：benchmark 应该压测它声称要衡量的子系统，而不是意外的无界客户端调度器。对 Raft
+写 benchmark 来说，一个逻辑写入本来就要经过 leader append、stable storage、多数派复制、commit
+和状态机 apply。无界 goroutine fanout 可能把存储 benchmark 变成客户端排队 benchmark。
+
+修复方式是限制 mixed workload 的并发度，让 benchmark 仍然制造压力，但结果可解释：
+
+```text
+benchmark concurrency 必须是显式输入
+        |
+        v
+负载应该逐步压满 Raft/LSM 路径
+        |
+        v
+失败应该指向系统行为，而不是 harness 过载
+```
+
+### #146：Benchmark 内部失败必须向外传播
+
+症状：benchmark helper 内部能观察到操作失败，但外层 benchmark 命令仍可能成功退出。这很危险，
+因为它会产生假的性能数据：一个静默丢弃失败写入的 benchmark 衡量的已经不是同一个系统。
+
+修复后，harness 会把隐藏的操作错误当作 benchmark 失败。对应不变量是：
+
+```text
+只有 correctness counter 干净时，性能数字才有效
+```
+
+这和项目里长时间 E2E 的规则一致：只有失败操作、final barrier 和严格一致性检查都干净时，
+吞吐和延迟才有意义。
+
+### #145：Leader Ready 是条件，不是 sleep
+
+症状：benchmark 启动阶段可能和 leader election 竞争，导致依赖时序的失败。根因和 #123、#124
+一样：测试真正需要的是“已经有可用 leader”，但 harness 使用的是固定等待和较弱的 ready 假设。
+
+修复后，benchmark 启动会等待明确的 leader-ready 条件，再开始施加负载。这样 benchmark 失败会集中在
+workload 阶段；除非场景本身要测选主，否则 steady-state latency 也不会意外包含 leader election 时间。
+
+### #143：Benchmark 必须关闭 LSM 数据库
+
+症状：LSM benchmark 运行后没有关闭数据库实例。这会让文件描述符、后台 compaction goroutine
+和临时目录泄漏到后续 benchmark iteration。
+
+原则是：LSM benchmark 不是纯 CPU microbenchmark。它拥有文件、WAL、SSTable 和 compaction worker。
+正确生命周期应该是：
+
+```text
+创建隔离数据库目录
+        |
+        v
+运行 workload
+        |
+        v
+等待或停止后台 worker
+        |
+        v
+关闭数据库
+        |
+        v
+删除测试目录
+```
+
+关闭数据库也影响正确性。如果一个 benchmark 遗留打开的数据库，后续 benchmark 可能观察到不属于该场景的资源竞争。
+
+### #150：Snapshot Apply 必须串行化数据库替换
+
+症状：一个聚焦 race 测试暴露了 `Database.Reload` 和并发 `Database.Get` 之间的真实数据竞争。
+对应的生产形态路径是 Raft InstallSnapshot。安装状态机快照时，系统可能关闭并替换 LSM 数据库；
+与此同时，客户端读请求仍在遍历 memtable 或 SSTable。
+
+旧的理解不完整：
+
+```text
+stateMachineMu 保护 Raft apply/read/snapshot 调用
+```
+
+这在 Raft adapter 边界成立，但 LSM database facade 也有被测试和存储工具直接调用的方法。
+LSM database 自己也需要 lifecycle 边界，确保破坏性操作不会和普通读写重叠。
+
+修复后，数据库增加 lifecycle `RWMutex`：
+
+```go
+func (d *Database) Get(key kv.Key) ([]byte, bool) {
+    d.lifecycleMu.RLock()
+    defer d.lifecycleMu.RUnlock()
+    ...
+}
+
+func (d *Database) ReplaceData(fn func(tmpDir string) error) error {
+    d.lifecycleMu.Lock()
+    defer d.lifecycleMu.Unlock()
+    ...
+}
+```
+
+Snapshot 导出也被收紧。状态机不再先列出 SSTable 文件名、稍后再打开，而是向数据库请求一个
+flush 后、已打开的 SSTable snapshot：
+
+```go
+files, closeSnapshot, err := db.FlushAndOpenSSTableSnapshot()
+defer closeSnapshot()
+```
+
+在类 Unix 文件系统上，打开的 fd 会固定已经选择的字节。Lifecycle lock 则保护反方向：
+应用 snapshot 时，不能在读者已经使用旧数据库期间关闭或替换它。
+
+验证：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race -run '^TestApplySnapshotDoesNotRaceWithConcurrentReads$' ./pkg/storage/lsm -count=1
+GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1
+GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_DeleteStress$' -count=1
+GO_KV_LOG_LEVEL=warn make test
+```
+
+修复前，聚焦 race 测试能报告 `Database.Reload` 和 `Database.Get` 的 data race。修复后该测试通过，
+更大的 LSM/storage race 门禁通过，10 分钟删除压力场景完成 986,369 次操作、失败 0、严格一致性 true。
+
+### #151：已发请求需要恢复窗口
+
+症状：10 分钟 mixed-failure workload 可能报告少量 `apply_timeout` 失败，但 final barrier
+和严格一致性都通过。复现失败的形态是：
+
+```text
+apply_timeout=4
+final barrier: true
+strict consistency: true
+```
+
+这个信号说明“harness 放弃等待 4 个已发请求的结果”，不是“集群丢失了已提交数据”。
+
+Raft 原理是：重试身份很重要。客户端命令会带上稳定身份：
+
+```go
+type ClientCommand struct {
+    ClientID    int64
+    SequenceNum int64
+    Command     any
+}
+```
+
+如果第一次 RPC 超时，同一个逻辑命令可以安全重试。状态机使用 `(ClientID, SequenceNum)`
+保证最多应用一次，并为重复请求返回已观察到的结果。
+
+旧的长测 harness 在命令已经发出后只给 30 秒重试窗口。在故障注入期间，这太短了，因为请求可能跨过多个临时窗口：
+
+1. leader 侧 apply wait 可能超时；
+2. leader 可能重启或降级；
+3. 新 leader 需要重新选举；
+4. follower 可能需要 snapshot catch-up 后才能恢复正常日志复制；
+5. 重试请求还需要重新绑定到原逻辑命令的结果。
+
+修复后扩展了有界的已发请求重试窗口：
+
+```go
+const (
+    longRunningSnapshotThreshold = 2 * 1024 * 1024
+    longRunningClientRetries     = 20
+    // Already-issued commands must survive several server-side apply waits plus
+    // leader re-election and snapshot catch-up. If the command is truly stuck,
+    // the long-running test still fails after this bounded window.
+    longRunningIssuedRequestRetryTimeout = 90 * time.Second
+)
+```
+
+这不会隐藏真实失败。超过有界窗口仍卡住的命令仍会计为失败。这个修改只是让 harness 和 Raft
+重试契约对齐：命令发出后，测试必须等待足够久，区分可恢复的选主/snapshot 抖动和真正卡死的 apply 路径。
+
+验证：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_MixedWithFailures$' -count=1
+GO_KV_LOG_LEVEL=warn make long-test
+GO_KV_LOG_LEVEL=warn make test
+```
+
+定向 mixed-failure 场景 619.602s 通过，666,692 次操作、失败 0、final barrier true、
+严格一致性 true。随后全量长时间 E2E 回归 3674.858s 通过，覆盖全部六个 10 分钟场景，失败操作为 0。
+
+### 综合经验
+
+这轮排查强化了一个有用的分层判断：
+
+- benchmark harness bug 通常扭曲测量面；
+- long E2E harness bug 通常扭曲失败分类面；
+- LSM/Raft snapshot bug 会破坏真实生命周期边界。
+
+修复策略必须匹配所在层次。不能靠放松测试隐藏存储 race；不能因为 benchmark 没等 leader 就重写 Raft；
+也不能在 harness 还不能证明失败为 0、数据一致性通过之前信任性能数字。

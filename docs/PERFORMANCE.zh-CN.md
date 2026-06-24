@@ -8,7 +8,7 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 
 | 项目 | 值 |
 |---|---|
-| 日期 | 2026-06-23 |
+| 日期 | 2026-06-24 |
 | 机器 | macOS Darwin 25.5.0, Apple Silicon |
 | Go | 1.25.5 |
 | 传输层 | 长时间 E2E 使用 gRPC；聚焦集成测试额外覆盖 TCP |
@@ -23,6 +23,8 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 | LSM compaction 调度回归 | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run '^(TestCreateNewSSTableSkipsCompactionWhenBelowThreshold|TestSSTableManagerOpenFilesSnapshotReleasesManagerLock)$' -count=10 -timeout=2m` | 通过 |
 | SSTable 包稳定性循环 | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -count=100 -timeout=5m` | 114.758s 通过 |
 | LSM/storage race 门禁 | `GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=12m` | 通过 |
+| LSM snapshot reload race 回归 | `GO_KV_LOG_LEVEL=warn go test -race -run '^TestApplySnapshotDoesNotRaceWithConcurrentReads$' ./pkg/storage/lsm -count=1` | 复现修复前 `Database.Reload` / `Database.Get` race 后通过 |
+| LSM snapshot reload package race 门禁 | `GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1` | 数据库 lifecycle lock 和状态机原子替换修复后通过 |
 | LSM-backed Raft log 物理压缩回归 | `GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm -run '^(TestStorageAdapterCompactLogDeletesPhysicalLogKeys|TestStorageAdapter_Snapshot|TestStorageAdapter_CompactBeyondLastIndexFromSnapshot|TestStorageAdapter_LogEntries|TestStorageAdapter_ReappendAfterTruncateSurvivesFlushCompactionAndRestart)$' -count=1 -timeout=5m` | 2.753s 通过 |
 | 物理日志 tombstone 后的 LSM 包回归 | `GO_KV_LOG_LEVEL=warn go test ./pkg/storage/lsm ./engine/lsm/... -count=1 -timeout=12m` | 通过 |
 | 物理日志 tombstone 后的 LSM/storage race 门禁 | `GO_KV_LOG_LEVEL=warn go test -race ./pkg/storage/lsm ./engine/lsm/... -count=1 -timeout=12m` | 通过；最慢 package `engine/lsm/database` 33.343s |
@@ -37,7 +39,8 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 | 全量 short 单元/集成门禁 | `GO_KV_LOG_LEVEL=warn go test -race -short ./... -count=1 -timeout=35m` | 通过；修复 #122、#123、#124 后最新 `tests` 包 1005.048s |
 | 单个 10 分钟写入密集触发场景 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_WriteHeavy$' -count=1` | 异步 compaction 调度修复后 613.049s 通过 |
 | #121 后 10 分钟重启/快照一致性场景 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=25m ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1` | 611.921s 通过，失败操作 0 |
-| 全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests -run '^TestLongRunning_10Min_(Comprehensive|WriteHeavy|MixedWithFailures|ConsistencyWithRestartsAndSnapshots|ReadHeavy|DeleteStress)$' -count=1` | 3657.132s 通过 |
+| Mixed-failure 已发请求重试回归 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_MixedWithFailures$' -count=1` | 619.602s 通过，666,692 次操作，失败 0，final barrier true，严格一致性 true |
+| 全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn make long-test` | 3674.858s 通过，覆盖全部六个 10 分钟场景 |
 
 现在 short 模式行为是明确的：10 分钟 E2E 在 `testing.Short()` 下会跳过。这样 `go test -short ./...` 可以继续作为 PR 覆盖率入口，而真实 10 分钟场景必须显式运行。
 
@@ -47,17 +50,19 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 
 | 场景 | 总操作数 | 失败操作 | 吞吐量 | P50 | P95 | P99 | Leader 切换 | 快照节点数 | 最大快照 index | 一致性 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Comprehensive | 655,382 | 0 | 1,092.30 ops/s | 3.457458ms | 12.997042ms | 40.629916ms | 4 | 3 | 482,995 | 通过，1,998 个 key |
-| WriteHeavy | 512,565 | 0 | 854.27 ops/s | 3.519625ms | 14.7735ms | 44.532042ms | 16 | 3 | 507,421 | 通过，2,000 个 key |
-| MixedWithFailures | 948,673 | 0 | 1,581.12 ops/s | 1.426167ms | 4.114709ms | 11.605334ms | 1 | 3 | 659,881 | 通过，3,600 个 node-key 检查 |
-| ConsistencyWithRestartsAndSnapshots | 1,299,458 | 0 | 2,165.76 ops/s | 1.554667ms | 3.969875ms | 8.658667ms | 5 | 3 | 908,296 | 通过，3,600 个 node-key 检查 |
-| ReadHeavy | 50,159,859 | 0 | 83,599.76 ops/s | 17.25us | 331.375us | 897.375us | 0 | 0 | 0 | 通过，2,000 个 key |
-| DeleteStress | 714,117 | 0 | 1,190.19 ops/s | 2.473625ms | 9.325959ms | 25.642416ms | 13 | 3 | 695,088 | 通过，3,600 个 node-key 检查 |
+| Comprehensive | 507,391 | 0 | 845.65 ops/s | 3.929333ms | 18.049458ms | 52.540375ms | 14 | 3 | 371,463 | 通过，1,990 个 key |
+| WriteHeavy | 558,608 | 0 | 931.01 ops/s | 2.68175ms | 12.287542ms | 35.588666ms | 14 | 3 | 543,609 | 通过，2,000 个 key |
+| MixedWithFailures | 678,178 | 0 | 1,130.30 ops/s | 1.598333ms | 5.805333ms | 15.755125ms | 6 | 3 | 467,015 | 通过，final barrier true，3,600 个 node-key 检查 |
+| ConsistencyWithRestartsAndSnapshots | 808,862 | 0 | 1,348.10 ops/s | 2.131125ms | 7.693208ms | 20.98475ms | 2 | 3 | 561,412 | 通过，final barrier true，3,600 个 node-key 检查 |
+| ReadHeavy | 36,043,150 | 0 | 60,071.92 ops/s | 30.083us | 421.208us | 1.436458ms | 0 | 0 | 0 | 通过，2,000 个 key |
+| DeleteStress | 468,936 | 0 | 781.56 ops/s | 3.394583ms | 15.347333ms | 46.558125ms | 10 | 3 | 457,143 | 通过，final barrier true，3,600 个 node-key 检查 |
 
 最新全量运行修复了此前由
 [issue #113](https://github.com/xmh1011/go-kv/issues/113)、
 [issue #116](https://github.com/xmh1011/go-kv/issues/116) 和
-[issue #117](https://github.com/xmh1011/go-kv/issues/117) 跟踪的
+[issue #117](https://github.com/xmh1011/go-kv/issues/117)、
+[issue #150](https://github.com/xmh1011/go-kv/issues/150) 和
+[issue #151](https://github.com/xmh1011/go-kv/issues/151) 跟踪的
 ReadIndex 与 apply-timeout 回归。对写入稳定性最关键的变化是：
 SSTable compaction 不再同步运行在 Raft apply 前台路径里。MemTable flush
 仍会先发布持久化的 Level-0 SSTable，然后把 compaction 合并到后台 worker
@@ -73,6 +78,16 @@ compaction worker，普通小 flush 不会额外创建 goroutine，也不会为 
 helper：membership 测试在 race 模式下会先扫描本地 leader 候选，再发 ReadIndex probe，
 避免对所有 follower 串行执行缓慢 probe。Issue #124 在 network-partition 测试的
 majority partition 内复用了同一个 helper，移除了另一份固定 sleep 的手写 probe loop。
+
+Issue #150 修复了 LSM 状态机 snapshot 替换边界。Snapshot apply 会关闭并替换数据库目录，
+因此 `Database.Get`、`Put`、`Delete`、`Recover`、`ForceFlush`、`Reload` 和 `Close`
+现在共享数据库 lifecycle lock。Snapshot 导出也会先打开并固定 SSTable snapshot，再复制字节。
+这样 Raft InstallSnapshot 替换本地状态时，并发读取不会观察到半关闭数据库。
+
+Issue #151 修复了 mixed-failure 长测 harness。已发出的命令使用稳定
+`(ClientID, SequenceNum)` 身份，语义上可以安全重试；旧的 30 秒已发请求重试窗口可能在
+leader 重新选举和 snapshot catch-up 仍在进行时过期。现在窗口是有界 90 秒：真正卡住的命令
+仍会失败，但正常 Raft 恢复不会在 final barrier 成功后被误报为失败操作。
 
 ## #109 后的重启/快照聚焦重放
 

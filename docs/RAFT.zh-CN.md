@@ -210,6 +210,8 @@ leader 侧 apply timeout 不能清理 pending client request。Timeout 只表示
 
 这样，同一个 client identity 的重试会重新绑定到原来的 log index，而不是在第一条 entry 仍可能提交时追加重复工作。
 
+长时间故障测试在 client harness 层也遵守同一条规则。如果命令已经发出，harness 会在有界恢复窗口内重试同一个逻辑请求，而不是某一次 apply wait 超时后就丢弃期望结果。这个窗口必须覆盖多次服务端 apply wait、leader 重新选举和 snapshot catch-up。真正卡住的命令仍会在有界窗口过期后失败；正常 Raft 恢复不应该仅因为第一次 leader 侧等待返回 `apply timeout` 就被统计成失败操作。
+
 ## 9. Follower 上的 AppendEntries
 
 `AppendEntries` 做三件事：

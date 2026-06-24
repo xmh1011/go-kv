@@ -352,6 +352,34 @@ Database.Get(key)
 
 Snapshot 导出会在持有 SSTable manager read lock 时打开所有准备复制的 SSTable 文件，之后从这些已打开的 fd 读取数据。这可以抵抗并发 compaction：即使 compaction 随后删除了目录项，已打开 fd 仍然指向 snapshot 选择的文件内容。
 
+Snapshot apply 比普通写入更有破坏性。它会安装一个完整替换的状态机数据库。因此 adapter
+会先验证 snapshot manifest，再写入临时替换目录，最后让 database facade 在 lifecycle
+写锁下替换内容。普通 `Get`、`Put`、`Delete`、`Recover`、`ForceFlush` 和 SSTable
+catalog 读取都需要持有 lifecycle 读锁。
+
+这把锁故意放在 memtable 和 SSTable 锁之上：
+
+```text
+Database.Get
+        |
+        v
+lifecycle RLock
+        |
+        v
+读取 memtable 和 SSTable
+
+Database.ReplaceData / Reload / Close
+        |
+        v
+lifecycle Lock
+        |
+        v
+关闭旧文件、替换目录、重新打开 catalog
+```
+
+如果没有这个外层 lifecycle 边界，Raft InstallSnapshot 可能在并发读仍持有旧
+memtable manager 或 SSTable manager 引用时关闭或 reload 整个 LSM 数据库。
+
 ## 14. 恢复
 
 恢复分层进行：
@@ -549,6 +577,7 @@ firstIndex <= 可见日志索引 <= lastIndex
 | SSTable 发布 | recovery 看到半写入表。 | 先写临时文件，fsync、close、rename 后再发布 metadata。 |
 | SSTable 重写 | 复用的内存表把旧 footer size 带进新文件。 | 每次 encode 前重置所有派生布局 metadata。 |
 | Snapshot apply | 畸形 snapshot 路径清空本地状态机。 | 关闭或删除当前 DB 前先验证完整 snapshot 路径清单。 |
+| Snapshot reload | InstallSnapshot 关闭或替换数据库时，并发读还在使用旧数据库。 | 使用 lifecycle lock 串行化数据库替换和普通读写。 |
 
 这些防线在 review 中必须被当作正确性要求，而不是性能细节。
 
@@ -569,6 +598,8 @@ firstIndex <= 可见日志索引 <= lastIndex
 - Raft 日志读取必须遵守逻辑 `[firstIndex, lastIndex]` 窗口。
 - 快照导出和应用不能与状态机写入并发冲突。
 - Snapshot apply 必须在破坏性替换开始前验证完整文件清单；非法路径是硬错误，不能跳过。
+- Snapshot apply、database reload 和 database close 必须持有 lifecycle 写锁，
+  让普通读写不能观察到半替换状态。
 
 大多数存储 bug 都是这些不变量之一被破坏。
 

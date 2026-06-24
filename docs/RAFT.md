@@ -236,6 +236,15 @@ This lets a retry with the same client identity bind back to the original log
 index instead of appending duplicate work while the first entry is still
 committing.
 
+Long-running failure tests use the same rule at the client harness boundary. If
+a command has already been issued, the harness retries that exact logical
+request for a bounded recovery window instead of dropping the expected result as
+soon as one apply wait times out. The window must cover several server-side
+apply waits plus leader re-election and snapshot catch-up. A real stuck command
+still fails when the bounded issued-request window expires; normal Raft recovery
+should not be counted as a failed operation merely because the first leader-side
+wait returned `apply timeout`.
+
 ## 9. AppendEntries On Followers
 
 `AppendEntries` does three jobs:

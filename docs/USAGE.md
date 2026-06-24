@@ -225,11 +225,16 @@ GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests/long_running_e2e_test
 
 The release workflow publishes a GitHub Release when a tag matching `v*.*.*` is
 pushed. It can also be started manually from GitHub Actions for an existing
-version tag.
+version tag. Release tags must use semantic-version style names such as
+`v0.1.0` or `v0.1.0-rc.1`, and the workflow validates that the tag exists before
+building artifacts.
 
 Create a release tag:
 
 ```bash
+git switch main
+git pull --ff-only origin main
+GO_KV_LOG_LEVEL=warn make test
 git tag v0.1.0
 git push origin v0.1.0
 ```
@@ -241,4 +246,30 @@ Actions and set:
 - `prerelease`: whether to mark the GitHub Release as a prerelease.
 
 The workflow runs short tests, builds cross-platform server and client
-binaries, generates checksums, and attaches artifacts to a GitHub release.
+binaries, generates per-platform checksums, creates a release-wide
+`SHA256SUMS.txt` manifest, and attaches artifacts to a GitHub release.
+
+Release artifacts are named by platform:
+
+```text
+kv-server-linux-amd64
+kv-client-linux-amd64
+kv-server-darwin-arm64
+kv-client-darwin-arm64
+kv-server-windows-amd64.exe
+kv-client-windows-amd64.exe
+go-kv-<goos>-<goarch>.sha256
+SHA256SUMS.txt
+```
+
+After downloading a release, verify checksums before running binaries:
+
+```bash
+sha256sum -c SHA256SUMS.txt
+```
+
+For module users, pin the same tag:
+
+```bash
+go get github.com/xmh1011/go-kv@v0.1.0
+```
