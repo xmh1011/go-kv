@@ -2,10 +2,13 @@ package tests
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/xmh1011/go-kv/pkg/config"
 	"github.com/xmh1011/go-kv/pkg/param"
 	"github.com/xmh1011/go-kv/pkg/storage"
 	"github.com/xmh1011/go-kv/pkg/transport/inmemory"
@@ -110,6 +113,8 @@ func BenchmarkKVCommandSerialization(b *testing.B) {
 // BenchmarkClientRequestProcessing 测试客户端请求处理的全流程性能
 // 这不包括网络传输，仅测试 Raft 层处理逻辑
 func BenchmarkClientRequestProcessing(b *testing.B) {
+	withFastSingleNodeRaftConfig(b)
+
 	dataDir := b.TempDir()
 	store, sm, _ := storage.NewStorage(storage.InmemoryStorage, dataDir, 1)
 	defer store.Close()
@@ -117,19 +122,23 @@ func BenchmarkClientRequestProcessing(b *testing.B) {
 	trans := inmemory.NewTransport("127.0.0.1:0")
 	trans.SetPeers(map[int]string{1: trans.Addr()})
 
-	rf := raft.NewRaft(1, []int{1}, store, sm, trans, make(chan param.CommitEntry, 1000))
+	commitCh := make(chan param.CommitEntry, 1024)
+	stopDrain := startBenchmarkCommitDrain(commitCh)
+	rf := raft.NewRaft(1, []int{1}, store, sm, trans, commitCh)
 	go rf.Run()
+	defer func() {
+		rf.Stop()
+		stopDrain()
+	}()
 
-	time.Sleep(300 * time.Millisecond)
+	waitForBenchmarkLeader(b, rf)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		cmdBytes, _ := json.Marshal(param.KVCommand{Op: param.OpSet, Key: "key", Value: "value"})
-		reply := &param.ClientReply{}
-		_ = rf.ClientRequest(&param.ClientArgs{ClientID: 1, SequenceNum: int64(i), Command: cmdBytes}, reply)
+		cmd := param.KVCommand{Op: param.OpSet, Key: "key", Value: "value"}
+		benchmarkClientRequest(b, rf, 1, int64(i+1), cmd)
 	}
 	b.StopTimer()
-	rf.Stop()
 }
 
 // BenchmarkStateMachineApply 测试状态机 Apply 操作的性能
@@ -219,6 +228,14 @@ func BenchmarkStorageGetEntry(b *testing.B) {
 
 // BenchmarkMixedWorkload 测试混合读写负载的性能
 func BenchmarkMixedWorkload(b *testing.B) {
+	withFastSingleNodeRaftConfig(b)
+
+	const (
+		keyCount    = 128
+		workerCount = 16
+		readStride  = 5 // four reads followed by one write
+	)
+
 	dataDir := b.TempDir()
 	store, sm, _ := storage.NewStorage(storage.InmemoryStorage, dataDir, 1)
 	defer store.Close()
@@ -226,41 +243,147 @@ func BenchmarkMixedWorkload(b *testing.B) {
 	trans := inmemory.NewTransport("127.0.0.1:0")
 	trans.SetPeers(map[int]string{1: trans.Addr()})
 
-	rf := raft.NewRaft(1, []int{1}, store, sm, trans, make(chan param.CommitEntry, 1000))
+	commitCh := make(chan param.CommitEntry, 1024)
+	stopDrain := startBenchmarkCommitDrain(commitCh)
+	rf := raft.NewRaft(1, []int{1}, store, sm, trans, commitCh)
 	go rf.Run()
+	defer func() {
+		rf.Stop()
+		stopDrain()
+	}()
 
-	time.Sleep(300 * time.Millisecond)
+	waitForBenchmarkLeader(b, rf)
 
+	for i := 0; i < keyCount; i++ {
+		cmd := param.KVCommand{Op: param.OpSet, Key: benchmarkKey(i), Value: "seed"}
+		benchmarkClientRequest(b, rf, 10_000, int64(i+1), cmd)
+	}
+
+	var failures atomic.Int64
+	var firstFailure atomic.Value
+	recordFailure := func(format string, args ...any) {
+		if failures.Add(1) == 1 {
+			firstFailure.Store(fmt.Sprintf(format, args...))
+		}
+	}
+
+	ops := make(chan int, workerCount*2)
 	var wg sync.WaitGroup
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		// 80% reads, 20% writes
-		if i%5 != 0 {
-			// Read
-			wg.Add(1)
-			go func(idx int) {
-				defer wg.Done()
-				key := "key" + string(rune(idx%100))
-				cmdBytes, _ := json.Marshal(param.KVCommand{Op: param.OpGet, Key: key, Value: ""})
-				reply := &param.ClientReply{}
-				_ = rf.ClientRequest(&param.ClientArgs{ClientID: 1, SequenceNum: int64(idx), Command: cmdBytes}, reply)
-			}(i)
-		} else {
-			// Write
-			wg.Add(1)
-			go func(idx int) {
-				defer wg.Done()
-				key := "key" + string(rune(idx%100))
-				cmdBytes, _ := json.Marshal(param.KVCommand{Op: param.OpSet, Key: key, Value: "value"})
-				reply := &param.ClientReply{}
-				_ = rf.ClientRequest(&param.ClientArgs{ClientID: 1, SequenceNum: int64(idx), Command: cmdBytes}, reply)
-			}(i)
-		}
+
+	for workerID := 0; workerID < workerCount; workerID++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			clientID := int64(workerID + 1)
+			var sequenceNum int64
+			for idx := range ops {
+				sequenceNum++
+				cmd := param.KVCommand{Key: benchmarkKey(idx % keyCount)}
+				if idx%readStride != 0 {
+					cmd.Op = param.OpGet
+				} else {
+					cmd.Op = param.OpSet
+					cmd.Value = fmt.Sprintf("value-%d", idx)
+				}
+
+				reply, err := benchmarkClientRequestResult(rf, clientID, sequenceNum, cmd)
+				if err != nil {
+					recordFailure("worker %d op %d failed: %v", workerID, idx, err)
+					continue
+				}
+				if reply.NotLeader || !reply.Success {
+					recordFailure("worker %d op %d returned success=%t notLeader=%t leaderHint=%d result=%v",
+						workerID, idx, reply.Success, reply.NotLeader, reply.LeaderHint, reply.Result)
+				}
+			}
+		}(workerID)
 	}
+
+	for i := 0; i < b.N; i++ {
+		ops <- i
+	}
+	close(ops)
 	wg.Wait()
 	b.StopTimer()
-	rf.Stop()
+
+	if failures.Load() > 0 {
+		b.Fatalf("mixed workload benchmark saw %d failed operations; first failure: %s",
+			failures.Load(), firstFailure.Load())
+	}
+	b.ReportMetric(float64(workerCount), "workers")
+}
+
+func withFastSingleNodeRaftConfig(b *testing.B) {
+	b.Helper()
+	oldElectionTimeout := config.Conf.Raft.ElectionTimeout
+	oldHeartbeatTimeout := config.Conf.Raft.HeartbeatTimeout
+	config.Conf.Raft.ElectionTimeout = 100 * time.Millisecond
+	config.Conf.Raft.HeartbeatTimeout = 10 * time.Millisecond
+	b.Cleanup(func() {
+		config.Conf.Raft.ElectionTimeout = oldElectionTimeout
+		config.Conf.Raft.HeartbeatTimeout = oldHeartbeatTimeout
+	})
+}
+
+func waitForBenchmarkLeader(b *testing.B, rf *raft.Raft) {
+	b.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if rf.State() == raft.Leader {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	b.Fatalf("raft node did not become leader before benchmark timeout")
+}
+
+func benchmarkKey(index int) string {
+	return fmt.Sprintf("key-%03d", index)
+}
+
+func benchmarkClientRequest(b *testing.B, rf *raft.Raft, clientID, sequenceNum int64, cmd param.KVCommand) {
+	b.Helper()
+	reply, err := benchmarkClientRequestResult(rf, clientID, sequenceNum, cmd)
+	if err != nil {
+		b.Fatalf("client request failed: %v", err)
+	}
+	if reply.NotLeader || !reply.Success {
+		b.Fatalf("client request returned success=%t notLeader=%t leaderHint=%d result=%v",
+			reply.Success, reply.NotLeader, reply.LeaderHint, reply.Result)
+	}
+}
+
+func benchmarkClientRequestResult(rf *raft.Raft, clientID, sequenceNum int64, cmd param.KVCommand) (*param.ClientReply, error) {
+	cmdBytes, err := json.Marshal(cmd)
+	if err != nil {
+		return nil, err
+	}
+	reply := &param.ClientReply{}
+	err = rf.ClientRequest(&param.ClientArgs{ClientID: clientID, SequenceNum: sequenceNum, Command: cmdBytes}, reply)
+	return reply, err
+}
+
+func startBenchmarkCommitDrain(ch <-chan param.CommitEntry) func() {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+		for {
+			select {
+			case <-ch:
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+		<-stopped
+	}
 }
 
 // BenchmarkSnapshotCreation 测试快照创建的性能
