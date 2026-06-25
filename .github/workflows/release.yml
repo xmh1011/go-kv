@@ -157,7 +157,7 @@ jobs:
           sha256sum kv-client-* kv-server-* > SHA256SUMS.txt
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.1
         with:
           tag_name: ${{ needs.validate.outputs.tag_name }}
           prerelease: ${{ needs.validate.outputs.prerelease }}
