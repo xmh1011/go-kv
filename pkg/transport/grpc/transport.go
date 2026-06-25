@@ -14,12 +14,15 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/xmh1011/go-kv/pkg/log"
 	"github.com/xmh1011/go-kv/pkg/param"
 	"github.com/xmh1011/go-kv/pkg/transport/grpc/pb"
 	"github.com/xmh1011/go-kv/raft/api"
 )
+
+const installSnapshotTermTrailer = "go-kv-install-snapshot-term"
 
 // ==================== 超时策略 ====================
 //
@@ -320,21 +323,25 @@ func (t *Transport) SendAppendEntries(target string, req *param.AppendEntriesArg
 func (t *Transport) SendInstallSnapshot(target string, req *param.InstallSnapshotArgs, resp *param.InstallSnapshotReply) error {
 	// 直接调用流式传输，获得大文件支持和断点续传能力
 	// Raft 传入的是完整快照数据（req.Offset=0, req.Done=true）
-	if err := t.SendInstallSnapshotStream(target, req.Term, req.LeaderID, req.LastIncludedIndex, req.LastIncludedTerm, req.Data); err != nil {
+	term, err := t.sendInstallSnapshotStream(target, req.Term, req.LeaderID, req.LastIncludedIndex, req.LastIncludedTerm, req.Data)
+	if err != nil {
 		return err
 	}
-	// 流式传输成功后，返回当前 Term（需要从当前状态获取）
-	// 由于流式传输已经成功，这里返回请求的 Term
-	resp.Term = req.Term
+	resp.Term = term
 	return nil
 }
 
 // SendInstallSnapshotStream 发送 InstallSnapshot RPC 请求（流式传输方式）。
 // 支持大文件传输和断点续传，不依赖单一超时。
 func (t *Transport) SendInstallSnapshotStream(target string, term, leaderID, lastIncludedIndex, lastIncludedTerm uint64, data []byte) error {
+	_, err := t.sendInstallSnapshotStream(target, term, leaderID, lastIncludedIndex, lastIncludedTerm, data)
+	return err
+}
+
+func (t *Transport) sendInstallSnapshotStream(target string, term, leaderID, lastIncludedIndex, lastIncludedTerm uint64, data []byte) (uint64, error) {
 	client, err := t.getPeerClient(target)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// 建立流式连接
@@ -343,7 +350,7 @@ func (t *Transport) SendInstallSnapshotStream(target string, term, leaderID, las
 
 	stream, err := client.InstallSnapshotStream(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to create snapshot stream: %w", err)
+		return 0, fmt.Errorf("failed to create snapshot stream: %w", err)
 	}
 
 	// 配置流式传输参数
@@ -379,11 +386,11 @@ func (t *Transport) SendInstallSnapshotStream(target string, term, leaderID, las
 		select {
 		case <-sendCtx.Done():
 			sendCancel()
-			return fmt.Errorf("timeout sending chunk at offset %d", offset)
+			return 0, fmt.Errorf("timeout sending chunk at offset %d", offset)
 		default:
 			if err := stream.Send(chunk); err != nil {
 				sendCancel()
-				return fmt.Errorf("failed to send chunk at offset %d: %w", offset, err)
+				return 0, fmt.Errorf("failed to send chunk at offset %d: %w", offset, err)
 			}
 		}
 
@@ -392,7 +399,7 @@ func (t *Transport) SendInstallSnapshotStream(target string, term, leaderID, las
 		// 接收确认
 		ack, err := stream.Recv()
 		if err != nil {
-			return fmt.Errorf("failed to receive ack for chunk at offset %d: %w", offset, err)
+			return 0, fmt.Errorf("failed to receive ack for chunk at offset %d: %w", offset, err)
 		}
 
 		if !ack.Accepted {
@@ -402,7 +409,7 @@ func (t *Transport) SendInstallSnapshotStream(target string, term, leaderID, las
 				offset = ack.NextOffset
 				continue
 			}
-			return fmt.Errorf("chunk rejected at offset %d: %s", offset, ack.Error)
+			return 0, fmt.Errorf("chunk rejected at offset %d: %s", offset, ack.Error)
 		}
 
 		offset = chunkEnd
@@ -415,18 +422,31 @@ func (t *Transport) SendInstallSnapshotStream(target string, term, leaderID, las
 
 	// 发送最后的 done 信号并关闭流
 	if err := stream.CloseSend(); err != nil {
-		return fmt.Errorf("failed to close snapshot stream: %w", err)
+		return 0, fmt.Errorf("failed to close snapshot stream: %w", err)
 	}
 
 	// 等待最终的确认
 	_, err = stream.Recv()
 	if err != nil && err != io.EOF {
-		return fmt.Errorf("failed to receive final ack: %w", err)
+		return 0, fmt.Errorf("failed to receive final ack: %w", err)
 	}
 
 	log.Debugf("[GRPCTransport] Snapshot transfer completed: target=%s, size=%d bytes", target, totalSize)
 
-	return nil
+	return installSnapshotTermFromTrailer(stream.Trailer(), term), nil
+}
+
+func installSnapshotTermFromTrailer(trailer metadata.MD, fallback uint64) uint64 {
+	values := trailer.Get(installSnapshotTermTrailer)
+	if len(values) == 0 {
+		return fallback
+	}
+	term, err := strconv.ParseUint(values[len(values)-1], 10, 64)
+	if err != nil {
+		log.Warnf("[GRPCTransport] Invalid InstallSnapshot term trailer %q: %v", values[len(values)-1], err)
+		return fallback
+	}
+	return term
 }
 
 // SendClientRequest 发送客户端请求到指定的 Raft 节点。
@@ -641,6 +661,7 @@ func (t *Transport) InstallSnapshotStream(stream pb.RaftService_InstallSnapshotS
 			if err := t.raft.InstallSnapshot(snapshotMetadata, reply); err != nil {
 				return fmt.Errorf("failed to install snapshot: %w", err)
 			}
+			stream.SetTrailer(metadata.Pairs(installSnapshotTermTrailer, strconv.FormatUint(reply.Term, 10)))
 
 			log.Debugf("[GRPCTransport] Snapshot installation completed: size=%d bytes", receivedBytes)
 			return nil

@@ -32,6 +32,7 @@ Related issues:
 - #146 Propagate benchmark test failures
 - #150 Prevent LSM snapshot reload races
 - #151 Extend mixed-failure issued-request retry budget
+- #164 Restarted follower can miss committed writes after snapshot catch-up
 
 ## 1. The Debugging Rule That Changed The Result
 
@@ -107,6 +108,64 @@ Affected issues:
 
 - #88 made ReadIndex apply timeouts visible instead of hiding them.
 - #89 and #90 relied on faster propagation of commit progress.
+
+## 3.1. Raft RPC Principle: Snapshot Replies Must Preserve Follower Term
+
+Every Raft RPC reply carries the receiver's current term. This is not optional
+metadata: it is the mechanism that lets a stale leader discover a higher term
+and step down. `AppendEntries`, `RequestVote`, and `InstallSnapshot` must all
+preserve that rule.
+
+The long-running mixed-failure test exposed a restart/snapshot catch-up failure:
+all client writes returned success, but a restarted follower missed the final
+barrier and several committed keys. One transport-level bug in that path was
+that the gRPC streaming snapshot helper installed the snapshot on the follower,
+but then returned the original request term to the leader:
+
+```go
+func (t *Transport) SendInstallSnapshot(...) error {
+    if err := t.SendInstallSnapshotStream(...); err != nil {
+        return err
+    }
+    resp.Term = req.Term
+    return nil
+}
+```
+
+That violates the Raft RPC contract. If the follower had already moved to a
+higher term, the leader would still process the snapshot result as a same-term
+success:
+
+```go
+if reply.Term > r.currentTerm {
+    r.becomeFollower(reply.Term)
+    return
+}
+
+r.nextIndex[peerID] = snapshotLastIndex + 1
+r.matchIndex[peerID] = snapshotLastIndex
+```
+
+The fix keeps the streaming transport API compatible while restoring the Raft
+reply semantics. The server sets a gRPC trailer after `InstallSnapshot`
+finishes:
+
+```go
+stream.SetTrailer(metadata.Pairs(
+    installSnapshotTermTrailer,
+    strconv.FormatUint(reply.Term, 10),
+))
+```
+
+The public `SendInstallSnapshot` path now reads that trailer and writes the
+actual follower term into `InstallSnapshotReply`. A focused regression checks
+that a follower replying with term `2` is observed by a leader that sent term
+`1`.
+
+Affected issue:
+
+- #164 exposed stale follower state after snapshot catch-up and made the lost
+  InstallSnapshot reply term visible under long-running restart pressure.
 
 ## 4. Raft Principle: Same-Term Leader Hints Must Still Demote Stale Roles
 

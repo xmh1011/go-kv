@@ -29,6 +29,7 @@ English version: [BUG_FIX_RETROSPECTIVE.md](BUG_FIX_RETROSPECTIVE.md)
 - #146 Propagate benchmark test failures
 - #150 Prevent LSM snapshot reload races
 - #151 Extend mixed-failure issued-request retry budget
+- #164 Restarted follower can miss committed writes after snapshot catch-up
 
 ## 1. 真正改变结果的调试原则
 
@@ -92,6 +93,59 @@ commit 推进后，leader 会继续调度复制，让 follower 更快收到最�
 
 - #88 让 ReadIndex apply timeout 不再被隐藏。
 - #89 和 #90 依赖更快的 commit 传播。
+
+## 3.1. Raft RPC 原理：Snapshot Reply 必须保留 Follower Term
+
+每个 Raft RPC reply 都要携带接收方当前 term。这不是普通调试元数据，而是过期 leader
+发现更高 term 并退位的机制。`AppendEntries`、`RequestVote` 和 `InstallSnapshot`
+都必须遵守这个规则。
+
+长时间 mixed-failure 测试暴露了一个重启和 snapshot catch-up 问题：所有客户端写入都成功返回，
+但一个重启后的 follower 没有应用最终 barrier，并且缺少多条已提交 key。这个路径中有一个
+传输层 bug：gRPC streaming snapshot helper 会在 follower 上正确安装 snapshot，但返回给
+leader 的 term 是原始请求 term：
+
+```go
+func (t *Transport) SendInstallSnapshot(...) error {
+    if err := t.SendInstallSnapshotStream(...); err != nil {
+        return err
+    }
+    resp.Term = req.Term
+    return nil
+}
+```
+
+这违反 Raft RPC 契约。如果 follower 已经进入更高 term，leader 仍会把 snapshot 结果当成
+同 term 的成功响应处理：
+
+```go
+if reply.Term > r.currentTerm {
+    r.becomeFollower(reply.Term)
+    return
+}
+
+r.nextIndex[peerID] = snapshotLastIndex + 1
+r.matchIndex[peerID] = snapshotLastIndex
+```
+
+修复保留了 streaming transport API 的兼容性，同时恢复 Raft reply 语义。服务端在
+`InstallSnapshot` 完成后写入 gRPC trailer：
+
+```go
+stream.SetTrailer(metadata.Pairs(
+    installSnapshotTermTrailer,
+    strconv.FormatUint(reply.Term, 10),
+))
+```
+
+公开的 `SendInstallSnapshot` 路径会读取该 trailer，并把真实 follower term 写入
+`InstallSnapshotReply`。新增聚焦回归会检查 follower 返回 term `2` 时，发送 term `1`
+的 leader 能观察到该更高 term。
+
+涉及 issue：
+
+- #164 在长时间重启压力下暴露 snapshot catch-up 后 follower 状态过期，并让
+  InstallSnapshot reply term 丢失问题变得可见。
 
 ## 4. Raft 原理：同任期 Leader Hint 也必须让旧角色降级
 

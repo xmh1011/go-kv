@@ -8,7 +8,7 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 
 | 项目 | 值 |
 |---|---|
-| 日期 | 2026-06-24 |
+| 日期 | 2026-06-25 |
 | 机器 | macOS Darwin 25.5.0, Apple Silicon |
 | Go | 1.25.5 |
 | 传输层 | 长时间 E2E 使用 gRPC；聚焦集成测试额外覆盖 TCP |
@@ -40,7 +40,12 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 | 单个 10 分钟写入密集触发场景 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_WriteHeavy$' -count=1` | 异步 compaction 调度修复后 613.049s 通过 |
 | #121 后 10 分钟重启/快照一致性场景 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=25m ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1` | 611.921s 通过，失败操作 0 |
 | Mixed-failure 已发请求重试回归 | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_MixedWithFailures$' -count=1` | 619.602s 通过，666,692 次操作，失败 0，final barrier true，严格一致性 true |
-| 全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn make long-test` | 3674.858s 通过，覆盖全部六个 10 分钟场景 |
+| gRPC InstallSnapshot term 回归 | `GO_KV_LOG_LEVEL=warn go test -race ./pkg/transport/grpc -run 'TestSendInstallSnapshot|TestInstallSnapshotStream' -count=1` | 新增 follower higher-term snapshot reply 回归后通过 |
+| #164 后 mixed-failure 定向重放 | `GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_MixedWithFailures$' -count=1 -timeout=15m` | 606.751s 通过，633,195 次操作，失败 0，final barrier true，严格一致性 true |
+| #164 后静态和单元门禁 | `/Users/xiaominghao/go/bin/staticcheck ./...`、`~/go/bin/errcheck -ignoretests ./...`、`go vet ./...`、`GO_KV_LOG_LEVEL=warn make test` | 通过 |
+| #164 后集成回归 | `GO_KV_LOG_LEVEL=warn make integration-test` | 512.324s 通过 |
+| #164 后端到端回归 | `GO_KV_LOG_LEVEL=warn make e2e-test` | 455.655s 通过 |
+| 全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn make long-test` | 3674.264s 通过，覆盖全部六个 10 分钟场景 |
 
 现在 short 模式行为是明确的：10 分钟 E2E 在 `testing.Short()` 下会跳过。这样 `go test -short ./...` 可以继续作为 PR 覆盖率入口，而真实 10 分钟场景必须显式运行。
 
@@ -50,19 +55,20 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 
 | 场景 | 总操作数 | 失败操作 | 吞吐量 | P50 | P95 | P99 | Leader 切换 | 快照节点数 | 最大快照 index | 一致性 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Comprehensive | 507,391 | 0 | 845.65 ops/s | 3.929333ms | 18.049458ms | 52.540375ms | 14 | 3 | 371,463 | 通过，1,990 个 key |
-| WriteHeavy | 558,608 | 0 | 931.01 ops/s | 2.68175ms | 12.287542ms | 35.588666ms | 14 | 3 | 543,609 | 通过，2,000 个 key |
-| MixedWithFailures | 678,178 | 0 | 1,130.30 ops/s | 1.598333ms | 5.805333ms | 15.755125ms | 6 | 3 | 467,015 | 通过，final barrier true，3,600 个 node-key 检查 |
-| ConsistencyWithRestartsAndSnapshots | 808,862 | 0 | 1,348.10 ops/s | 2.131125ms | 7.693208ms | 20.98475ms | 2 | 3 | 561,412 | 通过，final barrier true，3,600 个 node-key 检查 |
-| ReadHeavy | 36,043,150 | 0 | 60,071.92 ops/s | 30.083us | 421.208us | 1.436458ms | 0 | 0 | 0 | 通过，2,000 个 key |
-| DeleteStress | 468,936 | 0 | 781.56 ops/s | 3.394583ms | 15.347333ms | 46.558125ms | 10 | 3 | 457,143 | 通过，final barrier true，3,600 个 node-key 检查 |
+| Comprehensive | 774,102 | 0 | 1,290.17 ops/s | 2.874834ms | 8.513291ms | 23.756791ms | 4 | 3 | 575,853 | 通过，1,998 个 key |
+| WriteHeavy | 543,912 | 0 | 906.52 ops/s | 3.032ms | 11.244416ms | 37.242958ms | 12 | 3 | 543,632 | 通过，2,000 个 key |
+| MixedWithFailures | 663,144 | 0 | 1,105.24 ops/s | 1.572042ms | 6.362583ms | 22.033333ms | 7 | 3 | 447,566 | 通过，final barrier true，3,600 个 node-key 检查 |
+| ConsistencyWithRestartsAndSnapshots | 848,860 | 0 | 1,414.77 ops/s | 1.749042ms | 8.107166ms | 21.205459ms | 8 | 3 | 578,003 | 通过，final barrier true，3,600 个 node-key 检查 |
+| ReadHeavy | 31,486,862 | 0 | 52,478.10 ops/s | 31.5us | 409.667us | 1.512083ms | 0 | 0 | 0 | 通过，2,000 个 key |
+| DeleteStress | 395,959 | 0 | 659.93 ops/s | 3.263708ms | 17.853334ms | 60.205542ms | 11 | 3 | 377,811 | 通过，final barrier true，3,600 个 node-key 检查 |
 
 最新全量运行修复了此前由
 [issue #113](https://github.com/xmh1011/go-kv/issues/113)、
 [issue #116](https://github.com/xmh1011/go-kv/issues/116) 和
 [issue #117](https://github.com/xmh1011/go-kv/issues/117)、
 [issue #150](https://github.com/xmh1011/go-kv/issues/150) 和
-[issue #151](https://github.com/xmh1011/go-kv/issues/151) 跟踪的
+[issue #151](https://github.com/xmh1011/go-kv/issues/151) 以及
+[issue #164](https://github.com/xmh1011/go-kv/issues/164) 跟踪的
 ReadIndex 与 apply-timeout 回归。对写入稳定性最关键的变化是：
 SSTable compaction 不再同步运行在 Raft apply 前台路径里。MemTable flush
 仍会先发布持久化的 Level-0 SSTable，然后把 compaction 合并到后台 worker
@@ -88,6 +94,13 @@ Issue #151 修复了 mixed-failure 长测 harness。已发出的命令使用稳�
 `(ClientID, SequenceNum)` 身份，语义上可以安全重试；旧的 30 秒已发请求重试窗口可能在
 leader 重新选举和 snapshot catch-up 仍在进行时过期。现在窗口是有界 90 秒：真正卡住的命令
 仍会失败，但正常 Raft 恢复不会在 final barrier 成功后被误报为失败操作。
+
+Issue #164 修复了 gRPC streaming InstallSnapshot 的 reply 边界。Raft RPC
+契约要求每个 reply 都携带 follower 当前 term，这样 leader 如果已经过期就能退位。
+旧的 streaming transport 会正确安装 snapshot，但返回给调用方的是请求 term，
+导致 `processSnapshotReply` 可能把更高 term follower 当成同 term 的成功 snapshot ACK。
+现在服务端在安装 snapshot 后通过 gRPC trailer 写入 follower term，
+`SendInstallSnapshot` 会把该 term 传播到 `InstallSnapshotReply`。
 
 ## #109 后的重启/快照聚焦重放
 
