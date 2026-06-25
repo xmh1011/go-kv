@@ -45,7 +45,14 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 | #164 后静态和单元门禁 | `/Users/xiaominghao/go/bin/staticcheck ./...`、`~/go/bin/errcheck -ignoretests ./...`、`go vet ./...`、`GO_KV_LOG_LEVEL=warn make test` | 通过 |
 | #164 后集成回归 | `GO_KV_LOG_LEVEL=warn make integration-test` | 512.324s 通过 |
 | #164 后端到端回归 | `GO_KV_LOG_LEVEL=warn make e2e-test` | 455.655s 通过 |
-| 全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn make long-test` | 3674.264s 通过，覆盖全部六个 10 分钟场景 |
+| WAL torn-tail 回归 | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/wal -run '^TestRecoverTruncatesTornTailAfterValidRecords$' -count=1` | #166 修复前因 `decode key: unexpected EOF` 失败；截断不完整 WAL 尾记录后通过 |
+| SSTable 非阻塞 compaction 测试稳定性 | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run '^TestCreateNewSSTableDoesNotBlockBehindCompaction$' -count=100 -timeout=5m` | #168 将固定 100ms 完成 deadline 改为条件式发布检查后通过 |
+| #166 后 LSM/WAL race 门禁 | `GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=15m` | 通过；最慢 package `engine/lsm/database` 10.065s |
+| #166 后 Raft race/shuffle 探针 | `GO_KV_LOG_LEVEL=warn go test -race -shuffle=on ./raft -count=50 -timeout=40m` | 659.257s 通过 |
+| #166 后静态和单元门禁 | `/Users/xiaominghao/go/bin/staticcheck ./...`、`~/go/bin/errcheck -ignoretests ./...`、`go vet ./...`、`GO_KV_LOG_LEVEL=warn make test` | 通过 |
+| #166 后集成回归 | `GO_KV_LOG_LEVEL=warn make integration-test` | 506.003s 通过 |
+| #166 后端到端回归 | `GO_KV_LOG_LEVEL=warn make e2e-test` | 452.782s 通过 |
+| 全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn make long-test` | 3656.928s 通过，覆盖全部六个 10 分钟场景 |
 
 现在 short 模式行为是明确的：10 分钟 E2E 在 `testing.Short()` 下会跳过。这样 `go test -short ./...` 可以继续作为 PR 覆盖率入口，而真实 10 分钟场景必须显式运行。
 
@@ -55,21 +62,23 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 
 | 场景 | 总操作数 | 失败操作 | 吞吐量 | P50 | P95 | P99 | Leader 切换 | 快照节点数 | 最大快照 index | 一致性 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Comprehensive | 774,102 | 0 | 1,290.17 ops/s | 2.874834ms | 8.513291ms | 23.756791ms | 4 | 3 | 575,853 | 通过，1,998 个 key |
-| WriteHeavy | 543,912 | 0 | 906.52 ops/s | 3.032ms | 11.244416ms | 37.242958ms | 12 | 3 | 543,632 | 通过，2,000 个 key |
-| MixedWithFailures | 663,144 | 0 | 1,105.24 ops/s | 1.572042ms | 6.362583ms | 22.033333ms | 7 | 3 | 447,566 | 通过，final barrier true，3,600 个 node-key 检查 |
-| ConsistencyWithRestartsAndSnapshots | 848,860 | 0 | 1,414.77 ops/s | 1.749042ms | 8.107166ms | 21.205459ms | 8 | 3 | 578,003 | 通过，final barrier true，3,600 个 node-key 检查 |
-| ReadHeavy | 31,486,862 | 0 | 52,478.10 ops/s | 31.5us | 409.667us | 1.512083ms | 0 | 0 | 0 | 通过，2,000 个 key |
-| DeleteStress | 395,959 | 0 | 659.93 ops/s | 3.263708ms | 17.853334ms | 60.205542ms | 11 | 3 | 377,811 | 通过，final barrier true，3,600 个 node-key 检查 |
+| Comprehensive | 1,250,938 | 0 | 2,084.90 ops/s | 2.00875ms | 4.304916ms | 11.241458ms | 0 | 3 | 928,693 | 通过，1,996 个 key |
+| WriteHeavy | 866,100 | 0 | 1,443.50 ops/s | 2.046125ms | 5.075375ms | 11.049291ms | 14 | 3 | 850,768 | 通过，2,000 个 key |
+| MixedWithFailures | 1,136,462 | 0 | 1,894.10 ops/s | 1.26675ms | 2.13075ms | 4.634417ms | 1 | 3 | 794,687 | 通过，final barrier true，3,600 个 node-key 检查 |
+| ConsistencyWithRestartsAndSnapshots | 1,613,118 | 0 | 2,688.53 ops/s | 1.407208ms | 2.084625ms | 3.763667ms | 2 | 3 | 1,122,910 | 通过，final barrier true，3,600 个 node-key 检查 |
+| ReadHeavy | 61,731,897 | 0 | 102,886.49 ops/s | 16.625us | 294.25us | 710us | 0 | 0 | 0 | 通过，2,000 个 key |
+| DeleteStress | 859,815 | 0 | 1,433.03 ops/s | 1.98525ms | 4.57375ms | 11.266458ms | 12 | 3 | 853,481 | 通过，final barrier true，3,600 个 node-key 检查 |
 
-最新全量运行修复了此前由
+最新全量运行验证了此前由
 [issue #113](https://github.com/xmh1011/go-kv/issues/113)、
 [issue #116](https://github.com/xmh1011/go-kv/issues/116) 和
 [issue #117](https://github.com/xmh1011/go-kv/issues/117)、
 [issue #150](https://github.com/xmh1011/go-kv/issues/150) 和
 [issue #151](https://github.com/xmh1011/go-kv/issues/151) 以及
 [issue #164](https://github.com/xmh1011/go-kv/issues/164) 跟踪的
-ReadIndex 与 apply-timeout 回归。对写入稳定性最关键的变化是：
+ReadIndex、apply-timeout 和 snapshot catch-up 修复，也验证了
+[issue #166](https://github.com/xmh1011/go-kv/issues/166) 跟踪的 WAL recovery 边界。
+对写入稳定性最关键的变化是：
 SSTable compaction 不再同步运行在 Raft apply 前台路径里。MemTable flush
 仍会先发布持久化的 Level-0 SSTable，然后把 compaction 合并到后台 worker
 里执行；测试或关闭流程可以通过 `WaitForCompactions()` 等待后台任务收敛。
@@ -101,6 +110,12 @@ Issue #164 修复了 gRPC streaming InstallSnapshot 的 reply 边界。Raft RPC
 导致 `processSnapshotReply` 可能把更高 term follower 当成同 term 的成功 snapshot ACK。
 现在服务端在安装 snapshot 后通过 gRPC trailer 写入 follower term，
 `SendInstallSnapshot` 会把该 term 传播到 `InstallSnapshotReply`。
+
+Issue #166 修复了 LSM WAL recovery 边界。旧实现会一直解码记录直到 EOF，并把任意
+decode 错误都当作 fatal。真实崩溃或中断写入可能只留下不完整的最后一条 WAL 记录，
+正确不变量是：恢复所有完整前缀记录，只截断 torn tail，同时继续把非法长度字段等结构性损坏
+视为恢复失败。现在 `Recover` 会记录最后一条完整记录的 offset，把不完整尾部截断到该
+offset，再把可写 WAL handle seek 回 EOF；非尾部结构性损坏仍然返回错误。
 
 ## #109 后的重启/快照聚焦重放
 

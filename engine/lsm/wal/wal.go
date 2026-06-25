@@ -14,7 +14,7 @@ package wal
 
 import (
 	"bufio"
-	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -27,6 +27,8 @@ import (
 const (
 	defaultWALFileMode   = 0666
 	defaultWALFileSuffix = "wal"
+	maxWALKeyLength      = 1 << 20
+	maxWALValueLength    = 1 << 30
 )
 
 // WAL implementation
@@ -134,25 +136,75 @@ func Recover(path string, callback func(pair kv.KeyValuePair)) (*WAL, error) {
 	}
 	raw, err := io.ReadAll(file)
 	if err != nil {
+		_ = file.Close()
 		log.Errorf("[WAL] Read wal file failed: %s", err.Error())
 		return nil, fmt.Errorf("read wal file failed: %w", err)
 	}
 
-	buf := bytes.NewReader(raw)
 	count := 0
-	for buf.Len() > 0 {
-		var pair kv.KeyValuePair
-		err := pair.DecodeFrom(buf)
+	offset := 0
+	for offset < len(raw) {
+		pair, nextOffset, truncatedTail, err := decodeWALRecord(raw, offset)
 		if err != nil {
+			_ = file.Close()
 			log.Errorf("[WAL] Failed to read wal %s, error: %s", file.Name(), err.Error())
 			return nil, fmt.Errorf("failed to read wal %s: %w", file.Name(), err)
+		}
+		if truncatedTail {
+			log.Warnf("[WAL] Truncating torn WAL tail for %s from %d to %d bytes", path, len(raw), offset)
+			if err := file.Truncate(int64(offset)); err != nil {
+				_ = file.Close()
+				return nil, fmt.Errorf("truncate torn wal tail %s: %w", file.Name(), err)
+			}
+			if _, err := file.Seek(0, io.SeekEnd); err != nil {
+				_ = file.Close()
+				return nil, fmt.Errorf("seek wal after truncating torn tail %s: %w", file.Name(), err)
+			}
+			break
 		}
 
 		// 回调处理有效数据
 		callback(pair)
 		count++
+		offset = nextOffset
 	}
 
 	log.Debugf("[WAL] Recovered %d entries from %s", count, path)
 	return &WAL{file: file, buf: bufio.NewWriterSize(file, 32*1024), path: path}, nil
+}
+
+func decodeWALRecord(raw []byte, offset int) (kv.KeyValuePair, int, bool, error) {
+	remaining := len(raw) - offset
+	if remaining < 4 {
+		return kv.KeyValuePair{}, offset, true, nil
+	}
+
+	keyLen := int(binary.LittleEndian.Uint32(raw[offset : offset+4]))
+	if keyLen > maxWALKeyLength {
+		return kv.KeyValuePair{}, offset, false, fmt.Errorf("invalid key length: %d", keyLen)
+	}
+	keyStart := offset + 4
+	keyEnd := keyStart + keyLen
+	if len(raw) < keyEnd {
+		return kv.KeyValuePair{}, offset, true, nil
+	}
+
+	valueLenOffset := keyEnd
+	if len(raw)-valueLenOffset < 4 {
+		return kv.KeyValuePair{}, offset, true, nil
+	}
+	valueLen := int(binary.LittleEndian.Uint32(raw[valueLenOffset : valueLenOffset+4]))
+	if valueLen > maxWALValueLength {
+		return kv.KeyValuePair{}, offset, false, fmt.Errorf("invalid value length: %d", valueLen)
+	}
+	valueStart := valueLenOffset + 4
+	valueEnd := valueStart + valueLen
+	if len(raw) < valueEnd {
+		return kv.KeyValuePair{}, offset, true, nil
+	}
+
+	return kv.KeyValuePair{
+		Key:   kv.Key(raw[keyStart:keyEnd]),
+		Value: kv.Value(append([]byte(nil), raw[valueStart:valueEnd]...)),
+	}, valueEnd, false, nil
 }

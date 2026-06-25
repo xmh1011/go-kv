@@ -33,6 +33,8 @@ Related issues:
 - #150 Prevent LSM snapshot reload races
 - #151 Extend mixed-failure issued-request retry budget
 - #164 Restarted follower can miss committed writes after snapshot catch-up
+- #166 WAL recovery fails on torn trailing records
+- #168 Compaction non-blocking test can fail on slow CI runners
 
 ## 1. The Debugging Rule That Changed The Result
 
@@ -166,6 +168,139 @@ Affected issue:
 
 - #164 exposed stale follower state after snapshot catch-up and made the lost
   InstallSnapshot reply term visible under long-running restart pressure.
+
+## 3.2. LSM WAL Principle: Recovery Must Preserve The Durable Prefix
+
+The LSM write-ahead log is an append-only sequence of records:
+
+```text
+key length | key bytes | value length | value bytes
+```
+
+The recovery invariant is not "the whole WAL file must decode perfectly". The
+invariant is more precise:
+
+- every complete prefix record must be replayed;
+- an incomplete final record can be discarded because it was not fully written;
+- structural corruption that is not just a truncated tail must still fail
+  recovery.
+
+Issue #166 exposed the missing distinction. A WAL with valid records followed by
+five bytes of the next record failed recovery:
+
+```text
+read key failed: unexpected EOF
+failed to read wal ...: decode key: unexpected EOF
+```
+
+The old loop delegated each record to `KeyValuePair.DecodeFrom` and returned on
+the first decode error:
+
+```go
+for buf.Len() > 0 {
+    var pair kv.KeyValuePair
+    if err := pair.DecodeFrom(buf); err != nil {
+        return nil, fmt.Errorf("failed to read wal %s: %w", file.Name(), err)
+    }
+    callback(pair)
+}
+```
+
+That made an interrupted final append indistinguishable from a corrupt WAL. The
+fix parses records with explicit byte offsets. If the remaining bytes cannot
+hold the next key length, full key, value length, or full value, recovery
+truncates the file to the last complete offset and returns a writable WAL
+handle:
+
+```go
+pair, nextOffset, truncatedTail, err := decodeWALRecord(raw, offset)
+if truncatedTail {
+    file.Truncate(int64(offset))
+    file.Seek(0, io.SeekEnd)
+    break
+}
+callback(pair)
+offset = nextOffset
+```
+
+The decoder still rejects impossible lengths:
+
+```go
+if keyLen > maxWALKeyLength {
+    return kv.KeyValuePair{}, offset, false, fmt.Errorf("invalid key length: %d", keyLen)
+}
+```
+
+The test signal is intentionally layered. `TestRecoverTruncatesTornTailAfterValidRecords`
+failed before the fix with `unexpected EOF`, then passed after the fix and also
+proved the recovered WAL can accept a new append. The existing corrupt-WAL test
+continues to fail recovery for invalid length fields. After that, the LSM race
+gate, Raft `-race -shuffle -count=50` probe, unit tests, integration tests,
+ordinary E2E tests, and all six 10-minute long E2E scenarios passed.
+
+Affected issue:
+
+- #166 fixed the WAL recovery boundary so a torn final append no longer bricks
+  restart when the complete prefix is still valid.
+
+## 3.3. Test Principle: Assert The Invariant, Not A Tiny Scheduler Window
+
+Issue #168 was a CI-only failure in
+`TestCreateNewSSTableDoesNotBlockBehindCompaction`. The production invariant is
+important: `CreateNewSSTable` must publish the new Level-0 table without waiting
+for a currently running compaction. That keeps foreground MemTable flushes out
+of the background compaction critical path.
+
+The old test used a 100ms wall-clock timeout as a proxy for that invariant:
+
+```go
+select {
+case err := <-done:
+    completed = true
+    assert.NoError(t, err)
+case <-time.After(100 * time.Millisecond):
+    t.Fatal("CreateNewSSTable should publish the new table without waiting for compaction")
+}
+```
+
+This was too indirect. On a shared CI runner with `-race` and coverage enabled,
+the goroutine finished in about 110ms and the test failed even though the
+production behavior was not shown to be wrong. The repaired test observes the
+state transition directly: while compaction is still marked active, the new
+table must already be visible in the manager catalog. Only after that does the
+test release compaction and wait for the goroutine to return:
+
+```go
+require.Eventually(t, func() bool {
+    tables := manager.getLevelTables(level)
+    return len(tables) > 0
+}, 2*time.Second, 10*time.Millisecond)
+
+manager.mu.RLock()
+stillCompacting := manager.compactingLevels[level]
+manager.mu.RUnlock()
+require.True(t, stillCompacting)
+
+manager.endCompactionLevels([]int{level})
+```
+
+The validation signal is a focused stability loop:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable \
+  -run '^TestCreateNewSSTableDoesNotBlockBehindCompaction$' \
+  -count=100 -timeout=5m
+```
+
+That loop passed, followed by the full SSTable package test and the LSM race
+gate. The lesson is the same as the long E2E harness work: tests should encode
+the actual distributed/storage invariant. Small fixed sleeps and deadlines are
+diagnostics at best, not correctness proofs.
+
+Affected issue:
+
+- #168 stabilized the compaction non-blocking regression test by replacing a
+  scheduler-sensitive timeout with condition-based state checks.
 
 ## 4. Raft Principle: Same-Term Leader Hints Must Still Demote Stale Roles
 
