@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/go-kv-logo.svg" alt="go-kv logo" width="720">
+  <img src="assets/go-kv-logo.svg" alt="go-kv logo" width="280">
 </p>
 
 # go-kv

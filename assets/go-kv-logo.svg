@@ -1,58 +1,35 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="260" viewBox="0 0 960 260" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="120" viewBox="0 0 420 120" role="img" aria-labelledby="title desc">
   <title id="title">go-kv logo</title>
-  <desc id="desc">A Go-inspired logo for go-kv, showing Raft nodes, LSM storage levels, and a key-value mark.</desc>
+  <desc id="desc">A compact Go-inspired wordmark for the go-kv project.</desc>
   <defs>
-    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#f7fdff"/>
-      <stop offset="1" stop-color="#e6f7fb"/>
-    </linearGradient>
     <linearGradient id="goBlue" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#00add8"/>
       <stop offset="1" stop-color="#007d9c"/>
     </linearGradient>
-    <linearGradient id="kvDark" x1="0" y1="0" x2="1" y2="1">
+    <linearGradient id="dark" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#1c2b35"/>
-      <stop offset="1" stop-color="#0f1f27"/>
+      <stop offset="1" stop-color="#101820"/>
     </linearGradient>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#0f1f27" flood-opacity="0.14"/>
-    </filter>
   </defs>
 
-  <rect x="24" y="24" width="912" height="212" rx="28" fill="url(#panel)" filter="url(#shadow)"/>
-  <rect x="24" y="24" width="912" height="212" rx="28" fill="none" stroke="#b8e8f2" stroke-width="2"/>
+  <g transform="translate(16 18)">
+    <path d="M8 30h58" stroke="#00add8" stroke-width="9" stroke-linecap="round"/>
+    <path d="M0 50h48" stroke="#49c2de" stroke-width="9" stroke-linecap="round"/>
+    <path d="M16 70h36" stroke="#8bd8e8" stroke-width="9" stroke-linecap="round"/>
 
-  <g transform="translate(76 55)">
-    <path d="M46 45h135" stroke="#00add8" stroke-width="16" stroke-linecap="round"/>
-    <path d="M22 78h118" stroke="#00add8" stroke-width="16" stroke-linecap="round" opacity="0.72"/>
-    <path d="M57 112h94" stroke="#00add8" stroke-width="16" stroke-linecap="round" opacity="0.48"/>
+    <circle cx="88" cy="50" r="34" fill="#ffffff" stroke="#00add8" stroke-width="9"/>
+    <circle cx="88" cy="50" r="13" fill="#00add8"/>
+    <path d="M119 50h38" stroke="#243746" stroke-width="8" stroke-linecap="round"/>
+    <circle cx="160" cy="50" r="13" fill="#00add8"/>
+    <path d="M171 50h10M171 38v24" stroke="#00add8" stroke-width="6" stroke-linecap="round"/>
 
-    <circle cx="204" cy="78" r="40" fill="#ffffff" stroke="#00add8" stroke-width="10"/>
-    <circle cx="204" cy="78" r="16" fill="#00add8"/>
-    <circle cx="284" cy="38" r="22" fill="#3fb950" stroke="#ffffff" stroke-width="6"/>
-    <circle cx="322" cy="118" r="22" fill="#7c3aed" stroke="#ffffff" stroke-width="6"/>
-    <path d="M239 60l27-14M238 96l61 16" stroke="#243746" stroke-width="7" stroke-linecap="round"/>
-
-    <g transform="translate(244 68)">
-      <rect x="0" y="0" width="88" height="72" rx="18" fill="#ffffff" stroke="#243746" stroke-width="6"/>
-      <path d="M24 36h38" stroke="#243746" stroke-width="8" stroke-linecap="round"/>
-      <circle cx="65" cy="36" r="10" fill="#00add8"/>
-      <path d="M74 36h8M74 24v24" stroke="#00add8" stroke-width="6" stroke-linecap="round"/>
-    </g>
+    <circle cx="132" cy="20" r="14" fill="#3fb950" stroke="#ffffff" stroke-width="5"/>
+    <circle cx="176" cy="82" r="14" fill="#7c3aed" stroke="#ffffff" stroke-width="5"/>
+    <path d="M116 36l7-8M122 66l40 13" stroke="#243746" stroke-width="5" stroke-linecap="round"/>
   </g>
 
-  <g transform="translate(438 62)">
-    <text x="0" y="80" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="76" font-weight="800" letter-spacing="0" fill="url(#goBlue)">go</text>
-    <text x="102" y="80" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="76" font-weight="800" letter-spacing="0" fill="url(#kvDark)">-kv</text>
-    <text x="4" y="122" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="22" font-weight="600" letter-spacing="0" fill="#52636d">Raft consensus + LSM storage</text>
-
-    <g transform="translate(6 150)">
-      <rect x="0" y="0" width="88" height="20" rx="10" fill="#00add8"/>
-      <rect x="104" y="0" width="88" height="20" rx="10" fill="#3fb950"/>
-      <rect x="208" y="0" width="88" height="20" rx="10" fill="#7c3aed"/>
-      <text x="20" y="45" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#52636d">WAL</text>
-      <text x="120" y="45" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#52636d">RAFT</text>
-      <text x="230" y="45" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#52636d">LSM</text>
-    </g>
+  <g transform="translate(222 27)">
+    <text x="0" y="58" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="64" font-weight="800" letter-spacing="0" fill="url(#goBlue)">go</text>
+    <text x="86" y="58" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="64" font-weight="800" letter-spacing="0" fill="url(#dark)">-kv</text>
   </g>
 </svg>
