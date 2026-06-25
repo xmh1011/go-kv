@@ -75,8 +75,8 @@ func (s *Storage) load() (err error) {
 	}
 
 	s.hardState = data.HardState
-	s.snapshot = data.Snapshot
-	s.log = data.Log
+	s.snapshot = param.CloneSnapshot(data.Snapshot)
+	s.log = param.CloneLogEntries(data.Log)
 	s.logOffset = data.LogOffset
 	return nil
 }
@@ -144,7 +144,7 @@ func (s *Storage) GetState() (param.HardState, error) {
 func (s *Storage) AppendEntries(entries []param.LogEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.log = append(s.log, entries...)
+	s.log = append(s.log, param.CloneLogEntries(entries)...)
 	return s.persist()
 }
 
@@ -156,7 +156,8 @@ func (s *Storage) GetEntry(index uint64) (*param.LogEntry, error) {
 		return nil, nil
 	}
 
-	return &s.log[index-s.logOffset], nil
+	entry := param.CloneLogEntry(s.log[index-s.logOffset])
+	return &entry, nil
 }
 
 func (s *Storage) TruncateLog(fromIndex uint64) error {
@@ -199,14 +200,14 @@ func (s *Storage) LogSize() (int, error) {
 func (s *Storage) SaveSnapshot(snapshot *param.Snapshot) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.snapshot = snapshot
+	s.snapshot = param.CloneSnapshot(snapshot)
 	return s.persist()
 }
 
 func (s *Storage) ReadSnapshot() (*param.Snapshot, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.snapshot, nil
+	return param.CloneSnapshot(s.snapshot), nil
 }
 
 func (s *Storage) CompactLog(upToIndex uint64) error {

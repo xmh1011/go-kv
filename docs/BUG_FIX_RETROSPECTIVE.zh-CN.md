@@ -33,6 +33,7 @@ English version: [BUG_FIX_RETROSPECTIVE.md](BUG_FIX_RETROSPECTIVE.md)
 - #166 WAL recovery fails on torn trailing records
 - #168 Compaction non-blocking test can fail on slow CI runners
 - #169 In-memory and simplefile state machines panic on malformed commands
+- #171 In-memory and simplefile storage expose mutable log and snapshot internals
 
 ## 1. 真正改变结果的调试原则
 
@@ -1755,6 +1756,108 @@ Panic value: failed to unmarshal command: invalid character 'h' in literal true
 ```
 
 修复后，聚焦回归、storage race 门禁、storage 包测试和单元测试目标都通过。
+
+### #171：稳定存储不能暴露可变内部对象
+
+症状：`inmemory` 和 `simplefile` 两个 storage 后端会通过 stable-storage API 泄漏可变内部对象。
+调用方可以用 `[]byte` command 追加一条日志，在 `AppendEntries` 返回后修改这段 byte slice，
+随后 `GetEntry` 就会读到被修改后的 command。反方向也不安全：修改 `GetEntry` 返回的
+`*LogEntry` 会影响之后的读取结果。
+
+Snapshot 也有同样的所有权问题。`SaveSnapshot` 直接保存调用方传入的 `*param.Snapshot`
+指针，`ReadSnapshot` 又直接返回内部指针。调用方可以在 storage 方法之外修改 snapshot
+index、term 或 data。
+
+失败回归把这个 aliasing 问题直接暴露出来：
+
+```go
+originalCommand := []byte("original")
+entry := param.LogEntry{Term: 1, Index: 1, Command: originalCommand}
+store.AppendEntries([]param.LogEntry{entry})
+
+originalCommand[0] = 'X'
+stored, _ := store.GetEntry(1)
+// 修复前：stored.Command == []byte("Xriginal")
+
+stored.Command.([]byte)[0] = 'Y'
+storedAgain, _ := store.GetEntry(1)
+// 修复前：storedAgain.Command == []byte("Yriginal")
+```
+
+这破坏了 storage 边界。Raft stable storage 只能通过 `AppendEntries`、`TruncateLog`、
+`CompactLog`、`SaveSnapshot` 等方法改变。如果调用方可以修改已返回或已传入的对象，
+日志和 snapshot 状态就能绕过 storage lock 和 Raft 一致性检查被改变。
+
+修复新增了 Raft payload 的显式 clone helper：
+
+```go
+func CloneLogEntry(entry LogEntry) LogEntry {
+    entry.Command = CloneCommand(entry.Command)
+    return entry
+}
+
+func CloneSnapshot(snapshot *Snapshot) *Snapshot {
+    if snapshot == nil {
+        return nil
+    }
+    cloned := *snapshot
+    cloned.Data = append([]byte(nil), snapshot.Data...)
+    return &cloned
+}
+```
+
+`CloneCommand` 会复制 Raft 日志中实际使用的可变命令形态：
+
+```go
+case []byte:
+    return append([]byte(nil), cmd...)
+case ConfigChangeCommand:
+    return ConfigChangeCommand{NewPeerIDs: append([]int(nil), cmd.NewPeerIDs...)}
+case ClientCommand:
+    return NewClientCommand(cmd.ClientID, cmd.SequenceNum, CloneCommand(cmd.Command))
+```
+
+非 LSM storage 现在在所有权边界都使用这些 helper：
+
+```go
+func (s *Storage) AppendEntries(entries []param.LogEntry) error {
+    s.log = append(s.log, param.CloneLogEntries(entries)...)
+}
+
+func (s *Storage) GetEntry(index uint64) (*param.LogEntry, error) {
+    entry := param.CloneLogEntry(s.log[index-s.logOffset])
+    return &entry, nil
+}
+
+func (s *Storage) SaveSnapshot(snapshot *param.Snapshot) error {
+    s.snapshot = param.CloneSnapshot(snapshot)
+}
+
+func (s *Storage) ReadSnapshot() (*param.Snapshot, error) {
+    return param.CloneSnapshot(s.snapshot), nil
+}
+```
+
+LSM backend 已经天然具备这个性质，因为日志和 snapshot 在写入时会编码成 bytes，读取时会解码成新对象。
+
+验证：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/inmemory ./pkg/storage/simplefile -run 'TestStorageDefensiveCopies' -count=1
+GO_KV_LOG_LEVEL=warn go test ./pkg/param -run 'TestClone' -count=1
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/... ./pkg/param -count=1
+GO_KV_LOG_LEVEL=warn go test -race ./pkg/storage/... ./pkg/param -count=1
+GO_KV_LOG_LEVEL=warn go test -race -shuffle=on ./engine/lsm/... ./pkg/storage/... -count=20 -timeout=80m
+GO_KV_LOG_LEVEL=warn go test -race -shuffle=on ./raft -count=100 -timeout=80m
+GO_KV_LOG_LEVEL=warn make test
+GO_KV_LOG_LEVEL=warn make integration-test
+GO_KV_LOG_LEVEL=warn make e2e-test
+GO_KV_LOG_LEVEL=warn make long-test
+```
+
+修复前，回归测试能在后续读取里观察到 `Xriginal`、`Yriginal`、`Xnapshot` 和 `Ynapshot`。
+修复后，聚焦回归、包测试、race 测试、静态分析、单元门禁、集成测试、E2E 测试和全部六个
+10 分钟长时间 E2E 场景都通过。
 
 ### 综合经验
 
