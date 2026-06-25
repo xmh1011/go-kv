@@ -226,7 +226,7 @@ GO_KV_LOG_LEVEL=warn go test -race -v -timeout=90m ./tests/long_running_e2e_test
 The release workflow publishes a GitHub Release when a tag matching `v*.*.*` is
 pushed. It can also be started manually from GitHub Actions for an existing
 version tag. Release tags must use semantic-version style names such as
-`v0.1.0` or `v0.1.0-rc.1`, and the workflow validates that the tag exists before
+`v0.2.2` or `v0.2.2-rc.1`, and the workflow validates that the tag exists before
 building artifacts.
 
 Create a release tag:
@@ -235,14 +235,14 @@ Create a release tag:
 git switch main
 git pull --ff-only origin main
 GO_KV_LOG_LEVEL=warn make test
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
 To publish an existing tag manually, run the `Release` workflow from GitHub
 Actions and set:
 
-- `version`: the existing tag to publish, for example `v0.1.0`.
+- `version`: the existing tag to publish, for example `v0.2.2`.
 - `prerelease`: whether to mark the GitHub Release as a prerelease.
 
 The workflow runs short tests, builds cross-platform server and client
@@ -271,5 +271,5 @@ sha256sum -c SHA256SUMS.txt
 For module users, pin the same tag:
 
 ```bash
-go get github.com/xmh1011/go-kv@v0.1.0
+go get github.com/xmh1011/go-kv@v0.2.2
 ```
