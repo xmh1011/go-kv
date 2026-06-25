@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/go-kv-logo.svg" alt="go-kv logo" width="720">
+</p>
+
 # go-kv
 
 `go-kv` 是一个用 Go 编写的分布式、容错键值存储系统。它使用 Raft 共识算法在多个节点之间复制命令，并使用 LSM-tree 存储引擎高效持久化用户数据和 Raft 日志数据。
