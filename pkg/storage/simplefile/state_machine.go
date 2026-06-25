@@ -92,13 +92,13 @@ func (sm *StateMachine) persist() error {
 
 // Apply applies a log entry to the state machine.
 func (sm *StateMachine) Apply(entry param.LogEntry) any {
+	cmd, err := decodeKVCommand(entry)
+	if err != nil {
+		return err
+	}
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-
-	var cmd param.KVCommand
-	if err := json.Unmarshal(param.UnwrapClientCommand(entry.Command).([]byte), &cmd); err != nil {
-		panic(fmt.Sprintf("failed to unmarshal command: %v", err))
-	}
 
 	switch cmd.Op {
 	case param.OpSet:
@@ -116,6 +116,19 @@ func (sm *StateMachine) Apply(entry param.LogEntry) any {
 	default:
 		return fmt.Errorf("unknown operation: %d", cmd.Op)
 	}
+}
+
+func decodeKVCommand(entry param.LogEntry) (param.KVCommand, error) {
+	var cmd param.KVCommand
+	command := param.UnwrapClientCommand(entry.Command)
+	cmdBytes, ok := command.([]byte)
+	if !ok {
+		return cmd, fmt.Errorf("invalid command format: expected []byte, got %T", command)
+	}
+	if err := json.Unmarshal(cmdBytes, &cmd); err != nil {
+		return cmd, fmt.Errorf("failed to unmarshal command: %w", err)
+	}
+	return cmd, nil
 }
 
 // Get queries a key from the state machine.

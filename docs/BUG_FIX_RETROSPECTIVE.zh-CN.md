@@ -32,6 +32,7 @@ English version: [BUG_FIX_RETROSPECTIVE.md](BUG_FIX_RETROSPECTIVE.md)
 - #164 Restarted follower can miss committed writes after snapshot catch-up
 - #166 WAL recovery fails on torn trailing records
 - #168 Compaction non-blocking test can fail on slow CI runners
+- #169 In-memory and simplefile state machines panic on malformed commands
 
 ## 1. 真正改变结果的调试原则
 
@@ -1672,6 +1673,88 @@ GO_KV_LOG_LEVEL=warn make test
 
 定向 mixed-failure 场景 619.602s 通过，666,692 次操作、失败 0、final barrier true、
 严格一致性 true。随后全量长时间 E2E 回归 3674.858s 通过，覆盖全部六个 10 分钟场景，失败操作为 0。
+
+### #169：State Machine Apply 应返回错误，而不是 panic
+
+症状：`inmemory` 和 `simplefile` 两个状态机后端会把格式错误的已提交 command 处理成进程级
+panic。更糟的是，旧的 in-memory 测试还把这个行为写成了预期：
+
+```go
+defer func() {
+    if r := recover(); r == nil {
+        t.Error("The code did not panic on malformed command")
+    }
+}()
+
+sm.Apply(param.LogEntry{Command: []byte("this is not valid json")})
+```
+
+但 LSM adapter 已经采用了更合理的契约：先展开 `ClientCommand`，再校验 command 表示，
+如果类型错误或 JSON 解码失败，就返回 error：
+
+```go
+cmdBytes, ok := param.UnwrapClientCommand(entry.Command).([]byte)
+if !ok {
+    return fmt.Errorf("invalid command format: not []byte")
+}
+if err := json.Unmarshal(cmdBytes, &cmd); err != nil {
+    return err
+}
+```
+
+这里真正的问题是状态机接口不变量。`storage.StateMachine.Apply` 返回 `any`，Raft apply loop
+会把返回的 `error` 当成命令执行结果传给等待中的客户端请求。后端直接 panic 会绕过这个契约，
+把一个确定性的命令校验错误放大成节点可用性问题，并且让同一个 Raft 日志在不同存储后端上表现不一致。
+
+修复后，`inmemory` 和 `simplefile` 都与 LSM adapter 对齐，通过显式 helper 解码命令：
+
+```go
+func decodeKVCommand(entry param.LogEntry) (param.KVCommand, error) {
+    var cmd param.KVCommand
+    command := param.UnwrapClientCommand(entry.Command)
+    cmdBytes, ok := command.([]byte)
+    if !ok {
+        return cmd, fmt.Errorf("invalid command format: expected []byte, got %T", command)
+    }
+    if err := json.Unmarshal(cmdBytes, &cmd); err != nil {
+        return cmd, fmt.Errorf("failed to unmarshal command: %w", err)
+    }
+    return cmd, nil
+}
+```
+
+`Apply` 在拿状态机锁、修改数据之前先返回解码错误：
+
+```go
+cmd, err := decodeKVCommand(entry)
+if err != nil {
+    return err
+}
+
+sm.mu.Lock()
+defer sm.mu.Unlock()
+```
+
+新增回归测试同时覆盖直接传入的坏 command 和包在 `param.ClientCommand` 里的坏 command。
+测试还断言已有 key 不会被破坏；`simplefile` 额外重新打开文件后端，证明无效 command 不会产生持久化副作用。
+
+验证：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/inmemory ./pkg/storage/simplefile -run 'TestStateMachine/Apply_with_invalid_command_format_returns_error' -count=1
+GO_KV_LOG_LEVEL=warn go test -race ./pkg/storage/inmemory ./pkg/storage/simplefile ./pkg/storage/lsm -count=1
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/... -count=1
+GO_KV_LOG_LEVEL=warn make test
+```
+
+修复前，聚焦测试会在两个后端都打出 panic 栈：
+
+```text
+Panic value: interface conversion: interface {} is string, not []uint8
+Panic value: failed to unmarshal command: invalid character 'h' in literal true
+```
+
+修复后，聚焦回归、storage race 门禁、storage 包测试和单元测试目标都通过。
 
 ### 综合经验
 

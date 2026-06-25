@@ -35,6 +35,7 @@ Related issues:
 - #164 Restarted follower can miss committed writes after snapshot catch-up
 - #166 WAL recovery fails on torn trailing records
 - #168 Compaction non-blocking test can fail on slow CI runners
+- #169 In-memory and simplefile state machines panic on malformed commands
 
 ## 1. The Debugging Rule That Changed The Result
 
@@ -1852,6 +1853,96 @@ The targeted mixed-failure run passed in 619.602s with 666,692 operations, zero
 failures, final barrier true, and strict consistency true. The full long E2E
 regression then passed in 3674.858s across all six 10-minute scenarios with
 zero failed operations.
+
+### #169: State Machine Apply Must Return Errors, Not Panic
+
+Symptom: the in-memory and simplefile state-machine backends treated malformed
+committed commands as process-level panics. The in-memory test suite even encoded
+that behavior as expected:
+
+```go
+defer func() {
+    if r := recover(); r == nil {
+        t.Error("The code did not panic on malformed command")
+    }
+}()
+
+sm.Apply(param.LogEntry{Command: []byte("this is not valid json")})
+```
+
+The LSM adapter already used the safer contract. It unwraps `ClientCommand`,
+validates the command representation, and returns an error if decoding fails:
+
+```go
+cmdBytes, ok := param.UnwrapClientCommand(entry.Command).([]byte)
+if !ok {
+    return fmt.Errorf("invalid command format: not []byte")
+}
+if err := json.Unmarshal(cmdBytes, &cmd); err != nil {
+    return err
+}
+```
+
+The deeper issue is an interface invariant. `storage.StateMachine.Apply` returns
+`any`, and the Raft apply loop treats returned `error` values as command results
+that can be surfaced to waiters. A backend panic bypasses that contract. It turns
+a deterministic command-validation failure into a node availability failure,
+and it makes the behavior depend on which storage backend is selected.
+
+The fix made `inmemory` and `simplefile` match the LSM adapter. Both backends now
+decode commands through an explicit helper:
+
+```go
+func decodeKVCommand(entry param.LogEntry) (param.KVCommand, error) {
+    var cmd param.KVCommand
+    command := param.UnwrapClientCommand(entry.Command)
+    cmdBytes, ok := command.([]byte)
+    if !ok {
+        return cmd, fmt.Errorf("invalid command format: expected []byte, got %T", command)
+    }
+    if err := json.Unmarshal(cmdBytes, &cmd); err != nil {
+        return cmd, fmt.Errorf("failed to unmarshal command: %w", err)
+    }
+    return cmd, nil
+}
+```
+
+`Apply` now returns the decode error before taking the state-machine lock or
+mutating data:
+
+```go
+cmd, err := decodeKVCommand(entry)
+if err != nil {
+    return err
+}
+
+sm.mu.Lock()
+defer sm.mu.Unlock()
+```
+
+The regression tests cover direct malformed commands and wrapped
+`param.ClientCommand` values. They also assert that an existing key remains
+unchanged; the simplefile test additionally reopens the file-backed store to
+prove invalid commands are not persisted as a side effect.
+
+Validation:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/inmemory ./pkg/storage/simplefile -run 'TestStateMachine/Apply_with_invalid_command_format_returns_error' -count=1
+GO_KV_LOG_LEVEL=warn go test -race ./pkg/storage/inmemory ./pkg/storage/simplefile ./pkg/storage/lsm -count=1
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/... -count=1
+GO_KV_LOG_LEVEL=warn make test
+```
+
+The pre-fix focused test failed with panic stacks from both backends:
+
+```text
+Panic value: interface conversion: interface {} is string, not []uint8
+Panic value: failed to unmarshal command: invalid character 'h' in literal true
+```
+
+After the fix, the focused regression, storage race gate, storage package suite,
+and unit test target all passed.
 
 ### Combined Lesson
 
