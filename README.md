@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/go-kv-logo.svg" alt="go-kv logo" width="720">
+</p>
+
 # go-kv
 
 `go-kv` is a distributed, fault-tolerant key-value store written in Go. It uses
