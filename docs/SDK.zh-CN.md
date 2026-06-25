@@ -6,11 +6,11 @@ English version: [SDK.md](SDK.md)
 
 在 `v1.0.0` 之前，公开 API 仍可能调整。`v0.x` 版本可以使用，但应视为仍在演进。
 
-版本发布来自 `v0.1.0` 这类 Git tag。应用代码建议在 `go.mod` 中固定 tag，不要直接跟踪
+版本发布来自 `v0.2.2` 这类 Git tag。应用代码建议在 `go.mod` 中固定 tag，不要直接跟踪
 `main`：
 
 ```bash
-go get github.com/xmh1011/go-kv@v0.1.0
+go get github.com/xmh1011/go-kv@v0.2.2
 ```
 
 对 `v0.x` release 来说，patch 版本应尽量保持本文档描述的 SDK 表面兼容，除非 bug fix

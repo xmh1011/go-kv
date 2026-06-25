@@ -9,11 +9,11 @@ applications normally use `pkg/client`, `pkg/param`, and `pkg/transport`.
 The public API is not guaranteed to be stable before a `v1.0.0` release. Treat
 the `v0.x` API as usable but still evolving.
 
-Versioned releases are published from Git tags such as `v0.1.0`. Application
+Versioned releases are published from Git tags such as `v0.2.2`. Application
 code should pin a tag in `go.mod` instead of tracking `main`:
 
 ```bash
-go get github.com/xmh1011/go-kv@v0.1.0
+go get github.com/xmh1011/go-kv@v0.2.2
 ```
 
 For `v0.x` releases, patch versions should preserve the documented SDK surface
