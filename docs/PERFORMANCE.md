@@ -55,7 +55,14 @@ LSM compaction, client retries, and final data consistency.
 | Static and unit gates after #166 | `/Users/xiaominghao/go/bin/staticcheck ./...`, `~/go/bin/errcheck -ignoretests ./...`, `go vet ./...`, `GO_KV_LOG_LEVEL=warn make test` | Passed |
 | Integration regression after #166 | `GO_KV_LOG_LEVEL=warn make integration-test` | Passed in 506.003s |
 | End-to-end regression after #166 | `GO_KV_LOG_LEVEL=warn make e2e-test` | Passed in 452.782s |
-| Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn make long-test` | Passed in 3656.928s across all six 10-minute scenarios |
+| State-machine command decode regression | `GO_KV_LOG_LEVEL=warn go test ./pkg/storage/inmemory ./pkg/storage/simplefile -run 'TestStateMachine/Apply_with_invalid_command_format_returns_error' -count=1` | Failed before #169 with command decode panics; passed after returning apply errors |
+| Storage backend race gate after #169 | `GO_KV_LOG_LEVEL=warn go test -race ./pkg/storage/inmemory ./pkg/storage/simplefile ./pkg/storage/lsm -count=1` | Passed |
+| Storage package regression after #169 | `GO_KV_LOG_LEVEL=warn go test ./pkg/storage/... -count=1` | Passed |
+| Cluster race/shuffle probe after #169 | `GO_KV_LOG_LEVEL=warn go test -race -shuffle=on ./tests -run '^(TestCluster_InstallSnapshot|TestCluster_FullClusterRestart|TestCluster_Persistence_Restart|TestCluster_UnreliableNetwork_Churn)$' -count=3 -timeout=60m` | Passed in 533.924s |
+| Static and unit gates after #169 | `/Users/xiaominghao/go/bin/staticcheck ./...`, `~/go/bin/errcheck -ignoretests ./...`, `go vet ./...`, `GO_KV_LOG_LEVEL=warn make test` | Passed |
+| Integration regression after #169 | `GO_KV_LOG_LEVEL=warn make integration-test` | Passed in 511.925s |
+| End-to-end regression after #169 | `GO_KV_LOG_LEVEL=warn make e2e-test` | Passed in 453.914s |
+| Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn make long-test` | Passed in 3653.338s across all six 10-minute scenarios |
 
 The short-mode behavior is now explicit: the 10-minute E2E tests skip when
 `testing.Short()` is enabled. That keeps `go test -short ./...` usable for PR
@@ -71,12 +78,12 @@ node data.
 
 | Scenario | Total ops | Failed ops | Throughput | P50 | P95 | P99 | Leader changes | Snapshot nodes | Max snapshot index | Consistency |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Comprehensive | 1,250,938 | 0 | 2,084.90 ops/s | 2.00875ms | 4.304916ms | 11.241458ms | 0 | 3 | 928,693 | Passed, 1,996 keys |
-| WriteHeavy | 866,100 | 0 | 1,443.50 ops/s | 2.046125ms | 5.075375ms | 11.049291ms | 14 | 3 | 850,768 | Passed, 2,000 keys |
-| MixedWithFailures | 1,136,462 | 0 | 1,894.10 ops/s | 1.26675ms | 2.13075ms | 4.634417ms | 1 | 3 | 794,687 | Passed, final barrier true, 3,600 node-key checks |
-| ConsistencyWithRestartsAndSnapshots | 1,613,118 | 0 | 2,688.53 ops/s | 1.407208ms | 2.084625ms | 3.763667ms | 2 | 3 | 1,122,910 | Passed, final barrier true, 3,600 node-key checks |
-| ReadHeavy | 61,731,897 | 0 | 102,886.49 ops/s | 16.625us | 294.25us | 710us | 0 | 0 | 0 | Passed, 2,000 keys |
-| DeleteStress | 859,815 | 0 | 1,433.03 ops/s | 1.98525ms | 4.57375ms | 11.266458ms | 12 | 3 | 853,481 | Passed, final barrier true, 3,600 node-key checks |
+| Comprehensive | 1,114,892 | 0 | 1,858.15 ops/s | 2.082667ms | 4.631583ms | 11.111959ms | 6 | 3 | 835,886 | Passed, 1,996 keys |
+| WriteHeavy | 743,574 | 0 | 1,239.29 ops/s | 2.192041ms | 6.783583ms | 17.189584ms | 10 | 3 | 742,612 | Passed, 2,000 keys |
+| MixedWithFailures | 798,969 | 0 | 1,331.62 ops/s | 1.40625ms | 3.759375ms | 9.136708ms | 10 | 3 | 544,326 | Passed, final barrier true, 3,600 node-key checks |
+| ConsistencyWithRestartsAndSnapshots | 1,179,033 | 0 | 1,965.06 ops/s | 1.571875ms | 4.094291ms | 10.148208ms | 4 | 3 | 809,181 | Passed, final barrier true, 3,600 node-key checks |
+| ReadHeavy | 48,808,930 | 0 | 81,348.22 ops/s | 18.5us | 346.25us | 914.417us | 0 | 0 | 0 | Passed, 2,000 keys |
+| DeleteStress | 695,467 | 0 | 1,159.11 ops/s | 2.395959ms | 7.180375ms | 18.235625ms | 5 | 3 | 694,998 | Passed, final barrier true, 3,600 node-key checks |
 
 The latest run validates the previous ReadIndex and apply-timeout fixes tracked
 by [issue #113](https://github.com/xmh1011/go-kv/issues/113),
@@ -86,7 +93,9 @@ by [issue #113](https://github.com/xmh1011/go-kv/issues/113),
 [issue #151](https://github.com/xmh1011/go-kv/issues/151), and
 [issue #164](https://github.com/xmh1011/go-kv/issues/164), and it validates the
 WAL recovery boundary tracked by
-[issue #166](https://github.com/xmh1011/go-kv/issues/166). The important change
+[issue #166](https://github.com/xmh1011/go-kv/issues/166), and the state-machine
+command decoding contract tracked by
+[issue #169](https://github.com/xmh1011/go-kv/issues/169). The important change
 for write-heavy stability is that SSTable compaction is no longer run
 synchronously in the foreground Raft apply path. MemTable flush still publishes
 durable Level-0 SSTables before returning, but compaction is scheduled on a
@@ -138,6 +147,13 @@ structural corruption such as impossible length fields fatal. `Recover` now
 tracks the last complete record offset, truncates incomplete tails to that
 offset, seeks the writable WAL handle back to EOF, and continues to reject
 non-tail corruption.
+
+Issue #169 fixed the non-LSM state-machine command decode boundary. The
+in-memory and simplefile backends previously panicked when a committed command
+was not `[]byte` or contained malformed JSON, while the LSM adapter returned
+errors. Both backends now unwrap `param.ClientCommand`, validate the command
+type, return JSON decode errors through `StateMachine.Apply`, and avoid mutating
+or persisting state when command decoding fails.
 
 ## Post-#109 Focused Restart/Snapshot Replay
 

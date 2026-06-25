@@ -98,6 +98,43 @@ func TestStateMachine(t *testing.T) {
 		_, err = NewStateMachine(filePath)
 		assert.Error(t, err)
 	})
+
+	t.Run("Apply with invalid command format returns error", func(t *testing.T) {
+		sm, filePath := newTestStateMachine(t)
+		assert.Nil(t, sm.Apply(createLogEntry(t, "set", "existing", "value")))
+
+		tests := []struct {
+			name    string
+			command any
+		}{
+			{name: "non byte command", command: "not-bytes"},
+			{name: "malformed json", command: []byte("this is not valid json")},
+			{name: "wrapped non byte command", command: param.NewClientCommand(1, 1, "not-bytes")},
+			{name: "wrapped malformed json", command: param.NewClientCommand(1, 2, []byte("this is not valid json"))},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				var result any
+				assert.NotPanics(t, func() {
+					result = sm.Apply(param.LogEntry{Command: tt.command})
+				})
+				err, ok := result.(error)
+				assert.True(t, ok, "invalid command should return an error")
+				assert.Error(t, err)
+
+				val, getErr := sm.Get("existing")
+				assert.NoError(t, getErr)
+				assert.Equal(t, "value", val)
+
+				reopened, reopenErr := NewStateMachine(filePath)
+				assert.NoError(t, reopenErr)
+				persisted, persistedErr := reopened.Get("existing")
+				assert.NoError(t, persistedErr)
+				assert.Equal(t, "value", persisted)
+			})
+		}
+	})
 }
 
 func TestStateMachineConcurrentPersistAcrossHandles(t *testing.T) {

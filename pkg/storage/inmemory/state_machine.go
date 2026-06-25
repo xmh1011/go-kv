@@ -26,16 +26,13 @@ func NewInMemoryStateMachine() *StateMachine {
 
 // Apply 将日志条目应用到状态机。
 func (sm *StateMachine) Apply(entry param.LogEntry) any {
+	cmd, err := decodeKVCommand(entry)
+	if err != nil {
+		return err
+	}
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-
-	// 假设 Command 是 json 序列化后的 KVCommand
-	var cmd param.KVCommand
-	// 实际应用中，需要更健壮的命令解析
-	if err := json.Unmarshal(param.UnwrapClientCommand(entry.Command).([]byte), &cmd); err != nil {
-		// 在真实场景中，应 panic 或记录严重错误，因为已提交的日志不应是无效的
-		panic(fmt.Sprintf("failed to unmarshal command: %v", err))
-	}
 
 	switch cmd.Op {
 	case param.OpSet:
@@ -48,6 +45,19 @@ func (sm *StateMachine) Apply(entry param.LogEntry) any {
 		// 对于 Get 操作，通常不通过 Apply，但这里可以返回错误
 		return fmt.Errorf("unknown operation: %d", cmd.Op)
 	}
+}
+
+func decodeKVCommand(entry param.LogEntry) (param.KVCommand, error) {
+	var cmd param.KVCommand
+	command := param.UnwrapClientCommand(entry.Command)
+	cmdBytes, ok := command.([]byte)
+	if !ok {
+		return cmd, fmt.Errorf("invalid command format: expected []byte, got %T", command)
+	}
+	if err := json.Unmarshal(cmdBytes, &cmd); err != nil {
+		return cmd, fmt.Errorf("failed to unmarshal command: %w", err)
+	}
+	return cmd, nil
 }
 
 // Get 从状态机中查询一个键的值。
