@@ -264,6 +264,30 @@ func TestSendInstallSnapshot(t *testing.T) {
 		assert.Equal(t, 1, callCount, "Should have called InstallSnapshot once with the complete snapshot")
 		mu.Unlock()
 	})
+
+	t.Run("PropagatesHigherTermFromFollower", func(t *testing.T) {
+		snapshotData := []byte("snapshot")
+
+		mockRaft2.EXPECT().InstallSnapshot(gomock.Any(), gomock.Any()).
+			DoAndReturn(func(args *param.InstallSnapshotArgs, reply *param.InstallSnapshotReply) error {
+				assert.Equal(t, uint64(1), args.Term)
+				reply.Term = 2
+				return nil
+			}).Times(1)
+
+		req := &param.InstallSnapshotArgs{
+			Term:              1,
+			LeaderID:          1,
+			LastIncludedIndex: 100,
+			LastIncludedTerm:  1,
+			Data:              snapshotData,
+		}
+		resp := &param.InstallSnapshotReply{}
+
+		err := t1.SendInstallSnapshot("2", req, resp)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(2), resp.Term)
+	})
 }
 
 // TestAppendEntriesTimeout 测试 AppendEntries 超时动态计算

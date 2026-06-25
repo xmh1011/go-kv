@@ -11,7 +11,7 @@ LSM compaction, client retries, and final data consistency.
 
 | Field | Value |
 |---|---|
-| Date | 2026-06-24 |
+| Date | 2026-06-25 |
 | Machine | macOS Darwin 25.5.0, Apple Silicon |
 | Go | 1.25.5 |
 | Transport | gRPC for long E2E; focused integration also covers TCP |
@@ -43,7 +43,12 @@ LSM compaction, client retries, and final data consistency.
 | Single 10-minute write-heavy trigger scenario | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_WriteHeavy$' -count=1` | Passed in 613.049s after async compaction scheduling |
 | Post-#121 10-minute restart/snapshot consistency scenario | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=25m ./tests -run '^TestLongRunning_10Min_ConsistencyWithRestartsAndSnapshots$' -count=1` | Passed in 611.921s with 0 failed operations |
 | Mixed-failure issued-request retry regression | `GO_KV_LOG_LEVEL=warn go test -race -v -timeout=20m ./tests -run '^TestLongRunning_10Min_MixedWithFailures$' -count=1` | Passed in 619.602s with 666,692 operations, 0 failures, final barrier true, and strict consistency true |
-| Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn make long-test` | Passed in 3674.858s across all six 10-minute scenarios |
+| gRPC InstallSnapshot term regression | `GO_KV_LOG_LEVEL=warn go test -race ./pkg/transport/grpc -run 'TestSendInstallSnapshot|TestInstallSnapshotStream' -count=1` | Passed after adding a regression for follower higher-term snapshot replies |
+| Post-#164 mixed-failure replay | `GO_KV_LOG_LEVEL=warn go test -race -v ./tests -run '^TestLongRunning_10Min_MixedWithFailures$' -count=1 -timeout=15m` | Passed in 606.751s with 633,195 operations, 0 failures, final barrier true, and strict consistency true |
+| Static and unit gates after #164 | `/Users/xiaominghao/go/bin/staticcheck ./...`, `~/go/bin/errcheck -ignoretests ./...`, `go vet ./...`, `GO_KV_LOG_LEVEL=warn make test` | Passed |
+| Integration regression after #164 | `GO_KV_LOG_LEVEL=warn make integration-test` | Passed in 512.324s |
+| End-to-end regression after #164 | `GO_KV_LOG_LEVEL=warn make e2e-test` | Passed in 455.655s |
+| Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn make long-test` | Passed in 3674.264s across all six 10-minute scenarios |
 
 The short-mode behavior is now explicit: the 10-minute E2E tests skip when
 `testing.Short()` is enabled. That keeps `go test -short ./...` usable for PR
@@ -59,19 +64,20 @@ node data.
 
 | Scenario | Total ops | Failed ops | Throughput | P50 | P95 | P99 | Leader changes | Snapshot nodes | Max snapshot index | Consistency |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Comprehensive | 507,391 | 0 | 845.65 ops/s | 3.929333ms | 18.049458ms | 52.540375ms | 14 | 3 | 371,463 | Passed, 1,990 keys |
-| WriteHeavy | 558,608 | 0 | 931.01 ops/s | 2.68175ms | 12.287542ms | 35.588666ms | 14 | 3 | 543,609 | Passed, 2,000 keys |
-| MixedWithFailures | 678,178 | 0 | 1,130.30 ops/s | 1.598333ms | 5.805333ms | 15.755125ms | 6 | 3 | 467,015 | Passed, final barrier true, 3,600 node-key checks |
-| ConsistencyWithRestartsAndSnapshots | 808,862 | 0 | 1,348.10 ops/s | 2.131125ms | 7.693208ms | 20.98475ms | 2 | 3 | 561,412 | Passed, final barrier true, 3,600 node-key checks |
-| ReadHeavy | 36,043,150 | 0 | 60,071.92 ops/s | 30.083us | 421.208us | 1.436458ms | 0 | 0 | 0 | Passed, 2,000 keys |
-| DeleteStress | 468,936 | 0 | 781.56 ops/s | 3.394583ms | 15.347333ms | 46.558125ms | 10 | 3 | 457,143 | Passed, final barrier true, 3,600 node-key checks |
+| Comprehensive | 774,102 | 0 | 1,290.17 ops/s | 2.874834ms | 8.513291ms | 23.756791ms | 4 | 3 | 575,853 | Passed, 1,998 keys |
+| WriteHeavy | 543,912 | 0 | 906.52 ops/s | 3.032ms | 11.244416ms | 37.242958ms | 12 | 3 | 543,632 | Passed, 2,000 keys |
+| MixedWithFailures | 663,144 | 0 | 1,105.24 ops/s | 1.572042ms | 6.362583ms | 22.033333ms | 7 | 3 | 447,566 | Passed, final barrier true, 3,600 node-key checks |
+| ConsistencyWithRestartsAndSnapshots | 848,860 | 0 | 1,414.77 ops/s | 1.749042ms | 8.107166ms | 21.205459ms | 8 | 3 | 578,003 | Passed, final barrier true, 3,600 node-key checks |
+| ReadHeavy | 31,486,862 | 0 | 52,478.10 ops/s | 31.5us | 409.667us | 1.512083ms | 0 | 0 | 0 | Passed, 2,000 keys |
+| DeleteStress | 395,959 | 0 | 659.93 ops/s | 3.263708ms | 17.853334ms | 60.205542ms | 11 | 3 | 377,811 | Passed, final barrier true, 3,600 node-key checks |
 
 The latest run fixes the previous ReadIndex and apply-timeout regressions
 tracked by [issue #113](https://github.com/xmh1011/go-kv/issues/113),
 [issue #116](https://github.com/xmh1011/go-kv/issues/116), and
 [issue #117](https://github.com/xmh1011/go-kv/issues/117),
 [issue #150](https://github.com/xmh1011/go-kv/issues/150), and
-[issue #151](https://github.com/xmh1011/go-kv/issues/151). The important
+[issue #151](https://github.com/xmh1011/go-kv/issues/151), and
+[issue #164](https://github.com/xmh1011/go-kv/issues/164). The important
 change for write-heavy stability is that SSTable compaction is no longer run
 synchronously in the foreground Raft apply path. MemTable flush still publishes
 durable Level-0 SSTables before returning, but compaction is scheduled on a
@@ -105,6 +111,15 @@ use stable `(ClientID, SequenceNum)` identity and are safe to retry, but the old
 recovering from leader re-election and snapshot catch-up. The window is now a
 bounded 90 seconds: stuck commands still fail, but normal Raft recovery no
 longer appears as a false failed operation after the final barrier succeeds.
+
+Issue #164 fixed the gRPC streaming InstallSnapshot reply boundary. The Raft
+RPC contract requires every reply to carry the follower's current term so a
+leader can step down if it is stale. The streaming transport previously
+installed the snapshot correctly but returned the request term to the caller,
+which meant `processSnapshotReply` could treat a higher-term follower as a
+successful same-term snapshot ACK. The transport now writes the follower term
+into a gRPC trailer after snapshot installation and `SendInstallSnapshot`
+propagates that term into `InstallSnapshotReply`.
 
 ## Post-#109 Focused Restart/Snapshot Replay
 
