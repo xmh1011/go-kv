@@ -36,6 +36,7 @@ Related issues:
 - #166 WAL recovery fails on torn trailing records
 - #168 Compaction non-blocking test can fail on slow CI runners
 - #169 In-memory and simplefile state machines panic on malformed commands
+- #171 In-memory and simplefile storage expose mutable log and snapshot internals
 
 ## 1. The Debugging Rule That Changed The Result
 
@@ -1943,6 +1944,115 @@ Panic value: failed to unmarshal command: invalid character 'h' in literal true
 
 After the fix, the focused regression, storage race gate, storage package suite,
 and unit test target all passed.
+
+### #171: Stable Storage Must Not Expose Mutable Internals
+
+Symptom: the in-memory and simplefile storage backends leaked mutable internal
+objects through the stable-storage API. A caller could append a log entry with a
+`[]byte` command, mutate that byte slice after `AppendEntries` returned, and a
+later `GetEntry` would observe the modified command. The reverse direction was
+also unsafe: mutating the `*LogEntry` returned by `GetEntry` changed what future
+reads observed.
+
+Snapshots had the same ownership bug. `SaveSnapshot` stored the caller-provided
+`*param.Snapshot` pointer directly, and `ReadSnapshot` returned that internal
+pointer directly. Either side could mutate snapshot index, term, or data without
+going through storage methods.
+
+The failing regression made the aliasing visible:
+
+```go
+originalCommand := []byte("original")
+entry := param.LogEntry{Term: 1, Index: 1, Command: originalCommand}
+store.AppendEntries([]param.LogEntry{entry})
+
+originalCommand[0] = 'X'
+stored, _ := store.GetEntry(1)
+// before the fix: stored.Command == []byte("Xriginal")
+
+stored.Command.([]byte)[0] = 'Y'
+storedAgain, _ := store.GetEntry(1)
+// before the fix: storedAgain.Command == []byte("Yriginal")
+```
+
+This violates the storage boundary. Raft stable storage should only change
+through methods such as `AppendEntries`, `TruncateLog`, `CompactLog`, and
+`SaveSnapshot`. If callers can mutate returned or previously supplied objects,
+then log and snapshot state can change outside storage locks and outside Raft's
+consistency checks.
+
+The fix adds explicit cloning helpers for Raft payload types:
+
+```go
+func CloneLogEntry(entry LogEntry) LogEntry {
+    entry.Command = CloneCommand(entry.Command)
+    return entry
+}
+
+func CloneSnapshot(snapshot *Snapshot) *Snapshot {
+    if snapshot == nil {
+        return nil
+    }
+    cloned := *snapshot
+    cloned.Data = append([]byte(nil), snapshot.Data...)
+    return &cloned
+}
+```
+
+`CloneCommand` copies the mutable command shapes used by the Raft log:
+
+```go
+case []byte:
+    return append([]byte(nil), cmd...)
+case ConfigChangeCommand:
+    return ConfigChangeCommand{NewPeerIDs: append([]int(nil), cmd.NewPeerIDs...)}
+case ClientCommand:
+    return NewClientCommand(cmd.ClientID, cmd.SequenceNum, CloneCommand(cmd.Command))
+```
+
+The non-LSM storage backends now use those helpers at every ownership boundary:
+
+```go
+func (s *Storage) AppendEntries(entries []param.LogEntry) error {
+    s.log = append(s.log, param.CloneLogEntries(entries)...)
+}
+
+func (s *Storage) GetEntry(index uint64) (*param.LogEntry, error) {
+    entry := param.CloneLogEntry(s.log[index-s.logOffset])
+    return &entry, nil
+}
+
+func (s *Storage) SaveSnapshot(snapshot *param.Snapshot) error {
+    s.snapshot = param.CloneSnapshot(snapshot)
+}
+
+func (s *Storage) ReadSnapshot() (*param.Snapshot, error) {
+    return param.CloneSnapshot(s.snapshot), nil
+}
+```
+
+The LSM backend already had this property because log entries and snapshots are
+encoded to bytes on write and decoded into new values on read.
+
+Validation:
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/inmemory ./pkg/storage/simplefile -run 'TestStorageDefensiveCopies' -count=1
+GO_KV_LOG_LEVEL=warn go test ./pkg/param -run 'TestClone' -count=1
+GO_KV_LOG_LEVEL=warn go test ./pkg/storage/... ./pkg/param -count=1
+GO_KV_LOG_LEVEL=warn go test -race ./pkg/storage/... ./pkg/param -count=1
+GO_KV_LOG_LEVEL=warn go test -race -shuffle=on ./engine/lsm/... ./pkg/storage/... -count=20 -timeout=80m
+GO_KV_LOG_LEVEL=warn go test -race -shuffle=on ./raft -count=100 -timeout=80m
+GO_KV_LOG_LEVEL=warn make test
+GO_KV_LOG_LEVEL=warn make integration-test
+GO_KV_LOG_LEVEL=warn make e2e-test
+GO_KV_LOG_LEVEL=warn make long-test
+```
+
+The pre-fix regression failed by observing `Xriginal`, `Yriginal`, `Xnapshot`,
+and `Ynapshot` through later reads. After the fix, focused regressions, package
+tests, race tests, static analysis, the unit gate, integration tests, E2E tests,
+and all six 10-minute long-running E2E scenarios passed.
 
 ### Combined Lesson
 

@@ -167,6 +167,68 @@ func TestStorage(t *testing.T) {
 	})
 }
 
+func TestStorageDefensiveCopiesLogEntries(t *testing.T) {
+	s, _ := newTestStorage(t)
+	originalCommand := []byte("original")
+	entry := param.LogEntry{Term: 1, Index: 1, Command: originalCommand}
+
+	assert.NoError(t, s.AppendEntries([]param.LogEntry{entry}))
+
+	originalCommand[0] = 'X'
+	entry.Command = []byte("mutated-entry")
+
+	stored, err := s.GetEntry(1)
+	assert.NoError(t, err)
+	assert.NotNil(t, stored)
+	assert.Equal(t, uint64(1), stored.Term)
+	assert.Equal(t, uint64(1), stored.Index)
+	assert.Equal(t, []byte("original"), stored.Command)
+
+	stored.Term = 99
+	stored.Index = 99
+	stored.Command.([]byte)[0] = 'Y'
+
+	storedAgain, err := s.GetEntry(1)
+	assert.NoError(t, err)
+	assert.NotNil(t, storedAgain)
+	assert.Equal(t, uint64(1), storedAgain.Term)
+	assert.Equal(t, uint64(1), storedAgain.Index)
+	assert.Equal(t, []byte("original"), storedAgain.Command)
+}
+
+func TestStorageDefensiveCopiesSnapshots(t *testing.T) {
+	s, _ := newTestStorage(t)
+	snapshot := &param.Snapshot{
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  3,
+		Data:              []byte("snapshot"),
+	}
+
+	assert.NoError(t, s.SaveSnapshot(snapshot))
+
+	snapshot.LastIncludedIndex = 99
+	snapshot.LastIncludedTerm = 99
+	snapshot.Data[0] = 'X'
+
+	stored, err := s.ReadSnapshot()
+	assert.NoError(t, err)
+	assert.NotNil(t, stored)
+	assert.Equal(t, uint64(5), stored.LastIncludedIndex)
+	assert.Equal(t, uint64(3), stored.LastIncludedTerm)
+	assert.Equal(t, []byte("snapshot"), stored.Data)
+
+	stored.LastIncludedIndex = 100
+	stored.LastIncludedTerm = 100
+	stored.Data[0] = 'Y'
+
+	storedAgain, err := s.ReadSnapshot()
+	assert.NoError(t, err)
+	assert.NotNil(t, storedAgain)
+	assert.Equal(t, uint64(5), storedAgain.LastIncludedIndex)
+	assert.Equal(t, uint64(3), storedAgain.LastIncludedTerm)
+	assert.Equal(t, []byte("snapshot"), storedAgain.Data)
+}
+
 func TestStorageConcurrentPersistAcrossHandles(t *testing.T) {
 	tmpDir := t.TempDir()
 	filePath := filepath.Join(tmpDir, "raft_storage.gob")

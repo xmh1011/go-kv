@@ -62,7 +62,15 @@ LSM compaction, client retries, and final data consistency.
 | Static and unit gates after #169 | `/Users/xiaominghao/go/bin/staticcheck ./...`, `~/go/bin/errcheck -ignoretests ./...`, `go vet ./...`, `GO_KV_LOG_LEVEL=warn make test` | Passed |
 | Integration regression after #169 | `GO_KV_LOG_LEVEL=warn make integration-test` | Passed in 511.925s |
 | End-to-end regression after #169 | `GO_KV_LOG_LEVEL=warn make e2e-test` | Passed in 453.914s |
-| Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn make long-test` | Passed in 3653.338s across all six 10-minute scenarios |
+| Storage defensive-copy regression | `GO_KV_LOG_LEVEL=warn go test ./pkg/storage/inmemory ./pkg/storage/simplefile -run 'TestStorageDefensiveCopies' -count=1` | Failed before #171 by observing caller/result mutations (`Xriginal`, `Yriginal`, `Xnapshot`, `Ynapshot`); passed after cloning storage boundaries |
+| Raft command clone regression | `GO_KV_LOG_LEVEL=warn go test ./pkg/param -run 'TestClone' -count=1` | Passed |
+| Storage package and race gates after #171 | `GO_KV_LOG_LEVEL=warn go test ./pkg/storage/... ./pkg/param -count=1`, `GO_KV_LOG_LEVEL=warn go test -race ./pkg/storage/... ./pkg/param -count=1` | Passed |
+| LSM/storage race-shuffle probe after #171 | `GO_KV_LOG_LEVEL=warn go test -race -shuffle=on ./engine/lsm/... ./pkg/storage/... -count=20 -timeout=80m` | Passed; slowest packages `engine/lsm/database` 370.919s and `pkg/storage/lsm` 330.329s |
+| Raft race-shuffle probe after #171 | `GO_KV_LOG_LEVEL=warn go test -race -shuffle=on ./raft -count=100 -timeout=80m` | Passed in 1314.858s |
+| Static and unit gates after #171 | `/Users/xiaominghao/go/bin/staticcheck ./...`, `/Users/xiaominghao/go/bin/errcheck -ignoretests ./...`, `go vet ./...`, `GO_KV_LOG_LEVEL=warn make test` | Passed |
+| Integration regression after #171 | `GO_KV_LOG_LEVEL=warn make integration-test` | Passed in 504.713s |
+| End-to-end regression after #171 | `GO_KV_LOG_LEVEL=warn make e2e-test` | Passed in 455.209s |
+| Full long-running E2E regression after #171 | `GO_KV_LOG_LEVEL=warn make long-test` | Passed in 3658.971s across all six 10-minute race-enabled scenarios |
 
 The short-mode behavior is now explicit: the 10-minute E2E tests skip when
 `testing.Short()` is enabled. That keeps `go test -short ./...` usable for PR
@@ -78,12 +86,12 @@ node data.
 
 | Scenario | Total ops | Failed ops | Throughput | P50 | P95 | P99 | Leader changes | Snapshot nodes | Max snapshot index | Consistency |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Comprehensive | 1,114,892 | 0 | 1,858.15 ops/s | 2.082667ms | 4.631583ms | 11.111959ms | 6 | 3 | 835,886 | Passed, 1,996 keys |
-| WriteHeavy | 743,574 | 0 | 1,239.29 ops/s | 2.192041ms | 6.783583ms | 17.189584ms | 10 | 3 | 742,612 | Passed, 2,000 keys |
-| MixedWithFailures | 798,969 | 0 | 1,331.62 ops/s | 1.40625ms | 3.759375ms | 9.136708ms | 10 | 3 | 544,326 | Passed, final barrier true, 3,600 node-key checks |
-| ConsistencyWithRestartsAndSnapshots | 1,179,033 | 0 | 1,965.06 ops/s | 1.571875ms | 4.094291ms | 10.148208ms | 4 | 3 | 809,181 | Passed, final barrier true, 3,600 node-key checks |
-| ReadHeavy | 48,808,930 | 0 | 81,348.22 ops/s | 18.5us | 346.25us | 914.417us | 0 | 0 | 0 | Passed, 2,000 keys |
-| DeleteStress | 695,467 | 0 | 1,159.11 ops/s | 2.395959ms | 7.180375ms | 18.235625ms | 5 | 3 | 694,998 | Passed, final barrier true, 3,600 node-key checks |
+| Comprehensive | 1,089,045 | 0 | 1,815.08 ops/s | 2.193583ms | 4.964292ms | 12.644417ms | 2 | 3 | 817,445 | Passed, 1,996 keys |
+| WriteHeavy | 623,056 | 0 | 1,038.43 ops/s | 2.543458ms | 10.027083ms | 27.480542ms | 15 | 3 | 615,976 | Passed, 2,000 keys |
+| MixedWithFailures | 847,364 | 0 | 1,412.27 ops/s | 1.415166ms | 3.637125ms | 8.229125ms | 6 | 3 | 582,848 | Passed, final barrier true, 3,600 node-key checks |
+| ConsistencyWithRestartsAndSnapshots | 1,269,113 | 0 | 2,115.19 ops/s | 1.551083ms | 3.369458ms | 7.373791ms | 6 | 3 | 875,584 | Passed, final barrier true, 3,600 node-key checks |
+| ReadHeavy | 52,960,512 | 0 | 88,267.52 ops/s | 17.459us | 304.5us | 742.542us | 0 | 0 | 0 | Passed, 2,000 keys |
+| DeleteStress | 737,489 | 0 | 1,229.15 ops/s | 2.235209ms | 5.906709ms | 14.816583ms | 10 | 3 | 734,789 | Passed, final barrier true, 3,600 node-key checks |
 
 The latest run validates the previous ReadIndex and apply-timeout fixes tracked
 by [issue #113](https://github.com/xmh1011/go-kv/issues/113),
@@ -95,7 +103,9 @@ by [issue #113](https://github.com/xmh1011/go-kv/issues/113),
 WAL recovery boundary tracked by
 [issue #166](https://github.com/xmh1011/go-kv/issues/166), and the state-machine
 command decoding contract tracked by
-[issue #169](https://github.com/xmh1011/go-kv/issues/169). The important change
+[issue #169](https://github.com/xmh1011/go-kv/issues/169), and the stable
+storage ownership boundary tracked by
+[issue #171](https://github.com/xmh1011/go-kv/issues/171). The important change
 for write-heavy stability is that SSTable compaction is no longer run
 synchronously in the foreground Raft apply path. MemTable flush still publishes
 durable Level-0 SSTables before returning, but compaction is scheduled on a
@@ -154,6 +164,17 @@ was not `[]byte` or contained malformed JSON, while the LSM adapter returned
 errors. Both backends now unwrap `param.ClientCommand`, validate the command
 type, return JSON decode errors through `StateMachine.Apply`, and avoid mutating
 or persisting state when command decoding fails.
+
+Issue #171 fixed the non-LSM stable-storage ownership boundary. The in-memory
+and simplefile Raft log backends previously stored caller-owned `LogEntry`
+payloads and returned pointers into internal log and snapshot state. That made
+Raft's stable storage mutable outside `AppendEntries`, `TruncateLog`,
+`CompactLog`, and `SaveSnapshot`. The fix adds explicit clone helpers for
+`LogEntry`, `Snapshot`, `[]byte` commands, membership-change commands, and
+nested client commands, then applies those clones on every append, get,
+snapshot-save, and snapshot-read boundary. The full long-running E2E replay
+after this change had zero failed operations and true final consistency across
+all six scenarios.
 
 ## Post-#109 Focused Restart/Snapshot Replay
 

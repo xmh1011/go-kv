@@ -59,7 +59,15 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 | #169 后静态和单元门禁 | `/Users/xiaominghao/go/bin/staticcheck ./...`、`~/go/bin/errcheck -ignoretests ./...`、`go vet ./...`、`GO_KV_LOG_LEVEL=warn make test` | 通过 |
 | #169 后集成回归 | `GO_KV_LOG_LEVEL=warn make integration-test` | 511.925s 通过 |
 | #169 后端到端回归 | `GO_KV_LOG_LEVEL=warn make e2e-test` | 453.914s 通过 |
-| 全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn make long-test` | 3653.338s 通过，覆盖全部六个 10 分钟场景 |
+| Storage defensive-copy 回归 | `GO_KV_LOG_LEVEL=warn go test ./pkg/storage/inmemory ./pkg/storage/simplefile -run 'TestStorageDefensiveCopies' -count=1` | #171 修复前能观察到调用方/返回值突变（`Xriginal`、`Yriginal`、`Xnapshot`、`Ynapshot`）；在 storage 边界 clone 后通过 |
+| Raft command clone 回归 | `GO_KV_LOG_LEVEL=warn go test ./pkg/param -run 'TestClone' -count=1` | 通过 |
+| #171 后 storage 包和 race 门禁 | `GO_KV_LOG_LEVEL=warn go test ./pkg/storage/... ./pkg/param -count=1`、`GO_KV_LOG_LEVEL=warn go test -race ./pkg/storage/... ./pkg/param -count=1` | 通过 |
+| #171 后 LSM/storage race-shuffle 探针 | `GO_KV_LOG_LEVEL=warn go test -race -shuffle=on ./engine/lsm/... ./pkg/storage/... -count=20 -timeout=80m` | 通过；最慢 package 为 `engine/lsm/database` 370.919s 和 `pkg/storage/lsm` 330.329s |
+| #171 后 Raft race-shuffle 探针 | `GO_KV_LOG_LEVEL=warn go test -race -shuffle=on ./raft -count=100 -timeout=80m` | 1314.858s 通过 |
+| #171 后静态和单元门禁 | `/Users/xiaominghao/go/bin/staticcheck ./...`、`/Users/xiaominghao/go/bin/errcheck -ignoretests ./...`、`go vet ./...`、`GO_KV_LOG_LEVEL=warn make test` | 通过 |
+| #171 后集成回归 | `GO_KV_LOG_LEVEL=warn make integration-test` | 504.713s 通过 |
+| #171 后端到端回归 | `GO_KV_LOG_LEVEL=warn make e2e-test` | 455.209s 通过 |
+| #171 后全量长时间 E2E 回归 | `GO_KV_LOG_LEVEL=warn make long-test` | 3658.971s 通过，覆盖全部六个启用 race 的 10 分钟场景 |
 
 现在 short 模式行为是明确的：10 分钟 E2E 在 `testing.Short()` 下会跳过。这样 `go test -short ./...` 可以继续作为 PR 覆盖率入口，而真实 10 分钟场景必须显式运行。
 
@@ -69,12 +77,12 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 
 | 场景 | 总操作数 | 失败操作 | 吞吐量 | P50 | P95 | P99 | Leader 切换 | 快照节点数 | 最大快照 index | 一致性 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Comprehensive | 1,114,892 | 0 | 1,858.15 ops/s | 2.082667ms | 4.631583ms | 11.111959ms | 6 | 3 | 835,886 | 通过，1,996 个 key |
-| WriteHeavy | 743,574 | 0 | 1,239.29 ops/s | 2.192041ms | 6.783583ms | 17.189584ms | 10 | 3 | 742,612 | 通过，2,000 个 key |
-| MixedWithFailures | 798,969 | 0 | 1,331.62 ops/s | 1.40625ms | 3.759375ms | 9.136708ms | 10 | 3 | 544,326 | 通过，final barrier true，3,600 个 node-key 检查 |
-| ConsistencyWithRestartsAndSnapshots | 1,179,033 | 0 | 1,965.06 ops/s | 1.571875ms | 4.094291ms | 10.148208ms | 4 | 3 | 809,181 | 通过，final barrier true，3,600 个 node-key 检查 |
-| ReadHeavy | 48,808,930 | 0 | 81,348.22 ops/s | 18.5us | 346.25us | 914.417us | 0 | 0 | 0 | 通过，2,000 个 key |
-| DeleteStress | 695,467 | 0 | 1,159.11 ops/s | 2.395959ms | 7.180375ms | 18.235625ms | 5 | 3 | 694,998 | 通过，final barrier true，3,600 个 node-key 检查 |
+| Comprehensive | 1,089,045 | 0 | 1,815.08 ops/s | 2.193583ms | 4.964292ms | 12.644417ms | 2 | 3 | 817,445 | 通过，1,996 个 key |
+| WriteHeavy | 623,056 | 0 | 1,038.43 ops/s | 2.543458ms | 10.027083ms | 27.480542ms | 15 | 3 | 615,976 | 通过，2,000 个 key |
+| MixedWithFailures | 847,364 | 0 | 1,412.27 ops/s | 1.415166ms | 3.637125ms | 8.229125ms | 6 | 3 | 582,848 | 通过，final barrier true，3,600 个 node-key 检查 |
+| ConsistencyWithRestartsAndSnapshots | 1,269,113 | 0 | 2,115.19 ops/s | 1.551083ms | 3.369458ms | 7.373791ms | 6 | 3 | 875,584 | 通过，final barrier true，3,600 个 node-key 检查 |
+| ReadHeavy | 52,960,512 | 0 | 88,267.52 ops/s | 17.459us | 304.5us | 742.542us | 0 | 0 | 0 | 通过，2,000 个 key |
+| DeleteStress | 737,489 | 0 | 1,229.15 ops/s | 2.235209ms | 5.906709ms | 14.816583ms | 10 | 3 | 734,789 | 通过，final barrier true，3,600 个 node-key 检查 |
 
 最新全量运行验证了此前由
 [issue #113](https://github.com/xmh1011/go-kv/issues/113)、
@@ -86,7 +94,9 @@ English version: [PERFORMANCE.md](PERFORMANCE.md)
 ReadIndex、apply-timeout 和 snapshot catch-up 修复，也验证了
 [issue #166](https://github.com/xmh1011/go-kv/issues/166) 跟踪的 WAL recovery 边界，
 以及 [issue #169](https://github.com/xmh1011/go-kv/issues/169) 跟踪的状态机 command
-解码契约。
+解码契约，也验证了
+[issue #171](https://github.com/xmh1011/go-kv/issues/171) 跟踪的 stable storage
+所有权边界。
 对写入稳定性最关键的变化是：
 SSTable compaction 不再同步运行在 Raft apply 前台路径里。MemTable flush
 仍会先发布持久化的 Level-0 SSTable，然后把 compaction 合并到后台 worker
@@ -130,6 +140,14 @@ Issue #169 修复了非 LSM 状态机 command 解码边界。`inmemory` 和 `sim
 后端此前在已提交 command 不是 `[]byte` 或 JSON 畸形时会 panic，而 LSM adapter
 会返回 error。现在两个后端都会展开 `param.ClientCommand`，校验 command 类型，
 通过 `StateMachine.Apply` 返回 JSON 解码错误，并确保 command 解码失败时不修改或持久化状态。
+
+Issue #171 修复了非 LSM stable-storage 所有权边界。`inmemory` 和 `simplefile`
+Raft log 后端此前会保存调用方拥有的 `LogEntry` payload，并把内部 log 和 snapshot
+状态的指针直接返回给调用方。这样 Raft stable storage 可能绕过 `AppendEntries`、
+`TruncateLog`、`CompactLog` 和 `SaveSnapshot` 被外部修改。修复新增了 `LogEntry`、
+`Snapshot`、`[]byte` command、membership-change command 和嵌套 client command 的
+显式 clone helper，并在 append、get、snapshot-save、snapshot-read 每个边界使用 clone。
+修复后的全量长时间 E2E 重放在六个场景中全部失败操作为 0，最终一致性均为 true。
 
 ## #109 后的重启/快照聚焦重放
 

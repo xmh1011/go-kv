@@ -58,7 +58,7 @@ func (s *Storage) GetState() (param.HardState, error) {
 func (s *Storage) AppendEntries(entries []param.LogEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.log = append(s.log, entries...)
+	s.log = append(s.log, param.CloneLogEntries(entries)...)
 	return nil
 }
 
@@ -72,7 +72,8 @@ func (s *Storage) GetEntry(index uint64) (*param.LogEntry, error) {
 	}
 
 	// index 对应的切片位置是 index - logOffset
-	return &s.log[index-s.logOffset], nil
+	entry := param.CloneLogEntry(s.log[index-s.logOffset])
+	return &entry, nil
 }
 
 func (s *Storage) TruncateLog(fromIndex uint64) error {
@@ -117,14 +118,14 @@ func (s *Storage) LogSize() (int, error) {
 func (s *Storage) SaveSnapshot(snapshot *param.Snapshot) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.snapshot = snapshot
+	s.snapshot = param.CloneSnapshot(snapshot)
 	return nil
 }
 
 func (s *Storage) ReadSnapshot() (*param.Snapshot, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.snapshot, nil
+	return param.CloneSnapshot(s.snapshot), nil
 }
 
 func (s *Storage) CompactLog(upToIndex uint64) error {
