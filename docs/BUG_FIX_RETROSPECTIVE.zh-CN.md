@@ -30,6 +30,8 @@ English version: [BUG_FIX_RETROSPECTIVE.md](BUG_FIX_RETROSPECTIVE.md)
 - #150 Prevent LSM snapshot reload races
 - #151 Extend mixed-failure issued-request retry budget
 - #164 Restarted follower can miss committed writes after snapshot catch-up
+- #166 WAL recovery fails on torn trailing records
+- #168 Compaction non-blocking test can fail on slow CI runners
 
 ## 1. 真正改变结果的调试原则
 
@@ -146,6 +148,127 @@ stream.SetTrailer(metadata.Pairs(
 
 - #164 在长时间重启压力下暴露 snapshot catch-up 后 follower 状态过期，并让
   InstallSnapshot reply term 丢失问题变得可见。
+
+## 3.2. LSM WAL 原理：恢复必须保留 durable prefix
+
+LSM write-ahead log 是 append-only 记录序列：
+
+```text
+key length | key bytes | value length | value bytes
+```
+
+WAL recovery 的不变量不是“整个 WAL 文件必须完美解码”。更准确的不变量是：
+
+- 所有完整前缀记录都必须 replay；
+- 不完整的最后一条记录可以丢弃，因为它没有完整写入；
+- 如果不是简单的尾部截断，而是非法长度字段等结构性损坏，恢复仍然必须失败。
+
+Issue #166 暴露了旧实现没有区分这两类情况。一个 WAL 文件先包含多条有效记录，再追加下一条
+记录的前 5 个字节，恢复会直接失败：
+
+```text
+read key failed: unexpected EOF
+failed to read wal ...: decode key: unexpected EOF
+```
+
+旧循环把每条记录交给 `KeyValuePair.DecodeFrom`，遇到任意 decode 错误就返回：
+
+```go
+for buf.Len() > 0 {
+    var pair kv.KeyValuePair
+    if err := pair.DecodeFrom(buf); err != nil {
+        return nil, fmt.Errorf("failed to read wal %s: %w", file.Name(), err)
+    }
+    callback(pair)
+}
+```
+
+这样会把“最后一次 append 被中断”误判成“整个 WAL 损坏”。修复后，恢复逻辑显式按 byte
+offset 解析记录。如果剩余字节不足以组成下一条记录的 key length、完整 key、value length
+或完整 value，就把文件截断到最后一条完整记录的 offset，并返回仍可写入的 WAL handle：
+
+```go
+pair, nextOffset, truncatedTail, err := decodeWALRecord(raw, offset)
+if truncatedTail {
+    file.Truncate(int64(offset))
+    file.Seek(0, io.SeekEnd)
+    break
+}
+callback(pair)
+offset = nextOffset
+```
+
+解码器仍然会拒绝不可能的长度字段：
+
+```go
+if keyLen > maxWALKeyLength {
+    return kv.KeyValuePair{}, offset, false, fmt.Errorf("invalid key length: %d", keyLen)
+}
+```
+
+测试信号分层覆盖：`TestRecoverTruncatesTornTailAfterValidRecords` 在修复前因
+`unexpected EOF` 失败，修复后通过，并验证恢复后的 WAL 可以继续 append；原有 corrupt WAL
+测试仍会因为非法长度字段返回错误。随后 LSM race 门禁、Raft `-race -shuffle -count=50`
+探针、单元测试、集成测试、普通 E2E 和全部六个 10 分钟长时间 E2E 场景都通过。
+
+涉及 issue：
+
+- #166 修复 WAL recovery 边界，避免最后一次 append 的 torn tail 让本来有效的完整前缀
+  无法在重启时恢复。
+
+## 3.3. 测试原则：断言不变量，而不是很小的调度时间窗
+
+Issue #168 是 `TestCreateNewSSTableDoesNotBlockBehindCompaction` 在 CI 上暴露的
+失败。这个测试想保护的生产不变量很重要：`CreateNewSSTable` 必须在不等待当前正在运行的
+compaction 的情况下发布新的 Level-0 SSTable。这样前台 MemTable flush 不会被后台
+compaction 的关键路径拖住。
+
+旧测试用 100ms wall-clock timeout 近似这个不变量：
+
+```go
+select {
+case err := <-done:
+    completed = true
+    assert.NoError(t, err)
+case <-time.After(100 * time.Millisecond):
+    t.Fatal("CreateNewSSTable should publish the new table without waiting for compaction")
+}
+```
+
+这个信号太间接。在共享 CI runner 上，同时开启 `-race` 和 coverage 时，goroutine
+大约 110ms 才结束，于是测试失败，但这并不能证明生产逻辑真的等待了 compaction。
+修复后的测试直接观察状态变化：当 compaction 仍被标记为 active 时，新的 SSTable
+必须已经出现在 manager catalog 里。然后测试再释放 compaction，并等待 goroutine 返回：
+
+```go
+require.Eventually(t, func() bool {
+    tables := manager.getLevelTables(level)
+    return len(tables) > 0
+}, 2*time.Second, 10*time.Millisecond)
+
+manager.mu.RLock()
+stillCompacting := manager.compactingLevels[level]
+manager.mu.RUnlock()
+require.True(t, stillCompacting)
+
+manager.endCompactionLevels([]int{level})
+```
+
+聚焦稳定性验证命令：
+
+```bash
+GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable \
+  -run '^TestCreateNewSSTableDoesNotBlockBehindCompaction$' \
+  -count=100 -timeout=5m
+```
+
+该循环通过，随后完整 SSTable 包测试和 LSM race 门禁也通过。这里的经验和长时间 E2E
+harness 修复一致：测试应该编码真实的分布式/存储不变量；很小的固定 sleep 或 deadline
+最多是诊断信号，不是正确性证明。
+
+涉及 issue：
+
+- #168 通过条件式状态检查替代调度敏感 timeout，稳定了 compaction 非阻塞回归测试。
 
 ## 4. Raft 原理：同任期 Leader Hint 也必须让旧角色降级
 

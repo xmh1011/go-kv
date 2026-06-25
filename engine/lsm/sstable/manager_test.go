@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/xmh1011/go-kv/engine/lsm/kv"
 	"github.com/xmh1011/go-kv/engine/lsm/memtable"
@@ -155,25 +156,28 @@ func TestCreateNewSSTableDoesNotBlockBehindCompaction(t *testing.T) {
 		done <- manager.CreateNewSSTable(testIMemWithPair("key", "value"))
 	}()
 
-	completed := false
 	defer func() {
 		manager.endCompactionLevels([]int{level})
-		if !completed {
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-				t.Fatal("CreateNewSSTable goroutine did not finish after releasing compaction")
-			}
-		}
 		manager.WaitForCompactions()
 	}()
 
+	require.Eventually(t, func() bool {
+		tables := manager.getLevelTables(level)
+		return len(tables) > 0
+	}, 2*time.Second, 10*time.Millisecond, "CreateNewSSTable should publish the new table while compaction is still active")
+
+	manager.mu.RLock()
+	stillCompacting := manager.compactingLevels[level]
+	manager.mu.RUnlock()
+	require.True(t, stillCompacting, "test must observe publication before releasing compaction")
+
+	manager.endCompactionLevels([]int{level})
+
 	select {
 	case err := <-done:
-		completed = true
 		assert.NoError(t, err)
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("CreateNewSSTable should publish the new table without waiting for compaction")
+	case <-time.After(2 * time.Second):
+		t.Fatal("CreateNewSSTable goroutine did not finish after releasing compaction")
 	}
 }
 

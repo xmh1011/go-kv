@@ -48,7 +48,14 @@ LSM compaction, client retries, and final data consistency.
 | Static and unit gates after #164 | `/Users/xiaominghao/go/bin/staticcheck ./...`, `~/go/bin/errcheck -ignoretests ./...`, `go vet ./...`, `GO_KV_LOG_LEVEL=warn make test` | Passed |
 | Integration regression after #164 | `GO_KV_LOG_LEVEL=warn make integration-test` | Passed in 512.324s |
 | End-to-end regression after #164 | `GO_KV_LOG_LEVEL=warn make e2e-test` | Passed in 455.655s |
-| Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn make long-test` | Passed in 3674.264s across all six 10-minute scenarios |
+| WAL torn-tail regression | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/wal -run '^TestRecoverTruncatesTornTailAfterValidRecords$' -count=1` | Failed before #166 with `decode key: unexpected EOF`; passed after truncating incomplete WAL tails |
+| SSTable non-blocking compaction test stability | `GO_KV_LOG_LEVEL=warn go test ./engine/lsm/sstable -run '^TestCreateNewSSTableDoesNotBlockBehindCompaction$' -count=100 -timeout=5m` | Passed after #168 replaced the fixed 100ms completion deadline with condition-based publication checks |
+| LSM/WAL race gate after #166 | `GO_KV_LOG_LEVEL=warn go test -race ./engine/lsm/... ./pkg/storage/lsm -count=1 -timeout=15m` | Passed; slowest package `engine/lsm/database` 10.065s |
+| Raft race/shuffle probe after #166 | `GO_KV_LOG_LEVEL=warn go test -race -shuffle=on ./raft -count=50 -timeout=40m` | Passed in 659.257s |
+| Static and unit gates after #166 | `/Users/xiaominghao/go/bin/staticcheck ./...`, `~/go/bin/errcheck -ignoretests ./...`, `go vet ./...`, `GO_KV_LOG_LEVEL=warn make test` | Passed |
+| Integration regression after #166 | `GO_KV_LOG_LEVEL=warn make integration-test` | Passed in 506.003s |
+| End-to-end regression after #166 | `GO_KV_LOG_LEVEL=warn make e2e-test` | Passed in 452.782s |
+| Full long-running E2E regression | `GO_KV_LOG_LEVEL=warn make long-test` | Passed in 3656.928s across all six 10-minute scenarios |
 
 The short-mode behavior is now explicit: the 10-minute E2E tests skip when
 `testing.Short()` is enabled. That keeps `go test -short ./...` usable for PR
@@ -64,31 +71,33 @@ node data.
 
 | Scenario | Total ops | Failed ops | Throughput | P50 | P95 | P99 | Leader changes | Snapshot nodes | Max snapshot index | Consistency |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Comprehensive | 774,102 | 0 | 1,290.17 ops/s | 2.874834ms | 8.513291ms | 23.756791ms | 4 | 3 | 575,853 | Passed, 1,998 keys |
-| WriteHeavy | 543,912 | 0 | 906.52 ops/s | 3.032ms | 11.244416ms | 37.242958ms | 12 | 3 | 543,632 | Passed, 2,000 keys |
-| MixedWithFailures | 663,144 | 0 | 1,105.24 ops/s | 1.572042ms | 6.362583ms | 22.033333ms | 7 | 3 | 447,566 | Passed, final barrier true, 3,600 node-key checks |
-| ConsistencyWithRestartsAndSnapshots | 848,860 | 0 | 1,414.77 ops/s | 1.749042ms | 8.107166ms | 21.205459ms | 8 | 3 | 578,003 | Passed, final barrier true, 3,600 node-key checks |
-| ReadHeavy | 31,486,862 | 0 | 52,478.10 ops/s | 31.5us | 409.667us | 1.512083ms | 0 | 0 | 0 | Passed, 2,000 keys |
-| DeleteStress | 395,959 | 0 | 659.93 ops/s | 3.263708ms | 17.853334ms | 60.205542ms | 11 | 3 | 377,811 | Passed, final barrier true, 3,600 node-key checks |
+| Comprehensive | 1,250,938 | 0 | 2,084.90 ops/s | 2.00875ms | 4.304916ms | 11.241458ms | 0 | 3 | 928,693 | Passed, 1,996 keys |
+| WriteHeavy | 866,100 | 0 | 1,443.50 ops/s | 2.046125ms | 5.075375ms | 11.049291ms | 14 | 3 | 850,768 | Passed, 2,000 keys |
+| MixedWithFailures | 1,136,462 | 0 | 1,894.10 ops/s | 1.26675ms | 2.13075ms | 4.634417ms | 1 | 3 | 794,687 | Passed, final barrier true, 3,600 node-key checks |
+| ConsistencyWithRestartsAndSnapshots | 1,613,118 | 0 | 2,688.53 ops/s | 1.407208ms | 2.084625ms | 3.763667ms | 2 | 3 | 1,122,910 | Passed, final barrier true, 3,600 node-key checks |
+| ReadHeavy | 61,731,897 | 0 | 102,886.49 ops/s | 16.625us | 294.25us | 710us | 0 | 0 | 0 | Passed, 2,000 keys |
+| DeleteStress | 859,815 | 0 | 1,433.03 ops/s | 1.98525ms | 4.57375ms | 11.266458ms | 12 | 3 | 853,481 | Passed, final barrier true, 3,600 node-key checks |
 
-The latest run fixes the previous ReadIndex and apply-timeout regressions
-tracked by [issue #113](https://github.com/xmh1011/go-kv/issues/113),
+The latest run validates the previous ReadIndex and apply-timeout fixes tracked
+by [issue #113](https://github.com/xmh1011/go-kv/issues/113),
 [issue #116](https://github.com/xmh1011/go-kv/issues/116), and
 [issue #117](https://github.com/xmh1011/go-kv/issues/117),
 [issue #150](https://github.com/xmh1011/go-kv/issues/150), and
 [issue #151](https://github.com/xmh1011/go-kv/issues/151), and
-[issue #164](https://github.com/xmh1011/go-kv/issues/164). The important
-change for write-heavy stability is that SSTable compaction is no longer run
+[issue #164](https://github.com/xmh1011/go-kv/issues/164), and it validates the
+WAL recovery boundary tracked by
+[issue #166](https://github.com/xmh1011/go-kv/issues/166). The important change
+for write-heavy stability is that SSTable compaction is no longer run
 synchronously in the foreground Raft apply path. MemTable flush still publishes
 durable Level-0 SSTables before returning, but compaction is scheduled on a
 coalesced background worker and can be joined with `WaitForCompactions()` during
 shutdown or tests. Follow-up issue #119 tightened this further: below-threshold
 flushes now return without starting a no-op compaction worker, so ordinary small
-flushes do not create avoidable goroutines or contend on `Manager.mu`. Follow-up
-issue #121 tightened snapshot-driven Raft log compaction: `CompactLog` now
-tombstones compacted physical `log:<index>` keys before advancing the logical
-window, so long-running nodes can reclaim obsolete log payloads through normal
-LSM compaction. Issue #122 fixed a race-mode test precondition in
+flushes do not create avoidable goroutines or contend on `Manager.mu`.
+Follow-up issue #121 tightened snapshot-driven Raft log compaction: `CompactLog`
+now tombstones compacted physical `log:<index>` keys before advancing the
+logical window, so long-running nodes can reclaim obsolete log payloads through
+normal LSM compaction. Issue #122 fixed a race-mode test precondition in
 `TestWaitForAppliedLogRechecksLastAppliedOnTimeout`: the test now waits for the
 apply waiter to register before setting `lastApplied`, so it verifies the
 timeout-path recheck instead of depending on a short scheduler race. Issue #123
@@ -120,6 +129,15 @@ which meant `processSnapshotReply` could treat a higher-term follower as a
 successful same-term snapshot ACK. The transport now writes the follower term
 into a gRPC trailer after snapshot installation and `SendInstallSnapshot`
 propagates that term into `InstallSnapshotReply`.
+
+Issue #166 fixed the LSM WAL recovery boundary. Recovery previously decoded
+records until EOF and treated any decode error as fatal. A crash or interrupted
+write can leave an incomplete final WAL record, so the correct invariant is to
+replay every complete prefix record, truncate only the torn tail, and keep
+structural corruption such as impossible length fields fatal. `Recover` now
+tracks the last complete record offset, truncates incomplete tails to that
+offset, seeks the writable WAL handle back to EOF, and continues to reject
+non-tail corruption.
 
 ## Post-#109 Focused Restart/Snapshot Replay
 
